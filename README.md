@@ -1,5 +1,7 @@
 # suplayer
 
+English | [中文](README_zh.md)
+
 HarmonyOS media playback stack built on FFmpeg.
 
 ## Modules
