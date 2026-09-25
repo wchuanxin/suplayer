@@ -30,9 +30,10 @@ import { probe, FFVideoDecoder } from '@suplayer/ffmpeg';
 
 const info = await probe('https://example.com/live/index.m3u8');
 const vdec = new FFVideoDecoder();
-await vdec.open(info.streams[0].index ? 'https://example.com/live/index.m3u8' : '', -1, {
-  liveStartIndex: -1
+await vdec.open('https://example.com/live/index.m3u8', -1, {
+  liveStartIndex: -1   // join at the live edge
 });
+vdec.start(surfaceId); // from XComponent
 ```
 
 ## Building the native libraries
