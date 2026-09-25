@@ -1,0 +1,22 @@
+export {
+  probe,
+  extractFrame,
+  transcode,
+  FFAudioDecoder,
+  FFVideoDecoder,
+  FFSubtitleDecoder,
+  FFMediaInfo,
+  FFStreamInfo,
+  FFProgramInfo,
+  FFFrame,
+  FFAudioOpenInfo,
+  FFAudioPacket,
+  FFVideoOpenInfo,
+  FFVideoFrameEvent,
+  FFVideoInfoEvent,
+  FFSubtitleOpenInfo,
+  FFSubtitleEvent,
+  FFTranscodeOptions,
+  FFTranscodeResult,
+  FFNetOptions
+} from './src/main/ets/FFMedia';

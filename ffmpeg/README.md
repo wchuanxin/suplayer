@@ -1,0 +1,319 @@
+# @suplayer/ffmpeg
+
+FFmpeg-powered media kernel for HarmonyOS (compatible with API 24+,
+HarmonyOS 6.1.1 and later). Ships as a HAR with prebuilt native libraries for
+`arm64-v8a` and `x86_64`.
+
+## Features
+
+- **Media probing** — container/codec/stream metadata for any FFmpeg-supported
+  format, including raw MPEG-TS streams with multi-audio/subtitle tracks and
+  language tags, plus the PSI program table (PAT/PMT/SDT) of multi-program
+  transport streams.
+- **Frame extraction** — decode and extract a video frame at a given timestamp
+  (RGBA, ready for `PixelMap`).
+- **Audio decoding** — software decoding to PCM (F32LE interleaved) at the
+  source's sample rate and channel layout (mono through 7.1; exotic or >8ch
+  layouts are downmixed to stereo), with realtime pacing, instant hot track
+  switching (all audio tracks decoded in parallel, switching re-routes the
+  output with zero re-buffering), pause/resume.
+- **Video decoding** — software decoding with direct `XComponent`/`OH_NativeWindow`
+  Surface rendering.
+- **Subtitles** — DVB/broadcast subtitle decoding to composited RGBA bitmaps
+  (or UTF-8 text), enabled from the container's declaration (a PMT entry is
+  enough, even when the subtitle PID never delivers data).
+- **Multi-program TS (MPTS)** — lock playback to a single MPEG-TS program by
+  its program number; other programs' streams are discarded at the demuxer.
+- **Transcoding / muxing** — full pipeline: decode → filter (`setpts`, `scale`,
+  `fps`) → encode (OpenH264 for H.264, native AAC for audio) → MP4/MPEG-TS mux
+  with `+faststart`.
+- **Network & live streaming** — HTTPS (OpenSSL), HTTP, HLS (live and VOD),
+  plain TS over HTTP. `src` accepts URLs anywhere a file path is accepted.
+
+All processing runs in native worker threads; the JS API is promise/callback
+based and never blocks the UI thread. FFmpeg diagnostics are forwarded to
+`hilog` (domain `0xFF00`, tag `FFmpeg`).
+
+## Installation
+
+```json5
+// oh-package.json5
+"dependencies": {
+  "@suplayer/ffmpeg": "^1.5.0"
+}
+```
+
+## Permissions
+
+Network sources (HTTP/HTTPS/HLS) require the Internet permission in the
+consuming HAP's `module.json5`:
+
+```json5
+"requestPermissions": [
+  { "name": "ohos.permission.INTERNET" }
+]
+```
+
+Local file playback needs no permission when reading files inside the app's
+own sandbox; other paths require the usual file access permissions.
+
+## Quick start
+
+```ts
+import {
+  probe, extractFrame, transcode,
+  FFAudioDecoder, FFVideoDecoder,
+  FFMediaInfo, FFFrame, FFTranscodeOptions, FFTranscodeResult
+} from '@suplayer/ffmpeg';
+
+// 1. Probe a media file
+const info: FFMediaInfo = await probe('/data/app/el2/100/base/.../files/input.ts');
+console.info(info.format, info.duration, info.streams.length);
+
+// 2. Extract a frame (RGBA)
+const frame: FFFrame = await extractFrame(path, 5000); // ms
+
+// 3. Decode + play audio through AudioRenderer
+const dec = new FFAudioDecoder();
+const info = await dec.open(path, 1); // stream #1
+dec.on('pcm', (pkt) => renderer.write(pkt.data));
+dec.on('end', () => renderer.stop());
+dec.start(); // paced=true (realtime); pass false for max-speed decoding
+
+// Switch audio track while playing (multi-track TS)
+dec.switchTrack(2);
+
+// 4. Render video onto an XComponent surface
+const vdec = new FFVideoDecoder();
+const vinfo = await vdec.open(path);
+vdec.on('frame', (ev) => console.info(`frame @${ev.ptsMs}ms`));
+vdec.start(surfaceId); // from XComponent
+
+// 5. Transcode: TS -> MP4 with scaling
+const result: FFTranscodeResult = await transcode(srcPath, {
+  dst: outPath,
+  width: 160,
+  height: 90,
+  videoBitrate: 400000,
+  audioBitrate: 64000
+});
+
+// 6. Play an HLS live stream (HTTPS), starting at the live edge
+const live = new FFVideoDecoder();
+await live.open('https://example.com/live/index.m3u8', -1, {
+  liveStartIndex: -1,        // first segment from the end = lowest latency
+  analyzeMs: 5000,           // cap stream-info analysis for faster startup
+  allowedExtensions: 'ALL'   // for playlists with disguised segment URLs
+});
+live.start(surfaceId);
+
+// 7. Multi-program TS: probe the program table, then play one program
+const tsInfo: FFMediaInfo = await probe('https://example.com/mpts.ts');
+for (const p of tsInfo.programs) {
+  console.info(`program ${p.programNum} "${p.serviceName}" PMT ${p.pmtPid}`);
+}
+const vdec2 = new FFVideoDecoder();
+await vdec2.open('https://example.com/mpts.ts', -1, { program: 101 });
+vdec2.start(surfaceId); // only program 101's streams are demuxed
+```
+
+## API
+
+### `probe(src: string, options?: FFNetOptions): Promise<FFMediaInfo>`
+
+Returns container metadata and the full stream list. Each `FFStreamInfo`
+carries `index`, `type` (`video`/`audio`/`subtitle`/...), codec name, dimensions
+or sample rate/channels, `language`, duration and bitrate. For raw MPEG-TS
+inputs each stream also carries `pid` (its transport PID) and `programIndex`
+(index into `programs`); other containers report `pid: -1` because their
+stream ids are track/playlist indexes rather than PIDs.
+
+`FFMediaInfo.programs` lists the PSI program table (PAT/PMT/SDT) of
+multi-program transport streams: `programNum`, `pmtPid`, `pcrPid`,
+`pmtVersion` (PMT version_number, `-1` when unknown), `flags` (bit 0 =
+`AV_PROGRAM_RUNNING`), SDT `serviceName`/`serviceProvider` and the
+`streamIndexes` belonging to each program. `pmtPid`/`pcrPid`/`pmtVersion` are
+`-1` when the input carries no PSI. HLS exposes one synthetic program per
+variant (`programNum` 0, no SDT name, no PIDs) while MP4 reports none.
+
+### `extractFrame(src: string, timeMs: number): Promise<FFFrame>`
+
+Decodes the nearest video frame at `timeMs` and returns RGBA pixels
+(`width`, `height`, `data: ArrayBuffer`).
+
+### `transcode(src: string, options: FFTranscodeOptions): Promise<FFTranscodeResult>`
+
+One-shot transcode on a background worker. `FFTranscodeOptions`:
+
+| Field | Default | Description |
+|---|---|---|
+| `dst` | (required) | Output path; container inferred from extension (`.mp4`, `.ts`) |
+| `width` / `height` | source size | Scale filter target |
+| `fps` | source fps | fps filter target |
+| `videoBitrate` | 800000 | H.264 (OpenH264) target bitrate, bps |
+| `audioBitrate` | 96000 | AAC target bitrate, bps; `0` disables the audio track |
+| `startTimeMs` | 0 | Seek into the source before encoding |
+| `durationMs` | 0 (to EOF) | Stop encoding after this span |
+
+`FFTranscodeResult` reports `outputSize` (bytes), `durationMs` of the produced
+file and encoded video `frames`. Output timestamps are normalized to start at
+zero.
+
+### `FFNetOptions`
+
+Optional network/live options accepted by `probe` and both decoders' `open`:
+
+| Field | Default | Description |
+|---|---|---|
+| `userAgent` | `Lavf/7.1.1` | HTTP `User-Agent`; also applied to all HLS segment/key downloads |
+| `headers` | none | Extra HTTP headers, CRLF-separated (e.g. `"Referer: https://x\r\nCookie: y=z"`) |
+| `allowedExtensions` | FFmpeg whitelist | HLS segment extension whitelist, comma-separated. Pass `'ALL'` (and setting this at all) disables strict extension/format matching for streams whose playlist/segment URLs use disguised extensions (e.g. `.php` playlists, `.jpg`-named TS segments) |
+| `liveStartIndex` | `-3` | HLS live: segment index to start at; negative counts back from the live edge. `-1` starts at the newest segment (lowest latency, may join mid-GOP) |
+| `analyzeMs` | FFmpeg default | Cap `avformat_find_stream_info` analysis duration in ms — lower values speed up live startup |
+| `hw` | `'auto'` | Video decode backend: `'auto'` prefers the hardware decoder and falls back to software on failure, `'force'` requires hardware, `'never'` always uses software (FFVideoDecoder only) |
+| `program` | unset | MPEG-TS program number to lock playback to. When set, only streams of that program are demuxed; automatic stream selection stays inside the program and explicit `streamIndex` values are validated against it. Unknown program numbers fail the `open` |
+
+For live streams `durationMs` is `0` and the `'end'` event never fires; use
+`stop()` to end playback. `stop()` also aborts in-flight network reads
+immediately.
+
+### `FFAudioDecoder`
+
+```ts
+open(src: string, streamIndex?: number, options?: FFNetOptions): Promise<FFAudioOpenInfo>
+on(event: 'pcm', cb: (packet: FFAudioPacket) => void): void   // F32LE interleaved
+on(event: 'end', cb: () => void): void
+on(event: 'error', cb: (msg: string) => void): void
+on(event: 'switched', cb: (info: FFAudioOpenInfo) => void): void
+start(paced?: boolean): void      // default true = realtime pacing
+switchTrack(streamIndex: number): void  // instant hot switch, mid-playback
+pause(): void; resume(): void
+stop(): void; close(): void
+```
+
+All audio tracks of the source (within the locked `program`, if any) are
+decoded in parallel from the start, so `switchTrack` only re-routes the output:
+no decoder re-open, no re-buffering, no gap. Every track is resampled to the
+initial track's sample rate and channel layout, so the output format (and your
+`AudioRenderer` configuration) stays constant across switches.
+
+`FFAudioOpenInfo.channels` reports the output channel count and
+`FFAudioOpenInfo.channelLayout` the output channel mask (FFmpeg `AV_CH_*`
+bits, numerically identical to OHOS `audio.AudioChannelLayout` values; `0x3`
+= stereo) — pass them straight to `AudioRendererOptions.streamInfo`.
+
+### `FFVideoDecoder`
+
+```ts
+open(src: string, streamIndex?: number, options?: FFNetOptions): Promise<FFVideoOpenInfo>
+on(event: 'frame', cb: (ev: FFVideoFrameEvent) => void): void
+on(event: 'end', cb: () => void): void
+on(event: 'error', cb: (msg: string) => void): void
+on(event: 'info', cb: (ev: FFVideoInfoEvent) => void): void  // { backend: 'hw' | 'sw' }
+start(surfaceId: string): void    // renders into XComponent surface
+pause(): void; resume(): void
+stop(): void; close(): void
+```
+
+#### Hardware decoding
+
+With `hw: 'auto'` (default), H.264/HEVC streams in Annex-B framing (MPEG-TS,
+HLS-TS) are decoded by the AVCodec Kit hardware decoder (`OH_VideoDecoder`,
+surface mode) and rendered straight onto the XComponent surface — including
+10-bit HEVC (verified with 4K 3840x2160@50 HEVC Main10 live input at realtime
+frame rates). MP4-style length-prefixed streams are detected automatically and
+stay on the software path. The active backend is reported once via the
+`'info'` event (`{ backend: 'hw' | 'sw' }`) after `start`.
+
+### `FFSubtitleDecoder`
+
+```ts
+open(src: string, streamIndex?: number, options?: FFNetOptions): Promise<FFSubtitleOpenInfo>
+on(event: 'subtitle', cb: (ev: FFSubtitleEvent) => void): void
+on(event: 'end', cb: () => void): void
+on(event: 'error', cb: (msg: string) => void): void
+start(paced?: boolean): void      // default true = presentation-time pacing
+pause(): void; resume(): void
+stop(): void; close(): void
+```
+
+`open` accepts a stream that is merely *declared* by the container — a DVB
+subtitle entry in the PMT is enough: it succeeds and stays enabled even when
+the subtitle PID never carries a single packet (`declared: true` in the open
+info), so subtitles can be turned on straight from the program table.
+`streamIndex < 0` picks the first declared subtitle stream (inside the locked
+`program`, when `program` is set).
+
+Each `'subtitle'` event carries one decoded display set:
+
+| Field | Description |
+|---|---|
+| `clear` | `true` for an empty display set — clear what is on screen |
+| `ptsMs` / `durationMs` | Presentation time and display duration |
+| `canvasWidth` / `canvasHeight` | Composition size to scale against (falls back to the video size) |
+| `x` / `y` / `width` / `height` | Bounding box of the visible subtitle content, in composition coordinates |
+| `rgba` | RGBA8888 bitmap of that box (`width * height * 4` bytes), empty when `clear` |
+| `regionCount` | Bitmap regions composited into this box |
+| `text` | UTF-8 text for text-based subtitle streams (bitmap streams leave it empty) |
+
+Bitmap regions (DVB, DVD) are composited into a single box, cropped to the
+non-transparent area — a full-screen DVB page shrinks to a small text strip, so
+only a few dozen kilobytes cross the bridge per display set.
+
+```ts
+const subs = new FFSubtitleDecoder();
+const info = await subs.open(liveUrl, -1, { liveStartIndex: -1 }); // PMT-declared is enough
+subs.on('subtitle', async (ev) => {
+  if (ev.clear || ev.rgba.byteLength === 0) { overlay = undefined; return; }
+  overlay = await image.createPixelMap(ev.rgba, {      // draw at (ev.x, ev.y) scaled by
+    size: { width: ev.width, height: ev.height },      // boxWidth / ev.canvasWidth
+    pixelFormat: image.PixelMapFormat.RGBA_8888,
+    srcPixelFormat: image.PixelMapFormat.RGBA_8888
+  });
+});
+subs.start(true);
+```
+
+## Supported ABIs
+
+- `arm64-v8a` (devices)
+- `x86_64` (emulator)
+
+`libc++_shared.so` is bundled automatically.
+
+## Building from source
+
+The prebuilt native libraries are produced by the scripts in
+`tools/ffmpeg-build/` of the project repository (MSYS2 + OpenHarmony LLVM
+toolchain):
+
+```bash
+./build-openssl.sh          # OpenSSL 3.4.1 -> prebuilt/<abi>/libssl.a, libcrypto.a
+./build-openh264.sh         # OpenH264 2.5.0 -> prebuilt/<abi>/libopenh264.a
+./build-ffmpeg.sh m7        # FFmpeg 7.1.1  -> prebuilt/<abi>/libav*.a etc.
+```
+
+Copy the results into `ffmpeg/src/main/cpp/third_party/ffmpeg/libs/<abi>/`
+and rebuild the HAR. This also documents how to relink the library against a
+modified FFmpeg, as required for LGPL compliance.
+
+## License
+
+This library is distributed under the **LGPL-2.1-or-later**; see [LICENSE](LICENSE).
+No GPL/nonfree FFmpeg components are enabled. Full third-party license texts
+(BSD-2-Clause, Apache-2.0, Zlib) and static-linkage/LGPL-relinking details are
+appended to [LICENSE](LICENSE); the repository also carries them in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Third-party components
+
+| Component | Version | License |
+|---|---|---|
+| FFmpeg | 7.1.1 | LGPL-2.1-or-later |
+| OpenH264 | 2.5.0 | BSD-2-Clause |
+| OpenSSL | 3.4.1 | Apache-2.0 |
+| LLVM libc++ (`libc++_shared.so`) | NDK bundled | Apache-2.0 WITH LLVM-exception |
+| zlib | system provided | Zlib |
+
+License texts, exact FFmpeg build configuration and LGPL relinking
+instructions: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

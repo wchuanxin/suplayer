@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "module description"
+    },
+    {
+      "name": "SupAbility_desc",
+      "value": "description"
+    },
+    {
+      "name": "SupAbility_label",
+      "value": "suplayer"
+    }
+  ]
+}

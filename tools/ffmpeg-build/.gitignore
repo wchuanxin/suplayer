@@ -1,0 +1,9 @@
+build/
+prebuilt/
+ffmpeg-*.tar.xz
+ffmpeg-*/
+
+openh264-*/
+openssl-*
+*.tar.gz
+ohos-toolchain/

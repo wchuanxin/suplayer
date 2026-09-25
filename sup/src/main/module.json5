@@ -1,0 +1,58 @@
+{
+  "module": {
+    "name": "sup",
+    "type": "entry",
+    "description": "$string:module_desc",
+    "mainElement": "SupAbility",
+    "deviceTypes": [
+      "phone",
+      "tablet",
+      "2in1",
+      "car"
+    ],
+    "deliveryWithInstall": true,
+    "installationFree": false,
+    "requestPermissions": [
+      {
+        "name": "ohos.permission.INTERNET"
+      }
+    ],
+    "pages": "$profile:main_pages",
+    "abilities": [
+      {
+        "name": "SupAbility",
+        "srcEntry": "./ets/supability/SupAbility.ets",
+        "description": "$string:SupAbility_desc",
+        "icon": "$media:layered_image",
+        "label": "$string:SupAbility_label",
+        "startWindowIcon": "$media:startIcon",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": true,
+        "skills": [
+          {
+            "entities": [
+              "entity.system.home"
+            ],
+            "actions": [
+              "ohos.want.action.home"
+            ]
+          }
+        ]
+      }
+    ],
+    "extensionAbilities": [
+      {
+        "name": "SupBackupAbility",
+        "srcEntry": "./ets/supbackupability/SupBackupAbility.ets",
+        "type": "backup",
+        "exported": false,
+        "metadata": [
+          {
+            "name": "ohos.extension.backup",
+            "resource": "$profile:backup_config"
+          }
+        ],
+      }
+    ]
+  }
+}
