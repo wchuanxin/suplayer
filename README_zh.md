@@ -22,7 +22,7 @@
 }
 ```
 
-已发布至 [OHPM 三方库中心](https://ohpm.openharmony.cn)。完整 API 文档：
+完整 API 文档：
 [`ffmpeg/README.md`](ffmpeg/README.md)。
 
 ## 快速示例
