@@ -34,6 +34,8 @@ target_link_libraries(ffmpeg PUBLIC
     ${FFMPEG_PREBUILT}/libs/${OHOS_ARCH}/libswresample.a
     ${FFMPEG_PREBUILT}/libs/${OHOS_ARCH}/libavcodec.a
     ${FFMPEG_PREBUILT}/libs/${OHOS_ARCH}/libopenh264.a
+    ${FFMPEG_PREBUILT}/libs/${OHOS_ARCH}/libdavs2.a
+    ${FFMPEG_PREBUILT}/libs/${OHOS_ARCH}/libuavs3d.a
     ${FFMPEG_PREBUILT}/libs/${OHOS_ARCH}/libssl.a
     ${FFMPEG_PREBUILT}/libs/${OHOS_ARCH}/libcrypto.a
     ${FFMPEG_PREBUILT}/libs/${OHOS_ARCH}/libavutil.a
@@ -46,6 +48,7 @@ target_link_libraries(ffmpeg PUBLIC
     libnative_media_codecbase.so
     libnative_media_core.so
     z
+    m
     dl
 )
 

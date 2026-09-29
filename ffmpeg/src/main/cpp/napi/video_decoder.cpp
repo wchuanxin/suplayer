@@ -776,6 +776,8 @@ private:
         bool eofSent = false;
         int64_t firstPts = AV_NOPTS_VALUE;
         auto startWall = std::chrono::steady_clock::now();
+        bool pausing = false;
+        auto pauseStart = std::chrono::steady_clock::now();
         int rendered = 0;
         int failed = 0;
         if (hwPendingPkt_ != nullptr) {
@@ -786,8 +788,18 @@ private:
 
         while (!stop_) {
             if (paused_) {
+                if (!pausing) {
+                    pausing = true;
+                    pauseStart = std::chrono::steady_clock::now();
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
+            }
+            if (pausing) {
+                // Shift the pacing anchor by the paused span so frames do not
+                // burst out to catch up with the wall clock after resume.
+                startWall += std::chrono::steady_clock::now() - pauseStart;
+                pausing = false;
             }
             int ret = avcodec_receive_frame(dec_, frame);
             if (ret == AVERROR(EAGAIN)) {

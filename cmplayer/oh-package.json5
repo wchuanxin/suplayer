@@ -1,9 +1,11 @@
 {
   "name": "cmplayer",
   "version": "1.0.0",
-  "description": "Please describe the basic information.",
+  "description": "Player UI components built on the @suplayer/ffmpeg media kernel.",
   "main": "Index.ets",
   "author": "",
-  "license": "Apache-2.0",
-  "dependencies": {}
+  "license": "LGPL-2.1-or-later",
+  "dependencies": {
+    "@suplayer/ffmpeg": "file:../ffmpeg"
+  }
 }

@@ -1,14 +1,19 @@
 # Third Party Notices
 
 The native library `libs/<abi>/libffmpeg.so` shipped in this package
-statically links the third-party components listed below. The combined work
-is distributed under the terms of the **GNU LGPL-2.1-or-later** (see
-[LICENSE](LICENSE)).
+statically links the third-party components listed below. Because the build
+enables GPL components (libdavs2) and version-3 (OpenSSL 3.x), the combined
+work is distributed under the terms of the **GNU GPL-3.0-or-later** (see
+[LICENSE](LICENSE)). Rebuilding FFmpeg without `--enable-gpl
+--enable-version3 --enable-libdavs2` reverts the combined work to
+LGPL-2.1-or-later (see `tools/ffmpeg-build/build-ffmpeg.sh`).
 
 | Component | Version | License | Linkage |
 |---|---|---|---|
-| FFmpeg | 7.1.1 | LGPL-2.1-or-later | static |
+| FFmpeg | 7.1.1 | LGPL-2.1-or-later (GPL-3.0-or-later build options enabled) | static |
 | OpenH264 | 2.5.0 | BSD-2-Clause | static |
+| davs2 | 1.6.0 (master snapshot) | GPL-2.0-or-later | static |
+| uavs3d | 1.2 (master snapshot) | BSD-2-Clause | static |
 | OpenSSL | 3.4.1 | Apache-2.0 | static |
 | LLVM libc++ (`libc++_shared.so`) | OHOS NDK bundled | Apache-2.0 WITH LLVM-exception | dynamic (bundled unmodified) |
 | zlib | system provided | Zlib | dynamic (system `libz.so`) |
@@ -25,7 +30,9 @@ operating system.
 
 - Homepage: https://ffmpeg.org
 - Source: https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz
-- License: **LGPL-2.1-or-later** (see [LICENSE](LICENSE))
+- License: **LGPL-2.1-or-later** for its sources; this build enables
+  `--enable-gpl --enable-version3`, placing the combined `libffmpeg.so` under
+  **GPL-3.0-or-later** (see [LICENSE](LICENSE)).
 - Linkage: `libavformat.a`, `libavfilter.a`, `libswscale.a`,
   `libswresample.a`, `libavcodec.a`, `libavutil.a` — statically linked into
   `libffmpeg.so`.
@@ -39,19 +46,23 @@ mode `m7`):
 --disable-programs --disable-avdevice --disable-postproc
 --disable-debug --disable-symver --enable-small
 --disable-everything
+--enable-gpl --enable-version3
 --enable-network --enable-protocols
 --enable-demuxers --enable-parsers --enable-bsfs --enable-decoders
 --enable-filters --enable-swscale --enable-swresample
 --enable-avformat --enable-avcodec --enable-avfilter
 --enable-zlib
---enable-libopenh264 --enable-encoder=libopenh264,aac
+--enable-libopenh264 --enable-libdavs2 --enable-libuavs3d
+--enable-encoder=libopenh264,aac
 --enable-muxer=mp4,mpegts
 --enable-openssl
 ```
 
-`--enable-gpl`, `--enable-nonfree` and `--enable-version3` are **NOT** used;
-no GPL or nonfree FFmpeg components are enabled. All FFmpeg build modes of the
-project stay within the LGPL-2.1-or-later feature set.
+`--enable-gpl` (required by libdavs2) and `--enable-version3` (required by
+OpenSSL >= 3.x, Apache-2.0) upgrade the combined work from LGPL-2.1-or-later
+to **GPL-3.0-or-later**. `--enable-nonfree` is **NOT** used. To produce an
+LGPL-2.1-or-later build instead, remove `--enable-gpl --enable-version3
+--enable-libdavs2` (this drops AVS2 decoding) and rebuild.
 
 ## OpenH264 2.5.0
 
@@ -93,9 +104,9 @@ project stay within the LGPL-2.1-or-later feature set.
 - Linkage: `libssl.a`, `libcrypto.a` — statically linked into `libffmpeg.so`;
   provides the `https`/`tls` FFmpeg protocols.
 
-Apache-2.0 is approved by the FSF for use with GPL-3.0/LGPL-3.0 and is
-considered LGPL-2.1-compatible for this combined work; OpenSSL 3.x no longer
-applies its former OpenSSL License. The Apache-2.0 notice from the upstream
+Apache-2.0 is approved by the FSF for use with GPL-3.0/LGPL-3.0; since this
+build enables `--enable-version3`, OpenSSL 3.x (Apache-2.0) is license-
+compatible with the combined work. The Apache-2.0 notice from the upstream
 distribution is retained:
 
 > Copyright (c) 1998-2024 The OpenSSL Project Authors
@@ -115,7 +126,8 @@ distribution is retained:
 - License: **Apache-2.0 WITH LLVM-exception** (Apache-2.0 text in
   [Appendix A](#appendix-a-apache-license-version-20))
 - Linkage: dynamic; the unmodified `libc++_shared.so` from the OpenHarmony
-  NDK is bundled alongside `libffmpeg.so` as the C++ runtime of OpenH264.
+  NDK is bundled alongside `libffmpeg.so` as the C++ runtime of OpenH264 and
+  davs2.
 
 The LLVM exception to Apache-2.0 grants, in particular:
 
@@ -135,35 +147,79 @@ The LLVM exception to Apache-2.0 grants, in particular:
 > (C) 1995-2024 Jean-loup Gailly and Mark Adler
 >
 > This software is provided 'as-is', without any express or implied warranty.
-> In no event will the authors be held liable for any damages arising from
-> the use of this software.
+> In no event will the authors be held liable for any damages arising from the
+> use of this software.
 >
 > Permission is granted to anyone to use this software for any purpose,
 > including commercial applications, and to alter it and redistribute it
 > freely, subject to the following restrictions:
 >
 > 1. The origin of this software must not be misrepresented; you must not
->    claim that you wrote the original software. If you use this software in
->    a product, an acknowledgment in the product documentation would be
+>    claim that you wrote the original software. If you use this software in a
+>    product, an acknowledgment in the product documentation would be
 >    appreciated but is not required.
 > 2. Altered source versions must be plainly marked as such, and must not be
 >    misrepresented as being the original software.
 > 3. This notice may not be removed or altered from any source distribution.
 
+## davs2 1.6.0 (AVS2 decoder)
+
+- Homepage: https://github.com/pkuvcl/davs2 (master snapshot)
+- License: **GPL-2.0-or-later** — the reason this build enables `--enable-gpl`.
+  Upstream also offers a commercial proprietary license (contact
+  sswang@pku.edu.cn per the source headers).
+- Linkage: `libdavs2.a` — statically linked into `libffmpeg.so`; used as the
+  AVS2 (AVS2-P2/IEEE.1857.4, GB/T 33475.2) software decoder backend
+  (`libdavs2` FFmpeg decoder). Built with `tools/ffmpeg-build/build-davs2.sh`.
+
+License notice from the source headers:
+
+> This program is free software; you can redistribute it and/or modify
+> it under the terms of the GNU General Public License as published by
+> the Free Software Foundation; either version 2 of the License, or
+> (at your option) any later version.
+
+The complete GPL-2.0 text is available at
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt; the GPL-3.0 text
+governing the combined work is in [LICENSE](LICENSE).
+
+## uavs3d 1.2 (AVS3 decoder)
+
+- Homepage: https://github.com/uavs3/uavs3d (master snapshot)
+- License: **BSD-2-Clause**
+- Linkage: `libuavs3d.a` — statically linked into `libffmpeg.so`; used as the
+  AVS3 (AVS3-P2/IEEE.1857.10) software decoder backend (`libuavs3d` FFmpeg
+  decoder). Built with `tools/ffmpeg-build/build-uavs3d.sh`.
+
+> Copyright (c) 2018-2022 ["Peking University Shenzhen Graduate School",
+> "Peng Cheng Laboratory", and "Guangdong Bohua UHD Innovation Corporation"]
+> All rights reserved.
+>
+> Redistribution and use in source and binary forms, with or without
+> modification, are permitted provided that the following conditions are met:
+> 1. Redistributions of source code must retain the above copyright
+>    notice, this list of conditions and the following disclaimer.
+> 2. Redistributions in binary form must reproduce the above copyright
+>    notice, this list of conditions and the following disclaimer in the
+>    documentation and/or other materials provided with the distribution.
+
 ---
 
-## LGPL compliance notes
+## GPL compliance notes
 
-FFmpeg (LGPL-2.1-or-later) is **statically linked** into `libffmpeg.so`,
-making that library a combined work under LGPL-2.1-or-later. To satisfy the
-license's relinking requirement (LGPL-2.1 section 4), the complete build
-environment needed to reproduce the binaries or relink them against a
-modified FFmpeg is provided in the project repository under
-`tools/ffmpeg-build/`:
+FFmpeg (LGPL-2.1-or-later, built with `--enable-gpl --enable-version3`) and
+libdavs2 (GPL-2.0-or-later) are **statically linked** into `libffmpeg.so`,
+making that library a combined work under **GPL-3.0-or-later**. The complete
+corresponding source and the build environment needed to reproduce the
+binaries are provided in the project repository under `tools/ffmpeg-build/`:
 
 - `build-ffmpeg.sh` — cross-compiles FFmpeg 7.1.1 for `arm64-v8a` and
-  `x86_64` (mode `m7`); source tarball `ffmpeg-7.1.1.tar.xz` included.
+  `x86_64` (mode `m7`); source tarball `ffmpeg-7.1.1.tar.xz`.
 - `build-openh264.sh` — cross-compiles OpenH264 2.5.0 (`openh264-2.5.0.tar.gz`).
+- `build-davs2.sh` — cross-compiles davs2 (source:
+  https://github.com/pkuvcl/davs2, master snapshot tarball).
+- `build-uavs3d.sh` — cross-compiles uavs3d (source:
+  https://github.com/uavs3/uavs3d, master snapshot tarball).
 - `build-openssl.sh` — cross-compiles OpenSSL 3.4.1 (`openssl-3.4.1.tar.gz`).
 - `prebuilt/` — resulting static libraries and headers.
 

@@ -5,5 +5,8 @@ ffmpeg-*/
 
 openh264-*/
 openssl-*
+davs2*
+uavs3d*
 *.tar.gz
+*.tar.xz
 ohos-toolchain/

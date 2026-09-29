@@ -16,8 +16,6 @@ struct Index {
   @State frameMsg: string = '';
   @State decoding: boolean = false;
   @State audioMsg: string = '';
-  @State videoMsg: string = '';
-  @State playing: boolean = false;
   @State trackMsg: string = '';
   @State currentTrack: number = -1;
   @State transcoding: boolean = false;
@@ -32,8 +30,16 @@ struct Index {
   @State subBox: number[] = [0, 0, 0, 0];
   @State subCanvas: number[] = [0, 0];
   @State subText: string = '';
+  @State subStreamIndex: number = -1;
   @State videoBoxW: number = 0;
   @State videoBoxH: number = 0;
+  @State avPlaying: boolean = false;
+  @State avPaused: boolean = false;
+  @State avPosMs: number = 0;
+  @State avDurMs: number = 0;
+  @State avMsg: string = '';
+  @State hwBackend: string = '';
+  @State hwMode: 'auto' | 'force' | 'never' = 'auto';
 
   private probedPath: string = '';
   private renderer: audio.AudioRenderer | undefined = undefined;
@@ -51,6 +57,17 @@ struct Index {
   private subTimer: number = -1;
   private videoW: number = 0;
   private videoH: number = 0;
+  private avVideoDec: FFVideoDecoder | undefined = undefined;
+  private avAudioDec: FFAudioDecoder | undefined = undefined;
+  private avRenderer: audio.AudioRenderer | undefined = undefined;
+  private avWriteChain: Promise<void> = Promise.resolve();
+  private avFrames: number = 0;
+  private avBasePts: number = -1;
+  private lastAudioPts: number = -1;
+  private lastVideoPts: number = -1;
+  private lastSubPts: number = -1;
+  private syncTimer: number = -1;
+  private correcting: boolean = false;
 
   private programLabel(s: FFStreamInfo): string {
     if (s.programIndex < 0 || s.programIndex >= this.programNums.length) {
@@ -75,6 +92,23 @@ struct Index {
       return { liveStartIndex: -1, analyzeMs: 2000, allowedExtensions: 'ALL' };
     }
     return {};
+  }
+
+  private videoOptionsFor(src: string): FFNetOptions {
+    const opts: FFNetOptions = this.netOptionsFor(src);
+    opts.hw = this.hwMode;
+    return opts;
+  }
+
+  private formatClock(ms: number): string {
+    const total: number = Math.max(0, Math.floor(ms / 1000));
+    const h: number = Math.floor(total / 3600);
+    const m: number = Math.floor((total % 3600) / 60);
+    const s: number = total % 60;
+    if (h > 0) {
+      return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    }
+    return `${m}:${s.toString().padStart(2, '0')}`;
   }
 
   // Maps an output channel count to the AudioRenderer enum; unsupported counts
@@ -301,42 +335,6 @@ struct Index {
       });
   }
 
-  private doPlayVideo(): void {
-    if (this.srcPath.length === 0 || this.playing) {
-      return;
-    }
-    this.playing = true;
-    this.videoMsg = '打开中...';
-
-    const dec = new FFVideoDecoder();
-    let frames = 0;
-    dec.open(this.srcPath, -1, this.netOptionsFor(this.srcPath))
-      .then((info: FFVideoOpenInfo): void => {
-        this.videoMsg = `${info.width}x${info.height} ${info.fps.toFixed(0)}fps ${info.codec}`;
-        this.xcc.setXComponentSurfaceSize({ surfaceWidth: info.width, surfaceHeight: info.height });
-        const surfaceId = this.xcc.getXComponentSurfaceId();
-        dec.on('frame', (ev: FFVideoFrameEvent): void => {
-          frames++;
-        });
-        dec.on('end', (): void => {
-          this.playing = false;
-          this.videoMsg = `播放完成 frames=${frames}`;
-          console.info(`FFVIDEO_OK frames=${frames} dur=${info.durationMs}`);
-        });
-        dec.on('error', (msg: string): void => {
-          this.playing = false;
-          this.videoMsg = `失败: ${msg}`;
-          console.error(`FFVIDEO_FAIL ${msg}`);
-        });
-        dec.start(surfaceId);
-      })
-      .catch((err: Error): void => {
-        this.playing = false;
-        this.videoMsg = `打开失败: ${err.message}`;
-        console.error(`FFVIDEO_OPEN_FAIL ${err.message}`);
-      });
-  }
-
   private async createTrackRenderer(info: FFAudioOpenInfo): Promise<audio.AudioRenderer> {
     const renderer = await audio.createAudioRenderer(this.rendererOptionsOf(info));
     await renderer.start();
@@ -433,6 +431,272 @@ struct Index {
     }
   }
 
+  // Unified playback: FFVideoDecoder renders to the XComponent surface while
+  // FFAudioDecoder feeds an AudioRenderer; audio is the master clock, progress
+  // is tracked from packet pts, and pause/resume freezes both decoders.
+  private startAvPlayback(): void {
+    if (this.srcPath.length === 0 || this.avPlaying) {
+      return;
+    }
+    this.stopMptsPlayback();
+    this.avPlaying = true;
+    this.avPaused = false;
+    this.avMsg = '打开中...';
+    this.hwBackend = '';
+    this.avPosMs = 0;
+    this.avDurMs = 0;
+    this.avFrames = 0;
+    this.avBasePts = -1;
+    this.lastAudioPts = -1;
+    this.lastVideoPts = -1;
+    this.correcting = false;
+    const src = this.srcPath;
+    const opts = this.videoOptionsFor(src);
+    const vdec = new FFVideoDecoder();
+    this.avVideoDec = vdec;
+    vdec.open(src, -1, opts)
+      .then((info: FFVideoOpenInfo): void => {
+        if (!this.avPlaying || this.avVideoDec !== vdec) {
+          vdec.close();
+          return;
+        }
+        this.videoW = info.width;
+        this.videoH = info.height;
+        this.avDurMs = info.durationMs;
+        this.avMsg = `${info.width}x${info.height} ${info.fps.toFixed(0)}fps ${info.codec}`;
+        this.xcc.setXComponentSurfaceSize({ surfaceWidth: info.width, surfaceHeight: info.height });
+        const surfaceId = this.xcc.getXComponentSurfaceId();
+        vdec.on('info', (ev: FFVideoInfoEvent): void => {
+          this.hwBackend = ev.backend === 'hw' ? '硬解 (AVCodec)' : '软解 (FFmpeg)';
+          console.info(`FFAV_BACKEND ${ev.backend}`);
+        });
+        vdec.on('frame', (ev: FFVideoFrameEvent): void => {
+          this.avFrames++;
+          this.lastVideoPts = ev.ptsMs;
+          if (this.lastAudioPts < 0) {
+            this.avTrackPos(ev.ptsMs);
+          }
+        });
+        vdec.on('end', (): void => {
+          console.info(`FFAV_VIDEO_END frames=${this.avFrames}`);
+          if (this.avPlaying) {
+            this.avMsg = `播放完成 (视频 ${this.avFrames} 帧)`;
+            this.stopAvPlayback();
+          }
+        });
+        vdec.on('error', (msg: string): void => {
+          console.error(`FFAV_VIDEO_FAIL ${msg}`);
+          if (this.avPlaying) {
+            this.avMsg = `视频失败: ${msg}`;
+            this.stopAvPlayback();
+          }
+        });
+        vdec.start(surfaceId);
+        this.openAvAudio(src, opts);
+      })
+      .catch((err: Error): void => {
+        console.error(`FFAV_OPEN_FAIL ${err.message}`);
+        this.avMsg = `打开失败: ${err.message}`;
+        this.stopAvPlayback();
+      });
+  }
+
+  private openAvAudio(src: string, opts: FFNetOptions): void {
+    const adec = new FFAudioDecoder();
+    this.avAudioDec = adec;
+    adec.open(src, -1, opts)
+      .then((info: FFAudioOpenInfo): void => {
+        if (!this.avPlaying || this.avAudioDec !== adec) {
+          adec.close();
+          return;
+        }
+        if (this.avDurMs <= 0) {
+          this.avDurMs = info.durationMs;
+        }
+        console.info(`FFAV_AUDIO_OPEN ${info.codec} ${info.sampleRate}Hz ch=${info.channels}`);
+        this.createTrackRenderer(info)
+          .then((renderer: audio.AudioRenderer): void => {
+            if (!this.avPlaying) {
+              this.releaseRenderer(renderer);
+              return;
+            }
+            this.avRenderer = renderer;
+            adec.on('pcm', (packet: FFAudioPacket): void => {
+              this.lastAudioPts = packet.ptsMs;
+              this.avTrackPos(packet.ptsMs);
+              this.avWriteChain = this.avWriteChain
+                .then(async (): Promise<void> => {
+                  await renderer.write(packet.data);
+                })
+                .catch((e: BusinessError): void => {
+                  console.error(`FFAUDIO_WRITE_FAIL ${e.message}`);
+                });
+            });
+            adec.on('end', (): void => {
+              // Audio EOF: fall back to the video clock as master.
+              console.info('FFAV_AUDIO_END');
+              this.lastAudioPts = -1;
+            });
+            adec.on('error', (msg: string): void => {
+              console.error(`FFAV_AUDIO_FAIL ${msg}`);
+              this.lastAudioPts = -1;
+            });
+            adec.start(true);
+            this.startAvSyncTimer();
+          })
+          .catch((err: Error): void => {
+            console.error(`FFAV_RENDERER_FAIL ${err.message}`);
+            this.startAvSyncTimer();
+          });
+      })
+      .catch((err: Error): void => {
+        // Video-only playback (e.g. a source without an audio track).
+        console.info(`FFAV_NO_AUDIO ${err.message}`);
+        this.avAudioDec = undefined;
+        this.startAvSyncTimer();
+      });
+  }
+
+  private avTrackPos(ptsMs: number): void {
+    if (this.avBasePts < 0) {
+      this.avBasePts = ptsMs;
+    }
+    this.avPosMs = Math.max(0, ptsMs - this.avBasePts);
+  }
+
+  private startAvSyncTimer(): void {
+    if (this.syncTimer >= 0) {
+      return;
+    }
+    this.syncTimer = setInterval((): void => {
+      this.runAvSyncTick();
+    }, 1000);
+  }
+
+  private stopAvSyncTimer(): void {
+    if (this.syncTimer >= 0) {
+      clearInterval(this.syncTimer);
+      this.syncTimer = -1;
+    }
+  }
+
+  // Coarse A/V drift correction, ticked once per second. Compares the video
+  // presentation position against the audio master clock (or the video clock
+  // alone for audio-less sources) and freezes whichever stream runs ahead: the
+  // native pacing anchor shifts by the paused span, delaying that stream until
+  // the two clocks re-align.
+  private runAvSyncTick(): void {
+    if (!this.avPlaying || this.avPaused || this.correcting) {
+      return;
+    }
+    const master = this.lastAudioPts >= 0 ? this.lastAudioPts : this.lastVideoPts;
+    if (master < 0) {
+      return;
+    }
+    if (this.lastAudioPts >= 0 && this.lastVideoPts >= 0) {
+      const skewV = this.lastVideoPts - this.lastAudioPts;
+      if (Math.abs(skewV) > 3000) {
+        console.error(`FFAV_SYNC_SKEW ${skewV.toFixed(0)}ms out of range, skipped`);
+        return;
+      }
+      if (skewV > 150) {
+        const span = Math.min(skewV, 500);
+        this.correcting = true;
+        this.avVideoDec?.pause();
+        setTimeout((): void => {
+          if (this.avVideoDec !== undefined && this.avPlaying && !this.avPaused) {
+            this.avVideoDec.resume();
+          }
+          this.correcting = false;
+        }, span);
+        return;
+      }
+      if (skewV < -150) {
+        const span = Math.min(-skewV, 500);
+        this.correcting = true;
+        this.avAudioDec?.pause();
+        setTimeout((): void => {
+          if (this.avAudioDec !== undefined && this.avPlaying && !this.avPaused) {
+            this.avAudioDec.resume();
+          }
+          this.correcting = false;
+        }, span);
+        return;
+      }
+    }
+    // A displayed subtitle naturally lags the master clock while it stays on
+    // screen; only correct when it is presented ahead of it.
+    if (this.subDec !== undefined && this.lastSubPts >= 0) {
+      const skewS = this.lastSubPts - master;
+      if (skewS > 400 && skewS < 5000) {
+        const span = Math.min(skewS, 800);
+        this.correcting = true;
+        this.subDec.pause();
+        setTimeout((): void => {
+          if (this.subDec !== undefined && this.avPlaying && !this.avPaused) {
+            this.subDec.resume();
+          }
+          this.correcting = false;
+        }, span);
+      }
+    }
+  }
+
+  private toggleAvPause(): void {
+    if (!this.avPlaying) {
+      return;
+    }
+    if (this.avPaused) {
+      if (this.avRenderer !== undefined) {
+        this.avRenderer.start().catch((e: BusinessError): void => {
+          console.error(`FFRENDERER_RESUME_FAIL ${e.message}`);
+        });
+      }
+      this.avVideoDec?.resume();
+      this.avAudioDec?.resume();
+      this.subDec?.resume();
+      this.avPaused = false;
+    } else {
+      this.avVideoDec?.pause();
+      this.avAudioDec?.pause();
+      this.subDec?.pause();
+      if (this.avRenderer !== undefined) {
+        this.avRenderer.pause().catch((e: BusinessError): void => {
+          console.error(`FFRENDERER_PAUSE_FAIL ${e.message}`);
+        });
+      }
+      this.avPaused = true;
+    }
+  }
+
+  private stopAvPlayback(): void {
+    this.stopAvSyncTimer();
+    if (this.avVideoDec !== undefined) {
+      this.avVideoDec.stop();
+      this.avVideoDec.close();
+      this.avVideoDec = undefined;
+    }
+    if (this.avAudioDec !== undefined) {
+      this.avAudioDec.stop();
+      this.avAudioDec.close();
+      this.avAudioDec = undefined;
+    }
+    if (this.avRenderer !== undefined) {
+      const r = this.avRenderer;
+      this.avRenderer = undefined;
+      this.avWriteChain
+        .catch((e: BusinessError): void => {
+          console.error(`FFAUDIO_WRITE_FAIL ${e.message}`);
+        })
+        .then(async (): Promise<void> => {
+          await this.releaseRenderer(r);
+        });
+    }
+    this.avPlaying = false;
+    this.avPaused = false;
+    this.correcting = false;
+  }
+
   private lenToNumber(v: Length): number {
     if (typeof v === 'number') {
       return v;
@@ -470,6 +734,7 @@ struct Index {
 
   private applySubtitle(ev: FFSubtitleEvent): void {
     this.subEvents++;
+    this.lastSubPts = ev.ptsMs;
     console.info(`FFSUBEV n=${this.subEvents} clear=${ev.clear} box=${ev.x},${ev.y} ${ev.width}x${ev.height} regions=${ev.regionCount} canvas=${ev.canvasWidth}x${ev.canvasHeight} textLen=${ev.text.length} bytes=${ev.rgba.byteLength}`);
     if (this.subTimer >= 0) {
       clearTimeout(this.subTimer);
@@ -517,20 +782,24 @@ struct Index {
     }
     this.clearSubtitle();
     this.subOn = false;
+    this.subStreamIndex = -1;
+    this.lastSubPts = -1;
   }
 
   // Enables DVB/broadcast subtitles for the given source. As soon as the
   // container declares a subtitle stream (a PMT entry is enough) the decoder
-  // opens — even when its PID never carries data.
-  private startSubtitle(src: string, opts: FFNetOptions): void {
+  // opens — even when its PID never carries data. streamIndex < 0 selects the
+  // first declared subtitle stream.
+  private startSubtitle(src: string, opts: FFNetOptions, streamIndex: number): void {
     if (this.subDec !== undefined) {
       return;
     }
     const dec = new FFSubtitleDecoder();
     this.subDec = dec;
-    dec.open(src, -1, opts)
+    dec.open(src, streamIndex, opts)
       .then((info: FFSubtitleOpenInfo): void => {
         console.info(`FFSUB_OPEN codec=${info.codec} lang=${info.language} canvas=${info.width}x${info.height} declared=${info.declared} idx=${info.streamIndex}`);
+        this.subStreamIndex = info.streamIndex;
         this.subOn = true;
         this.subMsg = `字幕: ${info.codec} ${info.language} declared=${info.declared}`;
         dec.on('subtitle', (ev: FFSubtitleEvent): void => {
@@ -546,13 +815,12 @@ struct Index {
         console.info(`FFSUB_OPEN_FAIL ${err.message}`);
         this.subDec = undefined;
         this.subOn = false;
+        this.subStreamIndex = -1;
         this.subMsg = `无字幕: ${err.message}`;
       });
   }
 
-  // Self-check for the "PMT declares subtitles" rule: probes a stream whose PMT
-  // carries a DVB subtitle entry but whose PID never delivers a single packet,
-  // then opens the subtitle decoder straight from that declaration.
+  // Toggles the first declared subtitle track on/off.
   private toggleSubtitle(): void {
     if (this.subDec !== undefined) {
       const n = this.subEvents;
@@ -561,8 +829,27 @@ struct Index {
       console.info(`FFSUB_STOP events=${n}`);
       return;
     }
+    this.toggleSubtitleAt(-1);
+  }
+
+  // Starts or restarts subtitles on an explicit subtitle stream; clicking the
+  // stream currently active stops it instead.
+  private toggleSubtitleAt(index: number): void {
+    if (this.subDec !== undefined) {
+      const sameTrack = this.subStreamIndex === index;
+      const n = this.subEvents;
+      this.stopSubtitle();
+      if (sameTrack) {
+        this.subMsg = `字幕已停止 (${n} 事件)`;
+        console.info(`FFSUB_STOP events=${n}`);
+        return;
+      }
+    }
+    if (this.probedPath.length === 0) {
+      return;
+    }
     this.subEvents = 0;
-    this.startSubtitle(this.probedPath, this.netOptionsFor(this.probedPath));
+    this.startSubtitle(this.probedPath, this.netOptionsFor(this.probedPath), index);
   }
 
   private stopMptsPlayback(): void {
@@ -599,6 +886,7 @@ struct Index {
       console.info(`FFMPTS_STOP program=${p.programNum} frames=${frames} audioPackets=${packets}`);
       return;
     }
+    this.stopAvPlayback();
     this.stopMptsPlayback();
     this.mptsPlaying = true;
     this.mptsProgram = p.programNum;
@@ -613,6 +901,8 @@ struct Index {
       .then((info: FFVideoOpenInfo): void => {
         console.info(`FFMPTS_VIDEO_OPEN program=${p.programNum} ${info.width}x${info.height} fps=${info.fps} codec=${info.codec}`);
         this.mptsMsg = `节目 ${p.programNum} (${p.serviceName}): ${info.width}x${info.height} ${info.codec}`;
+        this.videoW = info.width;
+        this.videoH = info.height;
         this.xcc.setXComponentSurfaceSize({ surfaceWidth: info.width, surfaceHeight: info.height });
         const surfaceId = this.xcc.getXComponentSurfaceId();
         vdec.on('frame', (ev: FFVideoFrameEvent): void => {
@@ -680,7 +970,18 @@ struct Index {
     return parts.join(', ');
   }
 
+  private rowBgOf(s: FFStreamInfo): string {
+    if (s.type === 'audio' && this.currentTrack === s.index) {
+      return '#D0EBFF';
+    }
+    if (s.type === 'subtitle' && this.subStreamIndex === s.index) {
+      return '#E5DBFF';
+    }
+    return '#F1F3F5';
+  }
+
   aboutToDisappear(): void {
+    this.stopAvPlayback();
     this.stopMptsPlayback();
     this.stopSubtitle();
     if (this.audioDec !== undefined) {
@@ -704,6 +1005,28 @@ struct Index {
   }
 
   @Builder
+  hwOption(mode: 'auto' | 'force' | 'never', label: string)
+  {
+    Row({ space: 4 }) {
+      Radio({ value: mode, group: 'hw' })
+        .checked(this.hwMode === mode)
+        .width(18)
+        .height(18)
+        .onChange((on: boolean): void => {
+          if (on) {
+            this.hwMode = mode;
+          }
+        })
+      Text(label)
+        .fontSize(13)
+        .fontColor(this.hwMode === mode ? '#1971C2' : '#666666')
+    }
+    .onClick(() => {
+      this.hwMode = mode;
+    })
+  }
+
+  @Builder
   streamRow(s: FFStreamInfo)
   {
     Column({ space: 4 }) {
@@ -716,6 +1039,11 @@ struct Index {
           Text('播放中')
             .fontSize(12)
             .fontColor('#1971C2')
+        }
+        if (s.type === 'subtitle' && this.subStreamIndex === s.index) {
+          Text('字幕中')
+            .fontSize(12)
+            .fontColor('#7048E8')
         }
       }
       .width('100%')
@@ -730,7 +1058,7 @@ struct Index {
           .fontColor(this.currentTrack === s.index ? '#1971C2' : '#666666')
       }
       if (s.type === 'subtitle') {
-        Text(`lang: ${s.language}`)
+        Text(`lang: ${s.language}${this.subStreamIndex === s.index ? '' : '   点击开启'}`)
           .fontSize(13)
           .fontColor('#666666')
       }
@@ -744,10 +1072,12 @@ struct Index {
     .width('100%')
     .padding(12)
     .borderRadius(8)
-    .backgroundColor(this.currentTrack === s.index && s.type === 'audio' ? '#D0EBFF' : '#F1F3F5')
+    .backgroundColor(this.rowBgOf(s))
     .onClick(() => {
       if (s.type === 'audio') {
         this.playTrack(s.index);
+      } else if (s.type === 'subtitle') {
+        this.toggleSubtitleAt(s.index);
       }
     })
   }
@@ -866,11 +1196,22 @@ struct Index {
 
       Divider()
 
-      Button(this.playing ? '播放中...' : '视频软解播放')
+      Row({ space: 12 }) {
+        Text('解码:')
+          .fontSize(13)
+          .fontColor('#666666')
+        this.hwOption('auto', '自动')
+        this.hwOption('force', '硬解')
+        this.hwOption('never', '软解')
+      }
+      .width('100%')
+      .justifyContent(FlexAlign.Center)
+
+      Button(this.avPlaying ? (this.avPaused ? '已暂停' : '播放中...') : '播放 (视频+音频)')
         .width('60%')
-          .enabled(!this.playing && this.srcPath.length > 0)
+        .enabled(!this.avPlaying && this.srcPath.length > 0)
         .onClick(() => {
-          this.doPlayVideo();
+          this.startAvPlayback();
         })
 
       Stack() {
@@ -905,11 +1246,45 @@ struct Index {
         this.videoBoxH = this.lenToNumber(newArea.height);
       })
 
-      if (this.videoMsg.length > 0) {
-        Text(`视频: ${this.videoMsg}`)
+      if (this.avPlaying) {
+        Row({ space: 12 }) {
+          Button(this.avPaused ? '恢复' : '暂停')
+            .layoutWeight(1)
+            .enabled(this.avPlaying)
+            .onClick(() => {
+              this.toggleAvPause();
+            })
+          Button('停止')
+            .layoutWeight(1)
+            .enabled(this.avPlaying)
+            .onClick(() => {
+              this.stopAvPlayback();
+              this.avMsg = '已停止';
+            })
+        }
+        .width('100%')
+
+        Text(`${this.formatClock(this.avPosMs)} / ${this.avDurMs > 0 ? this.formatClock(this.avDurMs) : '直播'}`)
+          .fontSize(13)
+          .fontColor('#495057')
+        if (this.avDurMs > 0) {
+          Progress({ value: Math.min(this.avPosMs, this.avDurMs), total: this.avDurMs, type: ProgressType.Linear })
+            .width('100%')
+            .height(6)
+            .color('#1971C2')
+        }
+      }
+      if (this.hwBackend.length > 0) {
+        Text(`解码后端: ${this.hwBackend}`)
+          .fontSize(13)
+          .fontColor('#2F9E44')
+      }
+      if (this.avMsg.length > 0) {
+        Text(`播放: ${this.avMsg}`)
           .fontSize(13)
           .fontColor('#495057')
       }
+
       Row({ space: 12 }) {
         Button(this.subOn ? '停止字幕' : '字幕解码')
           .layoutWeight(1)

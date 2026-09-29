@@ -1,6 +1,9 @@
 #!/bin/bash
 # Cross-compile FFmpeg for HarmonyOS (aarch64 + x86_64)
-# Usage (from MSYS2): ./build-ffmpeg.sh [minimal|full] [arch...]   (default arch: arm64-v8a x86_64)
+# Usage (from MSYS2): ./build-ffmpeg.sh [minimal|m5|m7|full] [arch...]   (default arch: arm64-v8a x86_64)
+# m5/m7 additionally enable libdavs2 (AVS2, GPL) + libuavs3d (AVS3, BSD-2):
+# the resulting libffmpeg.so is GPL-3.0-or-later (--enable-gpl --enable-version3).
+# Sources: ./build-davs2.sh, ./build-uavs3d.sh produce prebuilt/<abi>/libdavs2.a, libuavs3d.a.
 set -e
 
 export PATH="/ucrt64/bin:$PATH"   # mingw gcc as host cc for tablegen tools
@@ -52,8 +55,14 @@ if [ "$MODE" = "minimal" ]; then
 elif [ "$MODE" = "m5" ] || [ "$MODE" = "m7" ]; then
   # M5: decode-side full config + openh264/aac encoders + mp4/mpegts muxers
   # M7: M5 + OpenSSL (https/tls protocols)
+  # NOTE: --enable-gpl is required by libdavs2 (AVS2, GPL-2.0-or-later) and
+  # --enable-version3 by OpenSSL >= 3.x (Apache-2.0): the resulting libffmpeg.so
+  # is GPL-3.0-or-later. Drop --enable-gpl --enable-version3 --enable-libdavs2
+  # to revert to LGPL-2.1-or-later.
   CONFIG_FLAGS=(
     --disable-everything
+    --enable-gpl
+    --enable-version3
     --enable-network
     --enable-protocols
     --enable-demuxers
@@ -68,6 +77,8 @@ elif [ "$MODE" = "m5" ] || [ "$MODE" = "m7" ]; then
     --enable-avfilter
     --enable-zlib
     --enable-libopenh264
+    --enable-libdavs2
+    --enable-libuavs3d
     --enable-encoder=libopenh264,aac
     --enable-muxer=mp4,mpegts
   )
@@ -137,6 +148,22 @@ Name: openh264
 Description: OpenH264 (static)
 Version: 2.5.0
 Libs: -L$SCRIPT_DIR/prebuilt/$ARCH -lopenh264 -L/c/ohos-ndk/llvm/lib/$TRIPLE -lc++_shared
+Cflags: -I$SCRIPT_DIR/prebuilt/include
+EOF
+    # AVS2 decoder (GPL-2.0!) - davs2 is C++, needs libc++_shared
+    cat > pkgconfig/davs2.pc <<EOF
+Name: davs2
+Description: AVS2-P2/IEEE.1857.4 decoder (static)
+Version: 1.6.0
+Libs: -L$SCRIPT_DIR/prebuilt/$ARCH -ldavs2 -L/c/ohos-ndk/llvm/lib/$TRIPLE -lc++_shared -lpthread -lm -ldl
+Cflags: -I$SCRIPT_DIR/prebuilt/include
+EOF
+    # AVS3 decoder (BSD-2-Clause) - uavs3d is C
+    cat > pkgconfig/uavs3d.pc <<EOF
+Name: uavs3d
+Description: AVS3-P2/IEEE.1857.10 decoder (static)
+Version: 1.2.100
+Libs: -L$SCRIPT_DIR/prebuilt/$ARCH -luavs3d -lm -lpthread
 Cflags: -I$SCRIPT_DIR/prebuilt/include
 EOF
     if [ "$MODE" = "m7" ]; then

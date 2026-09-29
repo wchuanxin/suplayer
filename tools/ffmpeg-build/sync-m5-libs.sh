@@ -6,7 +6,8 @@ D=ffmpeg/src/main/cpp/third_party/ffmpeg/libs
 for abi in arm64-v8a x86_64; do
   cp -f $P/$abi/libavcodec.a $P/$abi/libavformat.a $P/$abi/libavutil.a \
         $P/$abi/libavfilter.a $P/$abi/libswscale.a $P/$abi/libswresample.a \
-        $P/$abi/libopenh264.a $P/$abi/libssl.a $P/$abi/libcrypto.a $D/$abi/
+        $P/$abi/libopenh264.a $P/$abi/libdavs2.a $P/$abi/libuavs3d.a \
+        $P/$abi/libssl.a $P/$abi/libcrypto.a $D/$abi/
 done
 # libc++_shared.so: link-time copy in third_party + packaging copy in HAR libs/
 T=aarch64-linux-ohos

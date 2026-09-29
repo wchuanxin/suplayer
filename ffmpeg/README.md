@@ -18,7 +18,11 @@ HarmonyOS 6.1.1 and later). Ships as a HAR with prebuilt native libraries for
   switching (all audio tracks decoded in parallel, switching re-routes the
   output with zero re-buffering), pause/resume.
 - **Video decoding** — software decoding with direct `XComponent`/`OH_NativeWindow`
-  Surface rendering.
+  Surface rendering. Chinese AVS standards are supported in software: AVS2
+  (GB/T 33475.2, via libdavs2) and AVS3 (AVS3-P2/IEEE.1857.10, via libuavs3d),
+  as found in CCTV 4K/UHD broadcast TS streams (stream types 0xd2/0xd4). AVS1
+  (CAVS, stream type 0x42) decodes only in its Jizhun baseline profile; the
+  AVS+ broadcast profile (AVS-P16) is not supported by upstream FFmpeg/davs2.
 - **Subtitles** — DVB/broadcast subtitle decoding to composited RGBA bitmaps
   (or UTF-8 text), enabled from the container's declaration (a PMT entry is
   enough, even when the subtitle PID never delivers data).
@@ -45,9 +49,13 @@ Or declare the dependency in `oh-package.json5`:
 ```json5
 // oh-package.json5
 "dependencies": {
-  "@suplayer/ffmpeg": "^1.6.0"
+  "@suplayer/ffmpeg": "^1.7.0"
 }
 ```
+
+> Version note: **1.7.0** adds AVS2/AVS3 decoding; from this version on the
+> prebuilt `libffmpeg.so` is GPL-3.0-or-later (see [License](#license)).
+> 1.6.x is the last LGPL-2.1-or-later build (no AVS2 support).
 
 ## Permissions
 
@@ -324,30 +332,38 @@ toolchain):
 ```bash
 ./build-openssl.sh          # OpenSSL 3.4.1 -> prebuilt/<abi>/libssl.a, libcrypto.a
 ./build-openh264.sh         # OpenH264 2.5.0 -> prebuilt/<abi>/libopenh264.a
+./build-davs2.sh            # davs2 (AVS2)  -> prebuilt/<abi>/libdavs2.a
+./build-uavs3d.sh           # uavs3d (AVS3) -> prebuilt/<abi>/libuavs3d.a
 ./build-ffmpeg.sh m7        # FFmpeg 7.1.1  -> prebuilt/<abi>/libav*.a etc.
 ```
 
 Copy the results into `ffmpeg/src/main/cpp/third_party/ffmpeg/libs/<abi>/`
-and rebuild the HAR. This also documents how to relink the library against a
-modified FFmpeg, as required for LGPL compliance.
+(`tools/ffmpeg-build/sync-m5-libs.sh` does this) and rebuild the HAR. This
+also documents how to relink the library against a modified FFmpeg, as
+required for GPL/LGPL compliance.
 
 ## License
 
-This library is distributed under the **LGPL-2.1-or-later**; see [LICENSE](LICENSE).
-No GPL/nonfree FFmpeg components are enabled. Full third-party license texts
-(BSD-2-Clause, Apache-2.0, Zlib) and static-linkage/LGPL-relinking details are
-appended to [LICENSE](LICENSE); the repository also carries them in
+`libffmpeg.so` is distributed under the **GPL-3.0-or-later** — see
+[LICENSE](LICENSE). The build enables `--enable-gpl --enable-version3`
+because of libdavs2 (GPL-2.0-or-later, the AVS2 decoder) and OpenSSL 3.x
+(Apache-2.0). Remove `--enable-gpl --enable-version3 --enable-libdavs2` in
+`tools/ffmpeg-build/build-ffmpeg.sh` and rebuild to get an LGPL-2.1-or-later
+library without AVS2 support. Full third-party license texts and
+static-linkage/relinking details are in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Third-party components
 
 | Component | Version | License |
 |---|---|---|
-| FFmpeg | 7.1.1 | LGPL-2.1-or-later |
+| FFmpeg | 7.1.1 | LGPL-2.1-or-later (built with GPL-3.0 options) |
 | OpenH264 | 2.5.0 | BSD-2-Clause |
+| davs2 | 1.6.0 (master snapshot) | GPL-2.0-or-later |
+| uavs3d | 1.2 (master snapshot) | BSD-2-Clause |
 | OpenSSL | 3.4.1 | Apache-2.0 |
 | LLVM libc++ (`libc++_shared.so`) | NDK bundled | Apache-2.0 WITH LLVM-exception |
 | zlib | system provided | Zlib |
 
-License texts, exact FFmpeg build configuration and LGPL relinking
+License texts, exact FFmpeg build configuration and GPL relinking
 instructions: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

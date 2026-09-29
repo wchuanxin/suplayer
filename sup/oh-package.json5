@@ -1,10 +1,10 @@
 {
   "name": "sup",
   "version": "1.0.0",
-  "description": "Please describe the basic information.",
+  "description": "Demo app exercising every feature of the @suplayer/ffmpeg kernel: probe with stream cards and PSI program table, MPTS program playback, frame extraction, audio decode with hot track switching, unified video+audio playback (pause/resume, hw selector, subtitle track selection), DVB subtitles, transcoding.",
   "main": "",
   "author": "",
-  "license": "",
+  "license": "LGPL-2.1-or-later",
   "dependencies": {
     "@suplayer/ffmpeg": "file:../ffmpeg"
   }

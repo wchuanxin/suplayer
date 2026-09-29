@@ -268,6 +268,8 @@ void HwVideoDecoder::RenderLoop()
 {
     int64_t firstPtsUs = INT64_MIN;
     auto startWall = std::chrono::steady_clock::now();
+    bool pausing = false;
+    auto pauseStart = std::chrono::steady_clock::now();
     int rendered = 0;
 
     while (true) {
@@ -297,7 +299,17 @@ void HwVideoDecoder::RenderLoop()
             continue;
         }
         while (paused_.load() && !stop_.load()) {
+            if (!pausing) {
+                pausing = true;
+                pauseStart = std::chrono::steady_clock::now();
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (pausing) {
+            // Shift the pacing anchor by the paused span so frames do not
+            // burst out to catch up with the wall clock after resume.
+            startWall += std::chrono::steady_clock::now() - pauseStart;
+            pausing = false;
         }
         if (stop_.load()) {
             OH_VideoDecoder_FreeOutputBuffer(codec_, item.index);
