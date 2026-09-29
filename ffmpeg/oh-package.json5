@@ -1,7 +1,7 @@
 {
   "name": "@suplayer/ffmpeg",
   "version": "1.7.0",
-  "description": "FFmpeg-powered media kernel for HarmonyOS: media probing with MPEG-TS PSI program table (PAT/PMT), frame extraction, audio/video software decoding with Surface rendering, hardware video decoding via OH_AVCodec (H.264/H.265, surface mode, auto fallback), AVS2 (GB/T 33475.2, via davs2) and AVS3 (IEEE.1857.10, via uavs3d) software decoding, multi-track TS track switching, multi-program TS (MPTS) playback with program locking, DVB subtitle decoding (PMT-declared streams, composited RGBA), transcode/mux pipeline (libopenh264 + AAC), and network/live streaming (HTTPS, HLS) via bundled OpenSSL.",
+  "description": "FFmpeg-powered media kernel for HarmonyOS: media probing with MPEG-TS PSI program table, frame extraction, audio/video decoding with Surface rendering, H.264/HEVC hardware decoding with auto fallback, AVS2/AVS3 software decoding, multi-track TS switching, multi-program TS playback, DVB subtitles, transcoding (OpenH264 + AAC), and live streaming (HTTPS, HLS) via bundled OpenSSL.",
   "main": "Index.ets",
   "author": {
     "name": "suplayer",
@@ -11,8 +11,6 @@
   "license": "GPL-3.0-or-later",
   "keywords": [
     "ffmpeg",
-    "media",
-    "probe",
     "decode",
     "transcode",
     "subtitles",
