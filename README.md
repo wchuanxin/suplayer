@@ -18,7 +18,7 @@ HarmonyOS media playback stack built on FFmpeg.
 ```json5
 // oh-package.json5
 "dependencies": {
-  "@suplayer/ffmpeg": "^1.5.0"
+  "@suplayer/ffmpeg": "^1.6.0"
 }
 ```
 

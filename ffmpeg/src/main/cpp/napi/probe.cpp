@@ -300,7 +300,7 @@ napi_value Probe(napi_env env, napi_callback_info info)
     if (argc >= 2 && !ParseNetOptions(env, args[1], ctx->netOpts)) {
         delete ctx;
         napi_throw_type_error(env, nullptr,
-            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program? }");
+            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect? }");
         return nullptr;
     }
 

@@ -48,6 +48,7 @@ struct Index {
   private mptsAudioPackets: number = 0;
   private programNums: number[] = [];
   private subDec: FFSubtitleDecoder | undefined = undefined;
+  private subTimer: number = -1;
   private videoW: number = 0;
   private videoH: number = 0;
 
@@ -66,11 +67,12 @@ struct Index {
     return nums;
   }
 
-  // Generic options for user-provided URLs: permissive extension matching and a
-  // capped analysis window (needed by streams whose segment URLs are disguised).
+  // Generic options for user-provided URLs: permissive extension matching, a
+  // capped analysis window (needed by streams whose segment URLs are disguised),
+  // and live-edge startup (safe for playlists with INDEPENDENT-SEGMENTS).
   private netOptionsFor(src: string): FFNetOptions {
     if (src.startsWith('http://') || src.startsWith('https://')) {
-      return { analyzeMs: 5000, allowedExtensions: 'ALL' };
+      return { liveStartIndex: -1, analyzeMs: 2000, allowedExtensions: 'ALL' };
     }
     return {};
   }
@@ -443,6 +445,10 @@ struct Index {
   }
 
   private clearSubtitle(): void {
+    if (this.subTimer >= 0) {
+      clearTimeout(this.subTimer);
+      this.subTimer = -1;
+    }
     if (this.subOverlay !== undefined) {
       this.subOverlay.release();
       this.subOverlay = undefined;
@@ -450,9 +456,25 @@ struct Index {
     this.subText = '';
   }
 
+  // Auto-clear after the display set's announced lifetime, so a subtitle does
+  // not linger on screen when a live stream drops the terminating clear set.
+  private scheduleSubtitleExpiry(durationMs: number): void {
+    if (durationMs <= 0) {
+      return;
+    }
+    this.subTimer = setTimeout((): void => {
+      this.subTimer = -1;
+      this.clearSubtitle();
+    }, Math.round(durationMs));
+  }
+
   private applySubtitle(ev: FFSubtitleEvent): void {
     this.subEvents++;
     console.info(`FFSUBEV n=${this.subEvents} clear=${ev.clear} box=${ev.x},${ev.y} ${ev.width}x${ev.height} regions=${ev.regionCount} canvas=${ev.canvasWidth}x${ev.canvasHeight} textLen=${ev.text.length} bytes=${ev.rgba.byteLength}`);
+    if (this.subTimer >= 0) {
+      clearTimeout(this.subTimer);
+      this.subTimer = -1;
+    }
     if (ev.canvasWidth > 0 && ev.canvasHeight > 0) {
       this.subCanvas = [ev.canvasWidth, ev.canvasHeight];
     } else if (this.videoW > 0 && this.videoH > 0) {
@@ -462,6 +484,7 @@ struct Index {
       this.clearSubtitle();
       if (ev.text.length > 0) {
         this.subText = ev.text;
+        this.scheduleSubtitleExpiry(ev.durationMs);
       }
       return;
     }
@@ -483,6 +506,7 @@ struct Index {
       .catch((err: Error): void => {
         console.error(`FFSUB_BITMAP_FAIL ${err.message}`);
       });
+    this.scheduleSubtitleExpiry(ev.durationMs);
   }
 
   private stopSubtitle(): void {

@@ -36,10 +36,16 @@ based and never blocks the UI thread. FFmpeg diagnostics are forwarded to
 
 ## Installation
 
+```bash
+ohpm install @suplayer/ffmpeg
+```
+
+Or declare the dependency in `oh-package.json5`:
+
 ```json5
 // oh-package.json5
 "dependencies": {
-  "@suplayer/ffmpeg": "^1.5.0"
+  "@suplayer/ffmpeg": "^1.6.0"
 }
 ```
 
@@ -172,6 +178,8 @@ Optional network/live options accepted by `probe` and both decoders' `open`:
 | `analyzeMs` | FFmpeg default | Cap `avformat_find_stream_info` analysis duration in ms — lower values speed up live startup |
 | `hw` | `'auto'` | Video decode backend: `'auto'` prefers the hardware decoder and falls back to software on failure, `'force'` requires hardware, `'never'` always uses software (FFVideoDecoder only) |
 | `program` | unset | MPEG-TS program number to lock playback to. When set, only streams of that program are demuxed; automatic stream selection stays inside the program and explicit `streamIndex` values are validated against it. Unknown program numbers fail the `open` |
+| `httpPersistent` | `true` | Keep one HTTP/TCP connection alive across HLS playlist refreshes and segment downloads (`http_persistent=1`) instead of reconnecting for every request — cuts live-edge latency and TLS handshakes |
+| `reconnect` | `true` | Auto-retry failed network requests: `reconnect=1`, `reconnect_streamed=1`, `reconnect_on_network_error=1`, `reconnect_on_http_error=4xx,5xx`, `reconnect_delay_max=5` — survives CDN edge-misses (momentary 404/410 on freshly announced segments) and brief network drops |
 
 For live streams `durationMs` is `0` and the `'end'` event never fires; use
 `stop()` to end playback. `stop()` also aborts in-flight network reads
@@ -225,6 +233,25 @@ frame rates). MP4-style length-prefixed streams are detected automatically and
 stay on the software path. The active backend is reported once via the
 `'info'` event (`{ backend: 'hw' | 'sw' }`) after `start`.
 
+Before the first packet is fed to the hardware decoder, an AVCodec Kit
+capability pre-check (`OH_AVCodec_GetCapabilityByCategory`) validates that a
+hardware decoder exists for the codec and supports the stream's resolution and
+profile. The check is conservative: unknown or unmappable profiles and unknown
+dimensions never block decode, and the container's frame-rate metadata is
+advisory only (a mismatch logs a warning). On failure, `hw: 'force'` reports
+the reason through the `'error'` event, while `hw: 'auto'` silently falls back
+to software.
+
+#### HDR (HDR10 / HLG)
+
+`FFVideoOpenInfo` reports the stream's `colorPrimaries`, `colorTransfer` and
+`colorRange` (ffprobe naming, e.g. `bt2020`, `smpte2084`, `arib-std-b67`,
+`tv`). On the hardware path, BT.2020 streams with SMPTE2084 (HDR10) or
+ARIB-STD-B67 (HLG) transfer are further routed to the display by setting the
+surface color gamut (`NATIVEBUFFER_COLOR_GAMUT_BT2100_PQ` / `_HLG`), so the
+compositor tone-maps them correctly. The software path is left untouched: it
+renders RGBA, which cannot reproduce HDR anyway.
+
 ### `FFSubtitleDecoder`
 
 ```ts
@@ -273,6 +300,13 @@ subs.on('subtitle', async (ev) => {
 });
 subs.start(true);
 ```
+
+`durationMs` announces each display set's on-screen lifetime: schedule a clear
+for it (as the demo app does), so a subtitle does not linger on screen when a
+live stream drops the terminating empty display set.
+
+Pause/resume is pacing-aware: the presentation clock freezes while paused and
+resumes where it left off, instead of bursting through the backlog.
 
 ## Supported ABIs
 

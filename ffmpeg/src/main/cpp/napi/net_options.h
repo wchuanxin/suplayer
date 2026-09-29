@@ -29,6 +29,8 @@ struct NetOptions {
     int32_t analyzeMs = 0;              // 0 = ffmpeg default
     HwMode hwMode = HwMode::AUTO;       // video decoder backend selection
     int32_t program = INT32_MIN;        // MPEG-TS program_num to lock to; INT32_MIN = not set
+    bool httpPersistent = true;         // reuse one HTTP connection across HLS segments
+    bool reconnect = true;              // auto-retry transient network/HTTP failures
 };
 
 // Parse optional JS options object into NetOptions.
@@ -126,10 +128,32 @@ inline bool ParseNetOptions(napi_env env, napi_value val, NetOptions& out)
         return true;
     };
 
+    auto readBool = [&](const char* name, bool& dst) -> bool {
+        napi_value v = nullptr;
+        if (napi_get_named_property(env, val, name, &v) != napi_ok) {
+            return true;
+        }
+        napi_valuetype vt = napi_undefined;
+        napi_typeof(env, v, &vt);
+        if (vt == napi_undefined || vt == napi_null) {
+            return true;
+        }
+        if (vt != napi_boolean) {
+            return false;
+        }
+        bool b = false;
+        if (napi_get_value_bool(env, v, &b) != napi_ok) {
+            return false;
+        }
+        dst = b;
+        return true;
+    };
+
     if (!readString("userAgent", out.userAgent) || !readString("headers", out.headers) ||
         !readString("allowedExtensions", out.allowedExtensions) ||
         !readInt("liveStartIndex", out.liveStartIndex) || !readInt("analyzeMs", out.analyzeMs) ||
-        !readHwMode("hw", out.hwMode) || !readInt("program", out.program)) {
+        !readHwMode("hw", out.hwMode) || !readInt("program", out.program) ||
+        !readBool("httpPersistent", out.httpPersistent) || !readBool("reconnect", out.reconnect)) {
         return false;
     }
     return true;
@@ -156,6 +180,24 @@ inline void ApplyOpenOptions(AVFormatContext* fmt, AVDictionary** dict, const Ne
         char buf[16];
         snprintf(buf, sizeof(buf), "%d", opts.liveStartIndex);
         av_dict_set(dict, "live_start_index", buf, 0);
+    }
+    // Reuse a single HTTP connection across HLS playlist reloads and segment
+    // downloads instead of paying a fresh TCP+TLS handshake per segment (hls
+    // demuxer option; ignored by other formats).
+    if (opts.httpPersistent) {
+        av_dict_set(dict, "http_persistent", "1", 0);
+    }
+    // Auto-retry transient network failures: connection errors during setup,
+    // disconnects on live (non-seekable) streams and HTTP 4xx/5xx segment/
+    // playlist responses (CDN edge miss, origin hiccup) are retried with a
+    // capped backoff before the error surfaces (http protocol options; no-op
+    // for non-http sources).
+    if (opts.reconnect) {
+        av_dict_set(dict, "reconnect", "1", 0);
+        av_dict_set(dict, "reconnect_streamed", "1", 0);
+        av_dict_set(dict, "reconnect_on_network_error", "1", 0);
+        av_dict_set(dict, "reconnect_on_http_error", "4xx,5xx", 0);
+        av_dict_set(dict, "reconnect_delay_max", "5", 0);
     }
     if (fmt != nullptr && opts.analyzeMs > 0) {
         // AV_TIME_BASE is microseconds

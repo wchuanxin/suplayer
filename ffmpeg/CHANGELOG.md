@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.6.1 (2026-09-29)
+
+Package metadata fix (no code changes).
+
+- Corrected the `repository`/`homepage`/`bugs`/`author.url` URLs in
+  `oh-package.json5`: the previous GitHub address was unreachable (wrong
+  owner), all links now point to the accessible Gitee mirror
+  `https://gitee.com/wchuanxin/suplayer`.
+
+## 1.6.0 (2026-09-26)
+
+Hardware capability pre-check, HDR display adaptation, and live-networking
+hardening (validated against a 4K HDR10 HLS live source: 3840x2160@50 HEVC
+Main10, dual AAC, DVB subtitles, disguised `.php`/`.jpg` URLs).
+
+- Hardware decode capability pre-check: before the decoder is created the
+  chip's ability is queried via `OH_AVCodec_GetCapabilityByCategory`
+  (HARDWARE) — no hardware decoder for the mime type, or a size/profile
+  outside the reported range (e.g. HEVC Main10 on a Main-only decoder),
+  skips the whole hardware trial and starts straight on software. With
+  `hw: 'force'` the pre-check failure surfaces as a `start` error with the
+  reason. Stream profiles are mapped from FFmpeg `AV_PROFILE_*` (H.264
+  Baseline/Main/High, HEVC Main/Main10/MainStill); unmapped/unknown profiles
+  never block. Frame-rate metadata is advisory (logged, not blocking). The
+  matched hardware codec name is logged (`FFVideoHW`).
+- HDR10/HLG display: on the hardware path, BT.2020 content with an HDR
+  transfer (SMPTE 2084 / ARIB std B67) sets the surface color gamut to the
+  matching BT.2100 variant (`SET_COLOR_GAMUT`) right after start, so the
+  system compositor tone-maps 10-bit NV12 frames correctly. New
+  `FFVideoOpenInfo.colorPrimaries` / `colorTransfer` / `colorRange` fields
+  (ffprobe naming) let apps detect HDR content.
+- New `FFNetOptions.httpPersistent` (default `true`): HLS playlist reloads
+  and segment downloads reuse one HTTP connection instead of paying a fresh
+  TCP+TLS handshake per segment.
+- New `FFNetOptions.reconnect` (default `true`): transient network failures
+  — connection errors, live-stream disconnects, HTTP 4xx/5xx segment/
+  playlist responses — are auto-retried with a capped backoff (max 5s)
+  before the error surfaces. Both options are no-ops for non-HTTP sources.
+- `FFSubtitleDecoder` pause is now pacing-aware: the presentation anchor is
+  shifted by the paused span on resume, so subtitles no longer burst out to
+  catch up with the wall clock.
+- Palette-less PAL8 subtitle regions (rare, malformed DVB sets) now fall
+  back to fully transparent instead of painting a solid white block.
+
 ## 1.5.0 (2026-09-25)
 
 Multi-channel audio output: the decoder no longer downmixes to stereo.

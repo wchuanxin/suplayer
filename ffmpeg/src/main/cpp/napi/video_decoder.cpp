@@ -53,6 +53,134 @@ int64_t NowMs()
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// Maps an FFmpeg AV_PROFILE_* value to the matching OHOS AVC_PROFILE_* /
+// HEVC_PROFILE_* capability enum. Returns -1 (unknown) for anything else so
+// the capability pre-check never rejects an unrecognized profile.
+int MapOhProfile(AVCodecID codecId, int ffProfile)
+{
+    if (ffProfile == AV_PROFILE_UNKNOWN) {
+        return -1;
+    }
+    switch (codecId) {
+        case AV_CODEC_ID_H264:
+            if (ffProfile == AV_PROFILE_H264_BASELINE) {
+                return AVC_PROFILE_BASELINE;
+            }
+            if (ffProfile == AV_PROFILE_H264_MAIN) {
+                return AVC_PROFILE_MAIN;
+            }
+            if (ffProfile == AV_PROFILE_H264_HIGH) {
+                return AVC_PROFILE_HIGH;
+            }
+            return -1;
+        case AV_CODEC_ID_HEVC:
+            if (ffProfile == AV_PROFILE_HEVC_MAIN) {
+                return HEVC_PROFILE_MAIN;
+            }
+            if (ffProfile == AV_PROFILE_HEVC_MAIN_10) {
+                return HEVC_PROFILE_MAIN_10;
+            }
+            if (ffProfile == AV_PROFILE_HEVC_MAIN_STILL_PICTURE) {
+                return HEVC_PROFILE_MAIN_STILL;
+            }
+            return -1;
+        default:
+            return -1;
+    }
+}
+
+// Color metadata -> human-readable strings (names follow ffprobe conventions).
+std::string ColorPrimariesToStr(int primaries)
+{
+    switch (primaries) {
+        case AVCOL_PRI_BT709:
+            return "bt709";
+        case AVCOL_PRI_BT470M:
+            return "bt470m";
+        case AVCOL_PRI_BT470BG:
+            return "bt470bg";
+        case AVCOL_PRI_SMPTE170M:
+            return "smpte170m";
+        case AVCOL_PRI_SMPTE240M:
+            return "smpte240m";
+        case AVCOL_PRI_FILM:
+            return "film";
+        case AVCOL_PRI_BT2020:
+            return "bt2020";
+        case AVCOL_PRI_SMPTE431:
+            return "smpte431";
+        case AVCOL_PRI_SMPTE432:
+            return "smpte432";
+        default:
+            return "";
+    }
+}
+
+std::string ColorTrcToStr(int trc)
+{
+    switch (trc) {
+        case AVCOL_TRC_BT709:
+            return "bt709";
+        case AVCOL_TRC_GAMMA22:
+            return "gamma22";
+        case AVCOL_TRC_GAMMA28:
+            return "gamma28";
+        case AVCOL_TRC_SMPTE170M:
+            return "smpte170m";
+        case AVCOL_TRC_SMPTE240M:
+            return "smpte240m";
+        case AVCOL_TRC_LINEAR:
+            return "linear";
+        case AVCOL_TRC_LOG:
+            return "log100";
+        case AVCOL_TRC_LOG_SQRT:
+            return "log316";
+        case AVCOL_TRC_IEC61966_2_4:
+            return "iec61966-2-4";
+        case AVCOL_TRC_BT2020_10:
+            return "bt2020-10";
+        case AVCOL_TRC_BT2020_12:
+            return "bt2020-12";
+        case AVCOL_TRC_SMPTE2084:
+            return "smpte2084";
+        case AVCOL_TRC_SMPTE428:
+            return "smpte428";
+        case AVCOL_TRC_ARIB_STD_B67:
+            return "arib-std-b67";
+        default:
+            return "";
+    }
+}
+
+std::string ColorRangeToStr(int range)
+{
+    switch (range) {
+        case AVCOL_RANGE_MPEG:
+            return "tv";
+        case AVCOL_RANGE_JPEG:
+            return "pc";
+        default:
+            return "";
+    }
+}
+
+// Window color gamut for the render pipeline: BT.2020 sources are mapped to
+// their HDR variant (PQ/HLG) so the system compositor tone-maps correctly.
+// Returns -1 when the content is standard-dynamic-range (window default).
+int MapWindowGamut(int primaries, int trc)
+{
+    if (primaries != AVCOL_PRI_BT2020) {
+        return -1;
+    }
+    if (trc == AVCOL_TRC_SMPTE2084) {
+        return NATIVEBUFFER_COLOR_GAMUT_BT2100_PQ;
+    }
+    if (trc == AVCOL_TRC_ARIB_STD_B67) {
+        return NATIVEBUFFER_COLOR_GAMUT_BT2100_HLG;
+    }
+    return NATIVEBUFFER_COLOR_GAMUT_BT2020;
+}
+
 class VideoDecoderCore {
 public:
     VideoDecoderCore() = default;
@@ -244,6 +372,18 @@ public:
         }
         return dec_->codec->name;
     }
+    std::string GetColorPrimaries() const
+    {
+        return (opened_ && dec_ != nullptr) ? ColorPrimariesToStr(dec_->color_primaries) : "";
+    }
+    std::string GetColorTransfer() const
+    {
+        return (opened_ && dec_ != nullptr) ? ColorTrcToStr(dec_->color_trc) : "";
+    }
+    std::string GetColorRange() const
+    {
+        return (opened_ && dec_ != nullptr) ? ColorRangeToStr(dec_->color_range) : "";
+    }
 
     bool Start(uint64_t surfaceId)
     {
@@ -275,6 +415,17 @@ public:
             (void)g1;
             (void)g2;
             (void)g3;
+        } else if (dec_ != nullptr) {
+            // HDR/WCG hardware decode: the codec service renders NV12 straight
+            // into the window; declare the content color gamut so the system
+            // compositor tone-maps HDR10/HLG correctly.
+            int gamut = MapWindowGamut(dec_->color_primaries, dec_->color_trc);
+            if (gamut >= 0) {
+                int32_t gr = OH_NativeWindow_NativeWindowHandleOpt(window_, SET_COLOR_GAMUT, gamut);
+                OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFVideo",
+                    "window color gamut=%{public}d ret=%{public}d (primaries=%{public}d trc=%{public}d)",
+                    gamut, gr, dec_->color_primaries, dec_->color_trc);
+            }
         }
         OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFVideo", "window created surfaceId=%{public}llu %{public}dx%{public}d backend=%{public}s",
             static_cast<unsigned long long>(surfaceId), width_, height_, hwActive_.load() ? "hw" : "sw");
@@ -411,6 +562,25 @@ private:
             lastError_ = "hardware decode is not supported for codec id=" + std::to_string(static_cast<int>(codecId));
             return false;
         }
+        const char* mime = (codecId == AV_CODEC_ID_HEVC) ? OH_AVCODEC_MIMETYPE_VIDEO_HEVC
+                                                         : OH_AVCODEC_MIMETYPE_VIDEO_AVC;
+        // Pre-flight capability probe: when the system reports no hardware
+        // decoder for this mime, or a size/profile outside its capability
+        // range, skip the whole hardware trial (including the first-packet
+        // peek) and go straight to the software path.
+        int ohProfile = MapOhProfile(codecId, dec_->profile);
+        std::string capReason;
+        if (!HwVideoDecoder::CheckCapability(mime, width_, height_, fps_, ohProfile, capReason)) {
+            lastError_ = capReason;
+            if (hwMode_ == HwMode::FORCE) {
+                OH_LOG_Print(LOG_APP, LOG_ERROR, 0xFF00, "FFVideo",
+                    "hw capability pre-check failed: %{public}s", capReason.c_str());
+            } else {
+                OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFVideo",
+                    "hw capability pre-check failed, using sw: %{public}s", capReason.c_str());
+            }
+            return false;
+        }
         AVPacket* peek = av_packet_alloc();
         bool annexb = false;
         peekDeadlineMs_.store(NowMs() + 3000);
@@ -446,8 +616,6 @@ private:
             }
             return false;
         }
-        const char* mime = (codecId == AV_CODEC_ID_HEVC) ? OH_AVCODEC_MIMETYPE_VIDEO_HEVC
-                                                         : OH_AVCODEC_MIMETYPE_VIDEO_AVC;
         hw_ = std::make_unique<HwVideoDecoder>();
         hw_->onFrame = [this](double ptsMs) { EmitFrame(ptsMs); };
         hw_->onEnd = [this]() { EmitEnd(); };
@@ -765,6 +933,12 @@ void OpenComplete(napi_env env, napi_status status, void* data)
         napi_set_named_property(env, result, "durationMs", v);
         napi_create_string_utf8(env, ctx->core->GetCodecName().c_str(), NAPI_AUTO_LENGTH, &v);
         napi_set_named_property(env, result, "codec", v);
+        napi_create_string_utf8(env, ctx->core->GetColorPrimaries().c_str(), NAPI_AUTO_LENGTH, &v);
+        napi_set_named_property(env, result, "colorPrimaries", v);
+        napi_create_string_utf8(env, ctx->core->GetColorTransfer().c_str(), NAPI_AUTO_LENGTH, &v);
+        napi_set_named_property(env, result, "colorTransfer", v);
+        napi_create_string_utf8(env, ctx->core->GetColorRange().c_str(), NAPI_AUTO_LENGTH, &v);
+        napi_set_named_property(env, result, "colorRange", v);
         napi_resolve_deferred(env, ctx->deferred, result);
     }
     napi_delete_async_work(env, ctx->work);
@@ -898,7 +1072,7 @@ napi_value FFVideoDecoderOpen(napi_env env, napi_callback_info info)
     if (argc >= 3 && !ParseNetOptions(env, args[2], ctx->netOpts)) {
         delete ctx;
         napi_throw_type_error(env, nullptr,
-            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program? }");
+            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect? }");
         return nullptr;
     }
 

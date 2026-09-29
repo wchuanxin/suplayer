@@ -498,7 +498,10 @@ private:
             const uint8_t* pal = r->data[1];
             if (pal == nullptr) {
                 if (defaultPalette.empty()) {
-                    defaultPalette.assign(256, 0xFFFFFFFFu);
+                    // A palette-less PAL8 region carries no color information;
+                    // fall back to fully transparent instead of painting a
+                    // solid white block over the video.
+                    defaultPalette.assign(256, 0x00000000u);
                 }
                 pal = reinterpret_cast<const uint8_t*>(defaultPalette.data());
             }
@@ -570,11 +573,23 @@ private:
         AVPacket* pkt = av_packet_alloc();
         int64_t firstPts = AV_NOPTS_VALUE;
         auto startWall = std::chrono::steady_clock::now();
+        bool pausing = false;
+        auto pauseStart = std::chrono::steady_clock::now();
 
         while (!stop_) {
             if (paused_) {
+                if (!pausing) {
+                    pausing = true;
+                    pauseStart = std::chrono::steady_clock::now();
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
+            }
+            if (pausing) {
+                // Shift the pacing anchor by the paused span so subtitles do
+                // not burst out to catch up with the wall clock after resume.
+                startWall += std::chrono::steady_clock::now() - pauseStart;
+                pausing = false;
             }
             int ret = av_read_frame(fmt_, pkt);
             if (ret < 0) {
@@ -842,7 +857,7 @@ napi_value FFSubtitleDecoderOpen(napi_env env, napi_callback_info info)
     if (argc >= 3 && !ParseNetOptions(env, args[2], ctx->netOpts)) {
         delete ctx;
         napi_throw_type_error(env, nullptr,
-            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, program? }");
+            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, program?, httpPersistent?, reconnect? }");
         return nullptr;
     }
 

@@ -3,6 +3,7 @@
 
 extern "C" {
 #include <multimedia/player_framework/native_avcodec_videodecoder.h>
+#include <multimedia/player_framework/native_avcapability.h>
 #include <native_window/external_window.h>
 }
 
@@ -47,6 +48,16 @@ public:
     // mime: OH_AVCODEC_MIMETYPE_VIDEO_AVC / OH_AVCODEC_MIMETYPE_VIDEO_HEVC.
     // The window is not owned by this class (caller keeps it alive until Stop()).
     bool Start(OHNativeWindow* window, const char* mime, int width, int height, double fps);
+
+    // Pre-flight hardware capability probe; no decoder instance is created.
+    // mime: OH_AVCODEC_MIMETYPE_VIDEO_AVC / OH_AVCODEC_MIMETYPE_VIDEO_HEVC.
+    // profile: OHOS AVC_PROFILE_* / HEVC_PROFILE_* value, or -1 when unknown.
+    // Returns true when a hardware decoder for the mime exists and the given
+    // size (and profile, when known) fits its reported capability range.
+    // Frame-rate metadata is advisory: an out-of-range fps is logged but does
+    // not fail the check. 'reason' describes the first unsatisfied condition.
+    static bool CheckCapability(const char* mime, int width, int height, double fps, int profile,
+        std::string& reason);
 
     // Push one Annex-B access unit. eos=true flushes the decoder (data may be null).
     // Returns false when stopped before a buffer became available.

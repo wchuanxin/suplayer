@@ -844,7 +844,7 @@ napi_value FFAudioDecoderOpen(napi_env env, napi_callback_info info)
     if (argc >= 3 && !ParseNetOptions(env, args[2], ctx->netOpts)) {
         delete ctx;
         napi_throw_type_error(env, nullptr,
-            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program? }");
+            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect? }");
         return nullptr;
     }
 

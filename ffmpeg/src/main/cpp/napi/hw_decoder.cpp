@@ -25,6 +25,56 @@ void HwVideoDecoder::Fail(const std::string& msg)
     }
 }
 
+bool HwVideoDecoder::CheckCapability(const char* mime, int width, int height, double fps, int profile,
+    std::string& reason)
+{
+    OH_AVCapability* cap = OH_AVCodec_GetCapabilityByCategory(mime, false, HARDWARE);
+    if (cap == nullptr) {
+        reason = std::string("no hardware decoder for mime=") + mime;
+        return false;
+    }
+    const char* name = OH_AVCapability_GetName(cap);
+    const char* safeName = (name != nullptr) ? name : "?";
+    if (width > 0 && height > 0 && !OH_AVCapability_IsVideoSizeSupported(cap, width, height)) {
+        reason = "hw decoder " + std::string(safeName) + " does not support size " +
+            std::to_string(width) + "x" + std::to_string(height);
+        return false;
+    }
+    if (profile >= 0) {
+        const int32_t* profiles = nullptr;
+        uint32_t profileNum = 0;
+        if (OH_AVCapability_GetSupportedProfiles(cap, &profiles, &profileNum) == AV_ERR_OK &&
+            profileNum > 0 && profiles != nullptr) {
+            bool found = false;
+            for (uint32_t i = 0; i < profileNum; ++i) {
+                if (profiles[i] == profile) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                reason = "hw decoder " + std::string(safeName) + " does not support profile=" +
+                    std::to_string(profile);
+                return false;
+            }
+        }
+    }
+    if (width > 0 && height > 0 && fps > 0.0) {
+        // Container frame-rate metadata is advisory and often inaccurate; a
+        // mismatch is logged but does not block the hardware path.
+        int32_t fpsInt = static_cast<int32_t>(fps + 0.5);
+        if (!OH_AVCapability_AreVideoSizeAndFrameRateSupported(cap, width, height, fpsInt)) {
+            OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFVideoHW",
+                "hw codec %{public}s: %{public}dx%{public}d @%{public}d fps outside reported frame-rate range, trying anyway",
+                safeName, width, height, fpsInt);
+        }
+    }
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFVideoHW",
+        "hw capability ok: codec=%{public}s %{public}dx%{public}d profile=%{public}d",
+        safeName, width, height, profile);
+    return true;
+}
+
 bool HwVideoDecoder::Start(OHNativeWindow* window, const char* mime, int width, int height, double fps)
 {
     window_ = window;

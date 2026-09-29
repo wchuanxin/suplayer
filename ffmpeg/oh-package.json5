@@ -1,9 +1,13 @@
 {
   "name": "@suplayer/ffmpeg",
-  "version": "1.5.0",
+  "version": "1.6.1",
   "description": "FFmpeg-powered media kernel for HarmonyOS: media probing with MPEG-TS PSI program table (PAT/PMT), frame extraction, audio/video software decoding with Surface rendering, hardware video decoding via OH_AVCodec (H.264/H.265, surface mode, auto fallback), multi-track TS track switching, multi-program TS (MPTS) playback with program locking, DVB subtitle decoding (PMT-declared streams, composited RGBA), transcode/mux pipeline (libopenh264 + AAC), and network/live streaming (HTTPS, HLS) via bundled OpenSSL.",
   "main": "Index.ets",
-  "author": "suplayer",
+  "author": {
+    "name": "suplayer",
+    "email": "wchuanxin@qq.com",
+    "url": "https://gitee.com/wchuanxin/suplayer"
+  },
   "license": "LGPL-2.1-or-later",
   "keywords": [
     "ffmpeg",
@@ -17,9 +21,9 @@
     "mpegts",
     "harmonyos"
   ],
-  "homepage": "https://github.com/suplayer/suplayer",
-  "repository": "https://github.com/suplayer/suplayer",
-  "bugs": "https://github.com/suplayer/suplayer/issues",
+  "homepage": "https://gitee.com/wchuanxin/suplayer",
+  "repository": "https://gitee.com/wchuanxin/suplayer",
+  "bugs": "https://gitee.com/wchuanxin/suplayer/issues",
   "dependencies": {
     "libffmpeg.so": "file:./src/main/cpp/types/libffmpeg"
   }

@@ -77,6 +77,13 @@ export interface FFNetOptions {
    *  only streams of that program are demuxed; automatic stream selection stays
    *  inside the program and explicit stream indexes are validated against it. */
   program?: number;
+  /** Reuse one HTTP connection across HLS playlist reloads and segment
+   *  downloads instead of a fresh TCP+TLS handshake per segment (default true). */
+  httpPersistent?: boolean;
+  /** Auto-retry transient network failures: connection errors, live-stream
+   *  disconnects and HTTP 4xx/5xx segment responses are retried with a capped
+   *  backoff before surfacing an error (default true). */
+  reconnect?: boolean;
 }
 
 export interface FFAudioOpenInfo {
@@ -100,6 +107,13 @@ export interface FFVideoOpenInfo {
   fps: number;
   durationMs: number;
   codec: string;
+  /** Color primaries of the video, ffprobe naming (e.g. 'bt709', 'bt2020'); empty when unspecified */
+  colorPrimaries?: string;
+  /** Transfer characteristics, ffprobe naming (e.g. 'bt709', 'smpte2084' = HDR10 PQ,
+   *  'arib-std-b67' = HLG); empty when unspecified */
+  colorTransfer?: string;
+  /** Color range: 'tv' (limited), 'pc' (full); empty when unspecified */
+  colorRange?: string;
 }
 
 export interface FFVideoFrameEvent {
