@@ -24,6 +24,7 @@ napi/audio_decoder.cpp
 napi/video_decoder.cpp
 napi/subtitle_decoder.cpp
 napi/hw_decoder.cpp
+napi/demux_session.cpp
     napi/transcoder.cpp
 )
 

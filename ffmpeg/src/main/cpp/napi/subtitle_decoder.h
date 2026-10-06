@@ -13,6 +13,8 @@ napi_value FFSubtitleDecoderPause(napi_env env, napi_callback_info info);
 napi_value FFSubtitleDecoderResume(napi_env env, napi_callback_info info);
 napi_value FFSubtitleDecoderStop(napi_env env, napi_callback_info info);
 napi_value FFSubtitleDecoderClose(napi_env env, napi_callback_info info);
+napi_value FFSubtitleDecoderDetach(napi_env env, napi_callback_info info);
+napi_value FFSubtitleDecoderSetRawPump(napi_env env, napi_callback_info info);
 
 } // namespace ffmpeg
 

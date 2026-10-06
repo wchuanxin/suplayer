@@ -81,6 +81,25 @@ export interface FFNetOptions {
    *  disconnects and HTTP 4xx/5xx segment responses are retried with a capped
    *  backoff before surfacing an error (default true). */
   reconnect?: boolean;
+  /** Audio track decode mode: 'all' (default) decodes every audio track in
+   *  parallel so switchTrack is a zero-gap re-route; 'first' decodes only the
+   *  selected track and opens the target lazily on switchTrack. */
+  audioTracks?: 'all' | 'first';
+  /** Minimum interval in ms between FFVideoDecoder 'frame' events
+   *  (0 = every frame, default). The first frame is always emitted. */
+  frameEventMs?: number;
+  /** VOD start position in ms: seek to the keyframe at/before the target and
+   *  drop pre-target frames (0 = from head). Ignored for live sources. */
+  startTimeMs?: number;
+  /** Shared demuxer: route this decoder through the process-wide shared demux
+   *  session so every decoder of the same source shares ONE network
+   *  connection (default false = private per-decoder connection). */
+  sharedDemux?: boolean;
+  /** Source is a live stream. Live video subscribers use a catch-up overflow
+   *  policy: when their queue is full the backlog is dropped and routing
+   *  resumes at the next keyframe, instead of blocking the shared demux
+   *  thread (which would starve audio). Default false. */
+  live?: boolean;
 }
 
 export interface FFAudioOpenInfo {
@@ -196,6 +215,19 @@ export class FFAudioDecoder {
   resume(): void;
   stop(): void;
   close(): void;
+  /** Live A/V resync: drop the shared-queue backlog and resume at the next
+   *  routed packet (≈ live edge). No-op on a private (non-shared) connection. */
+  flushBacklog(): void;
+  /** Leak-path cleanup: unsubscribe from the shared demux session without
+   *  stopping the decoder (no thread joins). The still-running worker exits
+   *  on its own once the queue is detached. */
+  detach(): void;
+  /** Micro varispeed for live A/V sync: scales the resampler output rate by
+   *  the given factor (clamped to [0.98, 1.02]) while the renderer keeps
+   *  playing at the nominal sample rate — a 1.02x rate makes the renderer
+   *  consume each packet 2% faster with no discontinuity. Applied on the
+   *  worker thread before the next decoded frame. */
+  setRate(rate: number): void;
 }
 
 export class FFVideoDecoder {
@@ -209,6 +241,13 @@ export class FFVideoDecoder {
   resume(): void;
   stop(): void;
   close(): void;
+  /** Live A/V resync: drop the shared-queue backlog and resume at the newest
+   *  queued keyframe (≈ live edge). No-op on a private (non-shared) connection. */
+  flushToKeyframe(): void;
+  /** Leak-path cleanup: unsubscribe from the shared demux session without
+   *  stopping the decoder (no thread joins). The still-running worker exits
+   *  on its own once the queue is detached. */
+  detach(): void;
 }
 
 export class FFSubtitleDecoder {
@@ -217,13 +256,25 @@ export class FFSubtitleDecoder {
    *  feature can be enabled from the program table alone.
    *  streamIndex < 0 selects the first subtitle stream. */
   open(src: string, streamIndex?: number, options?: FFNetOptions): Promise<FFSubtitleOpenInfo>;
-  on(event: 'subtitle', callback: (ev: FFSubtitleEvent) => void): void;
-  on(event: 'end', callback: () => void): void;
-  on(event: 'error', callback: (msg: string) => void): void;
+    on(event: 'subtitle', callback: (ev: FFSubtitleEvent) => void): void;
+    on(event: 'end', callback: () => void): void;
+    on(event: 'error', callback: (msg: string) => void): void;
+    /** Raw PES pump mode: emits each demuxed subtitle packet as
+     *  (payload: ArrayBuffer, pts: number) — payload is the PES payload from
+     *  data_identifier; pts is in stream time_base units (90kHz for MPEG-TS),
+     *  -1 when absent. Subscribe before start(). */
+    on(event: 'pes', callback: (payload: ArrayBuffer, pts: number) => void): void;
+    /** Enables raw PES pump mode: skip avcodec decoding and forward subtitle
+     *  packets as-is (see the 'pes' event). Call before start(). */
+    setRawPump(enable: boolean): void;
   /** paced = true (default) displays each display set at its presentation time */
   start(paced?: boolean): void;
   pause(): void;
   resume(): void;
   stop(): void;
   close(): void;
+  /** Leak-path cleanup: unsubscribe from the shared demux session without
+   *  stopping the decoder (no thread joins). The still-running worker exits
+   *  on its own once the queue is detached. */
+  detach(): void;
 }

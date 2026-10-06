@@ -31,6 +31,20 @@ struct NetOptions {
     int32_t program = INT32_MIN;        // MPEG-TS program_num to lock to; INT32_MIN = not set
     bool httpPersistent = true;         // reuse one HTTP connection across HLS segments
     bool reconnect = true;              // auto-retry transient network/HTTP failures
+    bool audioAllTracks = true;         // decode every audio track in parallel (false = only the
+                                        // selected one; others open lazily on switchTrack)
+    int32_t frameEventMs = 0;           // min interval between 'frame' events in ms; 0 = every frame
+    int64_t startTimeMs = 0;            // VOD start position in ms: seek to the keyframe at/before
+                                        // the target and drop pre-target frames (0 = from head);
+                                        // ignored when the source is not seekable (live)
+    bool sharedDemux = false;           // B1: route this decoder through the process-wide shared
+                                        // demux session so every decoder of the same source shares
+                                        // ONE network connection (private connection when false)
+    bool live = false;                  // Source is a live stream. Live video subscribers use a
+                                        // catch-up overflow policy (drop backlog + resume at the
+                                        // next keyframe) instead of blocking the shared demux
+                                        // thread, so a slow video consumer can never starve the
+                                        // audio subscribers or push the HLS reader off the edge.
 };
 
 // Parse optional JS options object into NetOptions.
@@ -93,6 +107,27 @@ inline bool ParseNetOptions(napi_env env, napi_value val, NetOptions& out)
         return true;
     };
 
+    auto readInt64 = [&](const char* name, int64_t& dst) -> bool {
+        napi_value v = nullptr;
+        if (napi_get_named_property(env, val, name, &v) != napi_ok) {
+            return true;
+        }
+        napi_valuetype vt = napi_undefined;
+        napi_typeof(env, v, &vt);
+        if (vt == napi_undefined || vt == napi_null) {
+            return true;
+        }
+        if (vt != napi_number) {
+            return false;
+        }
+        double d = 0.0;
+        if (napi_get_value_double(env, v, &d) != napi_ok) {
+            return false;
+        }
+        dst = static_cast<int64_t>(d);
+        return true;
+    };
+
     auto readHwMode = [&](const char* name, HwMode& dst) -> bool {
         napi_value v = nullptr;
         if (napi_get_named_property(env, val, name, &v) != napi_ok) {
@@ -149,11 +184,47 @@ inline bool ParseNetOptions(napi_env env, napi_value val, NetOptions& out)
         return true;
     };
 
+    auto readAudioTracks = [&](const char* name, bool& dst) -> bool {
+        napi_value v = nullptr;
+        if (napi_get_named_property(env, val, name, &v) != napi_ok) {
+            return true;
+        }
+        napi_valuetype vt = napi_undefined;
+        napi_typeof(env, v, &vt);
+        if (vt == napi_undefined || vt == napi_null) {
+            return true;
+        }
+        if (vt != napi_string) {
+            return false;
+        }
+        size_t len = 0;
+        if (napi_get_value_string_utf8(env, v, nullptr, 0, &len) != napi_ok) {
+            return false;
+        }
+        std::vector<char> buf(len + 1, '\0');
+        napi_get_value_string_utf8(env, v, buf.data(), buf.size(), &len);
+        std::string s(buf.data(), len);
+        for (char& c : s) {
+            c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        }
+        if (s == "all") {
+            dst = true;
+        } else if (s == "first") {
+            dst = false;
+        } else {
+            return false;
+        }
+        return true;
+    };
+
     if (!readString("userAgent", out.userAgent) || !readString("headers", out.headers) ||
         !readString("allowedExtensions", out.allowedExtensions) ||
         !readInt("liveStartIndex", out.liveStartIndex) || !readInt("analyzeMs", out.analyzeMs) ||
         !readHwMode("hw", out.hwMode) || !readInt("program", out.program) ||
-        !readBool("httpPersistent", out.httpPersistent) || !readBool("reconnect", out.reconnect)) {
+        !readBool("httpPersistent", out.httpPersistent) || !readBool("reconnect", out.reconnect) ||
+        !readAudioTracks("audioTracks", out.audioAllTracks) || !readInt("frameEventMs", out.frameEventMs) ||
+        !readInt64("startTimeMs", out.startTimeMs) || !readBool("sharedDemux", out.sharedDemux) ||
+        !readBool("live", out.live)) {
         return false;
     }
     return true;

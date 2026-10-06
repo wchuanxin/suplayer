@@ -1,5 +1,6 @@
 #include "audio_decoder.h"
 #include "net_options.h"
+#include "demux_session.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -12,6 +13,7 @@ extern "C" {
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -127,31 +129,61 @@ public:
     bool Open(const std::string& src, int streamIndex, const NetOptions& netOpts)
     {
         CloseCodec();
+        audioAllTracks_ = netOpts.audioAllTracks;
         stop_ = false;
-        fmt_ = avformat_alloc_context();
-        fmt_->interrupt_callback.callback = InterruptOnStop;
-        fmt_->interrupt_callback.opaque = &stop_;
-        AVDictionary* dict = nullptr;
-        ApplyOpenOptions(fmt_, &dict, netOpts);
-        int ret = avformat_open_input(&fmt_, src.c_str(), nullptr, &dict);
-        av_dict_free(&dict);
-        if (ret < 0) {
-            lastError_ = "avformat_open_input failed: " + ErrToStr(ret);
-            return false;
-        }
-        ret = avformat_find_stream_info(fmt_, nullptr);
-        if (ret < 0) {
-            lastError_ = "avformat_find_stream_info failed: " + ErrToStr(ret);
-            CloseCodec();
-            return false;
-        }
         AVProgram* program = nullptr;
-        if (netOpts.program != INT32_MIN) {
-            program = SelectProgram(fmt_, netOpts.program);
-            if (program == nullptr) {
-                lastError_ = "program not found: " + std::to_string(netOpts.program);
+        if (netOpts.sharedDemux) {
+            // 共享 demux 会话：一条连接服务同源的全部解码器；open/流分析/
+            // program 锁定/startTimeMs seek 均由会话统一完成
+            std::string err;
+            session_ = DemuxSession::GetOrCreate(src, netOpts, err);
+            if (session_ == nullptr) {
+                lastError_ = "shared demux open failed: " + err;
+                return false;
+            }
+            fmt_ = session_->fmt(); // borrowed: closed by the session
+            sharedFmt_ = true;
+            program = session_->program();
+            dropBeforeMs_ = netOpts.startTimeMs > 0 ? static_cast<double>(netOpts.startTimeMs) : 0.0;
+        } else {
+            sharedFmt_ = false;
+            fmt_ = avformat_alloc_context();
+            fmt_->interrupt_callback.callback = InterruptOnStop;
+            fmt_->interrupt_callback.opaque = &stop_;
+            AVDictionary* dict = nullptr;
+            ApplyOpenOptions(fmt_, &dict, netOpts);
+            int ret = avformat_open_input(&fmt_, src.c_str(), nullptr, &dict);
+            av_dict_free(&dict);
+            if (ret < 0) {
+                lastError_ = "avformat_open_input failed: " + ErrToStr(ret);
+                return false;
+            }
+            ret = avformat_find_stream_info(fmt_, nullptr);
+            if (ret < 0) {
+                lastError_ = "avformat_find_stream_info failed: " + ErrToStr(ret);
                 CloseCodec();
                 return false;
+            }
+            if (netOpts.program != INT32_MIN) {
+                program = SelectProgram(fmt_, netOpts.program);
+                if (program == nullptr) {
+                    lastError_ = "program not found: " + std::to_string(netOpts.program);
+                    CloseCodec();
+                    return false;
+                }
+            }
+            // startTimeMs 定位起播（续播/seek）：跳到目标前最近可达位置，解码循环
+            // 丢弃目标前帧实现精确起点；不可 seek（直播等）时回退从头播放
+            dropBeforeMs_ = 0.0;
+            if (netOpts.startTimeMs > 0) {
+                int64_t targetUs = static_cast<int64_t>(netOpts.startTimeMs) * 1000;
+                if (avformat_seek_file(fmt_, -1, INT64_MIN, targetUs, INT64_MAX, 0) >= 0) {
+                    dropBeforeMs_ = static_cast<double>(netOpts.startTimeMs);
+                } else {
+                    OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFAudioSW",
+                        "seek to %{public}lldms failed, starting from head",
+                        static_cast<long long>(netOpts.startTimeMs));
+                }
             }
         }
         if (streamIndex < 0) {
@@ -177,6 +209,7 @@ public:
             CloseCodec();
             return false;
         }
+        // startTimeMs 的流级 seek 已在上方私有路径 / 会话创建时完成
         AudioTrack* initial = OpenTrackDecoder(streamIndex);
         if (initial == nullptr) {
             CloseCodec();
@@ -187,38 +220,67 @@ public:
         // hot switches
         outRate_ = initial->dec->sample_rate > 0 ? initial->dec->sample_rate : 44100;
         BuildOutLayout(initial->dec->ch_layout);
-        if (!ConfigureTrackSwr(initial)) {
+        if (!ConfigureTrackSwr(initial, outRate_)) {
             FreeTrack(initial);
             CloseCodec();
             return false;
         }
         tracks_.push_back(initial);
         streamIndex_ = streamIndex;
-        // activate every other allowed audio track for parallel receive
-        for (unsigned int i = 0; i < fmt_->nb_streams; ++i) {
-            int si = static_cast<int>(i);
-            if (si == streamIndex || !StreamInProgram(program, si)) {
-                continue;
+        // activate every other allowed audio track for parallel receive.
+        // audioTracks:'first' skips this — only the selected track decodes
+        // (lower CPU/power); switchTrack opens the target track lazily.
+        if (audioAllTracks_) {
+            for (unsigned int i = 0; i < fmt_->nb_streams; ++i) {
+                int si = static_cast<int>(i);
+                if (si == streamIndex || !StreamInProgram(program, si)) {
+                    continue;
+                }
+                if (fmt_->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) {
+                    continue;
+                }
+                AudioTrack* t = OpenTrackDecoder(si);
+                if (t == nullptr) {
+                    OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFAudioSW",
+                        "parallel track #%{public}d open failed, skipped", si);
+                    continue;
+                }
+                if (!ConfigureTrackSwr(t, outRate_)) {
+                    FreeTrack(t);
+                    continue;
+                }
+                tracks_.push_back(t);
             }
-            if (fmt_->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) {
-                continue;
-            }
-            AudioTrack* t = OpenTrackDecoder(si);
-            if (t == nullptr) {
-                OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFAudioSW",
-                    "parallel track #%{public}d open failed, skipped", si);
-                continue;
-            }
-            if (!ConfigureTrackSwr(t)) {
-                FreeTrack(t);
-                continue;
-            }
-            tracks_.push_back(t);
         }
         OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFAudioSW",
-            "parallel audio tracks=%{public}zu active=%{public}d outRate=%{public}d outCh=%{public}d outMask=%{public}llu",
-            tracks_.size(), streamIndex_, outRate_, outChannels_,
-            static_cast<unsigned long long>(outMask_));
+            "audio tracks=%{public}zu active=%{public}d parallel=%{public}s outRate=%{public}d "
+            "outCh=%{public}d outMask=%{public}llu",
+            tracks_.size(), streamIndex_, audioAllTracks_ ? "all" : "first",
+            outRate_, outChannels_, static_cast<unsigned long long>(outMask_));
+        if (sharedFmt_ && session_ != nullptr) {
+            // 订阅 program 内全部音频流（未锁定 program 时为全部音频流）：
+            // 未开轨的包由 Run 循环丢弃，语义与私有路径一致
+            std::vector<int> audioStreams;
+            for (unsigned int i = 0; i < fmt_->nb_streams; ++i) {
+                int si = static_cast<int>(i);
+                if (fmt_->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) {
+                    continue;
+                }
+                if (!StreamInProgram(program, si)) {
+                    continue;
+                }
+                audioStreams.push_back(si);
+            }
+            if (!audioStreams.empty()) {
+                queue_ = session_->Subscribe(audioStreams);
+                // Live audio: same catch-up overflow policy as video, but
+                // resume at the next packet (audio frames are independently
+                // decodable). This also covers a consumer that never pops
+                // (renderer start hang while backgrounded): blocking
+                // backpressure there would deadlock the whole shared session.
+                queue_->SetLiveDrop(netOpts.live, false);
+            }
+        }
         program_ = program;
         opened_ = true;
         return true;
@@ -282,11 +344,11 @@ public:
         }
     }
 
-    bool ConfigureTrackSwr(AudioTrack* t)
+    bool ConfigureTrackSwr(AudioTrack* t, int outRate)
     {
         AVChannelLayout outLayout = AV_CHANNEL_LAYOUT_MASK(outChannels_, outMask_);
         int ret = swr_alloc_set_opts2(&t->swr,
-            &outLayout, AV_SAMPLE_FMT_FLT, outRate_,
+            &outLayout, AV_SAMPLE_FMT_FLT, outRate,
             &t->dec->ch_layout, t->dec->sample_fmt, t->dec->sample_rate,
             0, nullptr);
         if (ret < 0 || t->swr == nullptr || swr_init(t->swr) < 0) {
@@ -295,6 +357,46 @@ public:
             return false;
         }
         return true;
+    }
+
+    // Varispeed reconfig: build the new SwrContext FIRST and only swap it in
+    // on success — a failed in-place reconfig would free t->swr and leave the
+    // worker crashing on a null context mid-stream.
+    void ApplyRateMilli(int rateMilli)
+    {
+        // Direction: the renderer consumes samples at a FIXED outRate_. Fewer
+        // output samples per decoded frame = shorter wall playback = FASTER.
+        // A slowdown (rateMilli < 1000) therefore needs MORE samples per frame:
+        // swr out rate = outRate_ / rate. (outRate_ * rate inverted the effect
+        // and drove live A/V skew the wrong way.)
+        if (rateMilli < 500) {
+            rateMilli = 500;
+        }
+        const int effectiveRate = static_cast<int>(
+            llround(static_cast<double>(outRate_) * 1000.0 / rateMilli));
+        for (AudioTrack* t : tracks_) {
+            if (t->dec == nullptr) {
+                continue;
+            }
+            SwrContext* swr = nullptr;
+            AVChannelLayout outLayout = AV_CHANNEL_LAYOUT_MASK(outChannels_, outMask_);
+            int ret = swr_alloc_set_opts2(&swr,
+                &outLayout, AV_SAMPLE_FMT_FLT, effectiveRate,
+                &t->dec->ch_layout, t->dec->sample_fmt, t->dec->sample_rate,
+                0, nullptr);
+            if (ret < 0 || swr == nullptr || swr_init(swr) < 0) {
+                swr_free(&swr);
+                OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFAudioSW",
+                    "rate reconfig failed (%{public}d milli), keep previous", rateMilli);
+                return;
+            }
+            swr_free(&t->swr);
+            t->swr = swr;
+        }
+        activeRateMilli_ = rateMilli;
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFAudioSW",
+            "audio rate %{public}d/1000 (swr out=%{public}dHz, renderer stays %{public}dHz)",
+            rateMilli, effectiveRate, outRate_);
     }
 
     void FreeTrack(AudioTrack* t)
@@ -396,10 +498,60 @@ public:
         pendingSwitch_ = streamIndex;
     }
 
+    // Varispeed (live A/V sync micro-correction): the renderer keeps consuming
+    // at a FIXED outRate_, so playback speed = outRate_ / swr-out-rate. A rate
+    // below 1.0 (slowdown) therefore RAISES the swr output rate: more samples
+    // per decoded frame => each packet takes longer to play, no discontinuity
+    // and no dropped content. The worker loop owns all SwrContexts, so only
+    // the request is stored here.
+    void SetRate(double rate)
+    {
+        if (!(rate >= 0.98 && rate <= 1.02)) {
+            rate = rate < 0.98 ? 0.98 : 1.02;
+        }
+        pendingRateMilli_.store(static_cast<int>(llround(rate * 1000.0)), std::memory_order_relaxed);
+    }
+
+    // A/V resync: drop the shared-queue backlog and resume at the next routed
+    // packet (audio frames are independently decodable). The still-running
+    // worker re-anchors its pacing on the forward pts jump (waitMs >= 1000),
+    // and the JS side flushes its PCM write queue on the same jump.
+    void FlushBacklog()
+    {
+        if (queue_ == nullptr) {
+            return; // private connection: no dropable backlog
+        }
+        queue_->DropBacklogToKeyframe(); // skipToKey off for audio: drops all
+    }
+
+    // Leak-path zombie cleanup — same rationale as the video decoder: never
+    // join anything on the JS thread; the worker exits on its own once the
+    // queue is detached, and the possible last-reference session Shutdown
+    // runs on a helper thread (Run holds its own session reference).
+    void DetachDemux()
+    {
+        if (session_ == nullptr) {
+            return;
+        }
+        if (queue_ != nullptr) {
+            session_->DetachQueue(queue_.get());
+        }
+        session_->CancelClaim();
+        auto session = std::move(session_);
+        session_ = nullptr;
+        std::thread([session = std::move(session)]() mutable { session.reset(); }).detach();
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFAudioSW", "demux detached (leak-path cleanup)");
+    }
+
 private:
     void StopInternal()
     {
         stop_ = true;
+        // Wake a worker blocked in a shared-queue Pop so the join below
+        // cannot hang on an empty, stalled queue (abort is re-checked on wake).
+        if (queue_ != nullptr) {
+            queue_->Wake();
+        }
         if (!running_.exchange(false)) {
             return;
         }
@@ -414,23 +566,68 @@ private:
             FreeTrack(t);
         }
         tracks_.clear();
-        if (fmt_ != nullptr) {
+        // Shared demux: drop the session's routing reference to our queue
+        // first, then release the claim/session; fmt_ is session-owned.
+        if (queue_ != nullptr && session_ != nullptr) {
+            session_->DetachQueue(queue_.get());
+        }
+        queue_ = nullptr;
+        if (session_ != nullptr) {
+            session_->CancelClaim();
+            session_ = nullptr;
+        }
+        if (fmt_ != nullptr && !sharedFmt_) {
             avformat_close_input(&fmt_);
         }
+        fmt_ = nullptr;
+        sharedFmt_ = false;
         program_ = nullptr;
         opened_ = false;
     }
 
+    static void FreeMsg(DecoderMsg* msg)
+    {
+        if (msg->data != nullptr) {
+            free(msg->data);
+        }
+        delete msg;
+    }
+
+    // Non-blocking TSF emit. A full queue means the JS thread is not draining
+    // (busy, or blocked in stop()/close() joining this very worker). Blocking
+    // here would deadlock that join (6s thread-block kill): the JS thread can
+    // never drain the queue while it waits inside pthread_join. Realtime PCM
+    // drops on a full queue (the renderer resyncs on pts anyway); critical
+    // events (end/error/switched) retry briefly and give up as soon as stop_
+    // is armed, so the join waits at most one retry interval.
     void Emit(DecoderMsg* msg)
     {
         if (tsfn_ == nullptr) {
-            if (msg->data != nullptr) {
-                free(msg->data);
-            }
-            delete msg;
+            FreeMsg(msg);
             return;
         }
-        napi_call_threadsafe_function(tsfn_, msg, napi_tsfn_blocking);
+        napi_status st = napi_call_threadsafe_function(tsfn_, msg, napi_tsfn_nonblocking);
+        if (st == napi_ok) {
+            return;
+        }
+        if (st == napi_queue_full && msg->type != MSG_PCM) {
+            for (int i = 0; i < 50 && !stop_.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                st = napi_call_threadsafe_function(tsfn_, msg, napi_tsfn_nonblocking);
+                if (st == napi_ok) {
+                    return;
+                }
+                if (st != napi_queue_full) {
+                    break; // closing: further retries cannot succeed
+                }
+            }
+        }
+        if (msg->type != MSG_PCM) {
+            OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFAudioSW",
+                "drop tsfn msg type=%{public}d st=%{public}d (queue full or closing)",
+                msg->type, static_cast<int>(st));
+        }
+        FreeMsg(msg);
     }
 
     void EmitPcm(const uint8_t* data, size_t len, double ptsMs)
@@ -471,14 +668,31 @@ private:
         Emit(msg);
     }
 
+    // Unified packet source: the shared demux queue when attached, the private
+    // av_read_frame otherwise. Returns av_read_frame-compatible status
+    // (0 = ok, <0 = EOF or aborted).
+    int ReadPacket(AVPacket* pkt)
+    {
+        if (queue_ != nullptr) {
+            return queue_->Pop(pkt, stop_);
+        }
+        return av_read_frame(fmt_, pkt);
+    }
+
     void Run()
     {
+        // Hold the shared session for the whole worker lifetime: DetachDemux
+        // (leak-path cleanup) may drop the core's reference from another
+        // thread while this worker is still draining; fmt_ stays valid until
+        // this local is destroyed.
+        std::shared_ptr<DemuxSession> session = session_;
         AVPacket* pkt = av_packet_alloc();
         AVFrame* frame = av_frame_alloc();
         bool eofSent = false;
         const int maxSamples = 8192;
         uint8_t* outBuf = static_cast<uint8_t*>(malloc(maxSamples * outChannels_ * sizeof(float)));
         int64_t firstPts = AV_NOPTS_VALUE;
+    int dropGuard = 0;
         auto startWall = std::chrono::steady_clock::now();
         bool pausing = false;
         auto pauseStart = std::chrono::steady_clock::now();
@@ -509,7 +723,11 @@ private:
                 } else if (t == nullptr) {
                     // track was not activated at open (open failed then); retry lazily
                     t = OpenTrackDecoder(sw);
-                    if (t != nullptr && ConfigureTrackSwr(t)) {
+                    // lazy-open must inherit the ACTIVE varispeed rate; same
+                    // direction rule as ApplyRateMilli (out rate = outRate_/rate)
+                    const int trackRate = activeRateMilli_ == 1000 ? outRate_ : static_cast<int>(
+                        llround(static_cast<double>(outRate_) * 1000.0 / activeRateMilli_));
+                    if (t != nullptr && ConfigureTrackSwr(t, trackRate)) {
                         tracks_.push_back(t);
                     } else {
                         FreeTrack(t);
@@ -527,6 +745,18 @@ private:
                     firstPts = AV_NOPTS_VALUE; // re-anchor pacing to now
                     EmitSwitched(t);
                 }
+            }
+
+            // varispeed: apply a pending rate change before decoding further
+            // frames so the whole reconfig stays on the worker thread
+            int rq = pendingRateMilli_.load(std::memory_order_relaxed);
+            if (rq != activeRateMilli_) {
+                ApplyRateMilli(rq);
+            }
+
+            int pendingRate = pendingRateMilli_.load(std::memory_order_relaxed);
+            if (pendingRate != activeRateMilli_) {
+                ApplyRateMilli(pendingRate);
             }
 
             // drain every parallel decoder; only the active track is converted and emitted
@@ -558,14 +788,6 @@ private:
                     }
                     t->decodedFrames++;
                     if (t == active) {
-                        int outSamples = swr_convert(t->swr, &outBuf, maxSamples,
-                            const_cast<const uint8_t**>(frame->extended_data), frame->nb_samples);
-                        if (outSamples < 0) {
-                            EmitError("swr_convert failed: " + ErrToStr(outSamples));
-                            decodeError = true;
-                            av_frame_unref(frame);
-                            break;
-                        }
                         double ptsMs = 0.0;
                         AVStream* stream = fmt_->streams[t->index];
                         int64_t pts = frame->best_effort_timestamp;
@@ -574,6 +796,30 @@ private:
                         }
                         if (pts != AV_NOPTS_VALUE) {
                             ptsMs = static_cast<double>(pts) * av_q2d(stream->time_base) * 1000.0;
+                        }
+                        // startTimeMs precise start: skip resample/emit for
+                        // pre-target frames. Guard cap protects streams with
+                        // broken timestamps (all NOPTS → ptsMs 0) from
+                        // dropping forever.
+                        if (dropBeforeMs_ > 0.0) {
+                            if (pts == AV_NOPTS_VALUE || ptsMs < dropBeforeMs_) {
+                                av_frame_unref(frame);
+                                if (++dropGuard > 3600) {
+                                    dropBeforeMs_ = 0.0;
+                                    OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFAudioSW",
+                                        "pre-target drop guard hit, emitting from current frame");
+                                }
+                                continue;
+                            }
+                            dropBeforeMs_ = 0.0;
+                        }
+                        int outSamples = swr_convert(t->swr, &outBuf, maxSamples,
+                            const_cast<const uint8_t**>(frame->extended_data), frame->nb_samples);
+                        if (outSamples < 0) {
+                            EmitError("swr_convert failed: " + ErrToStr(outSamples));
+                            decodeError = true;
+                            av_frame_unref(frame);
+                            break;
                         }
                         if (paced_) {
                             if (firstPts == AV_NOPTS_VALUE) {
@@ -585,7 +831,16 @@ private:
                                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::steady_clock::now() - startWall).count();
                                 int64_t waitMs = static_cast<int64_t>(targetMs) - static_cast<int64_t>(elapsed);
-                                if (waitMs > 0 && waitMs < 1000) {
+                                if (waitMs >= 1000) {
+                                    // Forward pts jump (live skip / edge reconnect):
+                                    // re-anchor the pacing instead of bursting.
+                                    // The old anchor would drop the sleep cap and
+                                    // decode at full speed, flooding the JS write
+                                    // queue whose drop valve discards the excess
+                                    // anyway — an audible chunk would be lost.
+                                    firstPts = pts;
+                                    startWall = std::chrono::steady_clock::now();
+                                } else if (waitMs > 0) {
                                     std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
                                 }
                             }
@@ -608,7 +863,7 @@ private:
                 break;
             }
 
-            int ret = av_read_frame(fmt_, pkt);
+            int ret = ReadPacket(pkt);
             if (ret < 0) {
                 if (!eofSent) {
                     for (AudioTrack* t : tracks_) {
@@ -633,6 +888,11 @@ private:
     }
 
     AVFormatContext* fmt_ = nullptr;
+    // Shared demux (B1): fmt_ is then BORROWED from the session and must not
+    // be closed here; packets come from queue_ instead of av_read_frame.
+    std::shared_ptr<DemuxSession> session_;
+    std::shared_ptr<PacketQueue> queue_;
+    bool sharedFmt_ = false;
     std::vector<AudioTrack*> tracks_; // all parallel audio decoders
     AVProgram* program_ = nullptr;
     int streamIndex_ = -1; // active (emitted) track index
@@ -641,13 +901,24 @@ private:
     uint64_t outMask_ = AV_CH_LAYOUT_STEREO; // shared output channel mask
     bool opened_ = false;
     std::string lastError_;
+    // startTimeMs precise start: active-track frames with pts below this (ms)
+    // are decoded but neither resampled nor emitted; cleared once the first
+    // target frame passes
+    double dropBeforeMs_ = 0.0;
 
     std::thread worker_;
     std::atomic<bool> running_{ false };
     std::atomic<bool> stop_{ false };
     std::atomic<bool> paused_{ false };
     std::atomic<int> pendingSwitch_{ -1 };
+    // varispeed request (milli-rate, 1000 = 1.0x); worker applies it by
+    // reconfiguring every track swr with out rate = outRate_ * rate
+    std::atomic<int> pendingRateMilli_{ 1000 };
+    int activeRateMilli_ = 1000; // worker-only mirror
     bool paced_ = false;
+    // audioTracks option: decode all tracks in parallel (true) or only the
+    // selected one, opening others lazily on switchTrack (false)
+    bool audioAllTracks_ = true;
 
     napi_threadsafe_function tsfn_ = nullptr;
     napi_ref pcmRef_ = nullptr;
@@ -928,7 +1199,10 @@ napi_value FFAudioDecoderStart(napi_env env, napi_callback_info info)
         napi_value resourceName = nullptr;
         napi_create_string_utf8(env, "ffmpeg_audio_tsfn", NAPI_AUTO_LENGTH, &resourceName);
         napi_threadsafe_function tsfn = nullptr;
-        napi_create_threadsafe_function(env, nullptr, nullptr, resourceName, 32, 2,
+        // PCM queue cap 96 (~3 s at 32 ms/packet): sub-second JS-thread
+        // stalls (system GC / vsync timeouts) must not hit the native drop
+        // path — the app-side write queue valve sheds the excess on recovery.
+        napi_create_threadsafe_function(env, nullptr, nullptr, resourceName, 96, 2,
             nullptr, nullptr, core, TsfnDispatcher, &tsfn);
         core->SetTsfn(tsfn);
     }
@@ -996,7 +1270,52 @@ napi_value FFAudioDecoderClose(napi_env env, napi_callback_info info)
     AudioDecoderCore* core = GetCore(env, info);
     if (core != nullptr) {
         core->Stop();
+        // Detach the shared demux subscription synchronously (queue + claim
+        // released; the session reference drops on a helper thread). Waiting
+        // for the GC finalizer to run CloseCodec left the subscriber count
+        // growing +N per rebuild cycle — a wedged demux session was never
+        // released. CloseCodec in the finalizer remains as the codec-free
+        // safety net.
+        core->DetachDemux();
         core->ReleaseTsfn();
+    }
+    return nullptr;
+}
+
+napi_value FFAudioDecoderFlushBacklog(napi_env env, napi_callback_info info)
+{
+    AudioDecoderCore* core = GetCore(env, info);
+    if (core != nullptr) {
+        core->FlushBacklog();
+    }
+    return nullptr;
+}
+
+napi_value FFAudioDecoderSetRate(napi_env env, napi_callback_info info)
+{
+    AudioDecoderCore* core = GetCore(env, info);
+    if (core == nullptr) {
+        napi_throw_error(env, nullptr, "FFAudioDecoder is not constructed");
+        return nullptr;
+    }
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) {
+        napi_throw_type_error(env, nullptr, "setRate(rate: number) requires a rate argument");
+        return nullptr;
+    }
+    double rate = 1.0;
+    napi_get_value_double(env, args[0], &rate);
+    core->SetRate(rate);
+    return nullptr;
+}
+
+napi_value FFAudioDecoderDetach(napi_env env, napi_callback_info info)
+{
+    AudioDecoderCore* core = GetCore(env, info);
+    if (core != nullptr) {
+        core->DetachDemux();
     }
     return nullptr;
 }

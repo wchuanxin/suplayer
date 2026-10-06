@@ -1,5 +1,6 @@
 #include "subtitle_decoder.h"
 #include "net_options.h"
+#include "demux_session.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -28,6 +29,8 @@ enum SubMsgType {
     SUBMSG_SUBTITLE = 0,
     SUBMSG_END = 1,
     SUBMSG_ERROR = 2,
+    // raw PES passthrough (DVB pump mode): payload + pts pushed to JS as-is
+    SUBMSG_PES = 3,
 };
 
 // One decoded subtitle display set, composited into a single RGBA bitmap that
@@ -48,6 +51,11 @@ struct SubMsg {
     size_t rgbaLen = 0;
     std::string text;
     std::string err;
+    // SUBMSG_PES: demuxed subtitle packet payload (PES from data_identifier)
+    // + pts in stream time_base units (90kHz for MPEG-TS, -1 = none)
+    uint8_t* pes = nullptr;
+    size_t pesLen = 0;
+    double pesPts = -1.0;
 };
 
 struct RgbaRect {
@@ -98,6 +106,10 @@ public:
     {
         return &errorRef_;
     }
+    napi_ref* PesSlot()
+    {
+        return &pesRef_;
+    }
     napi_ref GetSubtitleCallback() const
     {
         return subtitleRef_;
@@ -109,6 +121,17 @@ public:
     napi_ref GetErrorCallback() const
     {
         return errorRef_;
+    }
+    napi_ref GetPesCallback() const
+    {
+        return pesRef_;
+    }
+    // Raw PES pump mode: skip avcodec decoding entirely and forward subtitle
+    // packets as-is. Must be set before start(); open() runs unchanged (the
+    // codec context is opened but unused in raw mode).
+    void SetRawPump(bool raw)
+    {
+        raw_ = raw;
     }
     napi_threadsafe_function GetTsfn() const
     {
@@ -134,30 +157,46 @@ public:
     {
         CloseCodec();
         stop_ = false;
-        fmt_ = avformat_alloc_context();
-        fmt_->interrupt_callback.callback = InterruptOnStop;
-        fmt_->interrupt_callback.opaque = &stop_;
-        AVDictionary* dict = nullptr;
-        ApplyOpenOptions(fmt_, &dict, netOpts);
-        int ret = avformat_open_input(&fmt_, src.c_str(), nullptr, &dict);
-        av_dict_free(&dict);
-        if (ret < 0) {
-            lastError_ = "avformat_open_input failed: " + ErrToStr(ret);
-            return false;
-        }
-        ret = avformat_find_stream_info(fmt_, nullptr);
-        if (ret < 0) {
-            lastError_ = "avformat_find_stream_info failed: " + ErrToStr(ret);
-            CloseCodec();
-            return false;
-        }
         AVProgram* program = nullptr;
-        if (netOpts.program != INT32_MIN) {
-            program = SelectProgram(fmt_, netOpts.program);
-            if (program == nullptr) {
-                lastError_ = "program not found: " + std::to_string(netOpts.program);
+        if (netOpts.sharedDemux) {
+            // 共享 demux 会话：一条连接服务同源的全部解码器；open/流分析/
+            // program 锁定均由会话统一完成（字幕不参与 startTimeMs seek，
+            // 应用层以当前播放位置起拉二级会话）
+            std::string err;
+            session_ = DemuxSession::GetOrCreate(src, netOpts, err);
+            if (session_ == nullptr) {
+                lastError_ = "shared demux open failed: " + err;
+                return false;
+            }
+            fmt_ = session_->fmt(); // borrowed: closed by the session
+            sharedFmt_ = true;
+            program = session_->program();
+        } else {
+            sharedFmt_ = false;
+            fmt_ = avformat_alloc_context();
+            fmt_->interrupt_callback.callback = InterruptOnStop;
+            fmt_->interrupt_callback.opaque = &stop_;
+            AVDictionary* dict = nullptr;
+            ApplyOpenOptions(fmt_, &dict, netOpts);
+            int ret = avformat_open_input(&fmt_, src.c_str(), nullptr, &dict);
+            av_dict_free(&dict);
+            if (ret < 0) {
+                lastError_ = "avformat_open_input failed: " + ErrToStr(ret);
+                return false;
+            }
+            ret = avformat_find_stream_info(fmt_, nullptr);
+            if (ret < 0) {
+                lastError_ = "avformat_find_stream_info failed: " + ErrToStr(ret);
                 CloseCodec();
                 return false;
+            }
+            if (netOpts.program != INT32_MIN) {
+                program = SelectProgram(fmt_, netOpts.program);
+                if (program == nullptr) {
+                    lastError_ = "program not found: " + std::to_string(netOpts.program);
+                    CloseCodec();
+                    return false;
+                }
             }
         }
         if (streamIndex < 0) {
@@ -197,9 +236,9 @@ public:
         }
         dec_ = avcodec_alloc_context3(codec);
         avcodec_parameters_to_context(dec_, stream->codecpar);
-        ret = avcodec_open2(dec_, codec, nullptr);
-        if (ret < 0) {
-            lastError_ = "avcodec_open2 failed: " + ErrToStr(ret);
+        int openRet = avcodec_open2(dec_, codec, nullptr);
+        if (openRet < 0) {
+            lastError_ = "avcodec_open2 failed: " + ErrToStr(openRet);
             CloseCodec();
             return false;
         }
@@ -221,6 +260,15 @@ public:
             }
         }
         declared_ = true;
+        if (sharedFmt_ && session_ != nullptr) {
+            queue_ = session_->Subscribe({ streamIndex_ });
+            // Live catch-up overflow policy, same as audio: a subtitle queue
+            // that never pops (no track selected by the app) must not
+            // backpressure the shared demux read into a permanent wedge once
+            // the pre-start cap fills — the demux thread would block forever
+            // in Route() and starve every other subscriber of the session.
+            queue_->SetLiveDrop(netOpts.live, false);
+        }
         opened_ = true;
         OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFSub",
             "subtitle opened stream=#%{public}d codec=%{public}s lang=%{public}s canvas=%{public}dx%{public}d declared=%{public}d",
@@ -287,10 +335,34 @@ public:
         StopInternal();
     }
 
+    // Leak-path zombie cleanup — same rationale as the video decoder: never
+    // join anything on the JS thread; the worker exits on its own once the
+    // queue is detached, and the possible last-reference session Shutdown
+    // runs on a helper thread (Run holds its own session reference).
+    void DetachDemux()
+    {
+        if (session_ == nullptr) {
+            return;
+        }
+        if (queue_ != nullptr) {
+            session_->DetachQueue(queue_.get());
+        }
+        session_->CancelClaim();
+        auto session = std::move(session_);
+        session_ = nullptr;
+        std::thread([session = std::move(session)]() mutable { session.reset(); }).detach();
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFSubtitle", "demux detached (leak-path cleanup)");
+    }
+
 private:
     void StopInternal()
     {
         stop_ = true;
+        // Wake a worker blocked in a shared-queue Pop so the join below
+        // cannot hang on an empty, stalled queue (abort is re-checked on wake).
+        if (queue_ != nullptr) {
+            queue_->Wake();
+        }
         if (!running_.exchange(false)) {
             return;
         }
@@ -308,9 +380,21 @@ private:
         if (dec_ != nullptr) {
             avcodec_free_context(&dec_);
         }
-        if (fmt_ != nullptr) {
+        // Shared demux: drop the session's routing reference to our queue
+        // first, then release the claim/session; fmt_ is session-owned.
+        if (queue_ != nullptr && session_ != nullptr) {
+            session_->DetachQueue(queue_.get());
+        }
+        queue_ = nullptr;
+        if (session_ != nullptr) {
+            session_->CancelClaim();
+            session_ = nullptr;
+        }
+        if (fmt_ != nullptr && !sharedFmt_) {
             avformat_close_input(&fmt_);
         }
+        fmt_ = nullptr;
+        sharedFmt_ = false;
         program_ = nullptr;
         streamIndex_ = -1;
         canvasWidth_ = 0;
@@ -320,16 +404,54 @@ private:
         opened_ = false;
     }
 
+    static void FreeMsg(SubMsg* msg)
+    {
+        if (msg->rgba != nullptr) {
+            free(msg->rgba);
+        }
+        if (msg->pes != nullptr) {
+            free(msg->pes);
+        }
+        delete msg;
+    }
+
+    // Non-blocking TSF emit. A full queue means the JS thread is not draining
+    // (busy, or blocked in stop()/close() joining this very worker). Blocking
+    // here would deadlock that join (6s thread-block kill). Subtitle bitmaps
+    // are realtime display sets and drop on a full queue (the next clear event
+    // restores a consistent state); end/error retry briefly and give up as
+    // soon as stop_ is armed, so the join waits at most one retry interval.
     void Emit(SubMsg* msg)
     {
         if (tsfn_ == nullptr) {
-            if (msg->rgba != nullptr) {
-                free(msg->rgba);
-            }
-            delete msg;
+            FreeMsg(msg);
             return;
         }
-        napi_call_threadsafe_function(tsfn_, msg, napi_tsfn_blocking);
+        napi_status st = napi_call_threadsafe_function(tsfn_, msg, napi_tsfn_nonblocking);
+        if (st == napi_ok) {
+            return;
+        }
+        // Only end/error deserve a bounded retry (see comment above). PES and
+        // bitmap messages are realtime and drop silently on a full queue.
+        bool retriable = msg->type == SUBMSG_END || msg->type == SUBMSG_ERROR;
+        if (st == napi_queue_full && retriable) {
+            for (int i = 0; i < 50 && !stop_.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                st = napi_call_threadsafe_function(tsfn_, msg, napi_tsfn_nonblocking);
+                if (st == napi_ok) {
+                    return;
+                }
+                if (st != napi_queue_full) {
+                    break; // closing: further retries cannot succeed
+                }
+            }
+        }
+        if (retriable) {
+            OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFSub",
+                "drop tsfn msg type=%{public}d st=%{public}d (queue full or closing)",
+                msg->type, static_cast<int>(st));
+        }
+        FreeMsg(msg);
     }
 
     void EmitEnd()
@@ -355,6 +477,29 @@ private:
         msg->ptsMs = ptsMs;
         msg->canvasWidth = canvasWidth_;
         msg->canvasHeight = canvasHeight_;
+        Emit(msg);
+    }
+
+    // Raw PES passthrough (DVB pump mode): forward the demuxed subtitle packet
+    // (PES payload from data_identifier) untouched — the JS DVB chain
+    // assembles display sets itself. This lets the JS subtitle pipeline reuse
+    // the bytes the shared demux already downloaded instead of issuing a
+    // second concurrent segment download (which the server throttles).
+    void EmitPes(const AVPacket* pkt)
+    {
+        if (pkt->size <= 0) {
+            return;
+        }
+        auto* msg = new SubMsg();
+        msg->type = SUBMSG_PES;
+        msg->pesPts = pkt->pts == AV_NOPTS_VALUE ? -1.0 : static_cast<double>(pkt->pts);
+        msg->pesLen = static_cast<size_t>(pkt->size);
+        msg->pes = static_cast<uint8_t*>(malloc(msg->pesLen));
+        if (msg->pes != nullptr) {
+            memcpy(msg->pes, pkt->data, msg->pesLen);
+        } else {
+            msg->pesLen = 0;
+        }
         Emit(msg);
     }
 
@@ -568,8 +713,24 @@ private:
             tight.data(), tight.size());
     }
 
+    // Unified packet source: the shared demux queue when attached, the private
+    // av_read_frame otherwise. Returns av_read_frame-compatible status
+    // (0 = ok, <0 = EOF or aborted).
+    int ReadPacket(AVPacket* pkt)
+    {
+        if (queue_ != nullptr) {
+            return queue_->Pop(pkt, stop_);
+        }
+        return av_read_frame(fmt_, pkt);
+    }
+
     void Run()
     {
+        // Hold the shared session for the whole worker lifetime: DetachDemux
+        // (leak-path cleanup) may drop the core's reference from another
+        // thread while this worker is still draining; fmt_ stays valid until
+        // this local is destroyed.
+        std::shared_ptr<DemuxSession> session = session_;
         AVPacket* pkt = av_packet_alloc();
         int64_t firstPts = AV_NOPTS_VALUE;
         auto startWall = std::chrono::steady_clock::now();
@@ -591,12 +752,17 @@ private:
                 startWall += std::chrono::steady_clock::now() - pauseStart;
                 pausing = false;
             }
-            int ret = av_read_frame(fmt_, pkt);
+            int ret = ReadPacket(pkt);
             if (ret < 0) {
                 EmitEnd();
                 break;
             }
             if (pkt->stream_index == streamIndex_) {
+                if (raw_) {
+                    EmitPes(pkt);
+                    av_packet_unref(pkt);
+                    continue;
+                }
                 AVSubtitle sub;
                 memset(&sub, 0, sizeof(sub));
                 int got = 0;
@@ -627,6 +793,11 @@ private:
     }
 
     AVFormatContext* fmt_ = nullptr;
+    // Shared demux (B1): fmt_ is then BORROWED from the session and must not
+    // be closed here; packets come from queue_ instead of av_read_frame.
+    std::shared_ptr<DemuxSession> session_;
+    std::shared_ptr<PacketQueue> queue_;
+    bool sharedFmt_ = false;
     AVCodecContext* dec_ = nullptr;
     SwsContext* sws_ = nullptr;
     AVProgram* program_ = nullptr;
@@ -638,6 +809,8 @@ private:
     bool declared_ = false;
     bool opened_ = false;
     bool paced_ = true;
+    // raw PES pump mode (see SetRawPump)
+    bool raw_ = false;
     std::string lastError_;
 
     std::thread worker_;
@@ -649,6 +822,7 @@ private:
     napi_ref subtitleRef_ = nullptr;
     napi_ref endRef_ = nullptr;
     napi_ref errorRef_ = nullptr;
+    napi_ref pesRef_ = nullptr;
 };
 
 struct OpenContext {
@@ -772,23 +946,43 @@ void TsfnDispatcher(napi_env env, napi_value jsCallback, void* context, void* da
                 napi_call_function(env, undefined, cb, 0, nullptr, &undefined);
             }
         }
-    } else if (msg->type == SUBMSG_ERROR) {
-        if (core != nullptr && core->GetErrorCallback() != nullptr) {
-            napi_value cb = nullptr;
-            napi_get_reference_value(env, core->GetErrorCallback(), &cb);
-            if (cb != nullptr) {
-                napi_value msgVal = nullptr;
-                napi_create_string_utf8(env, msg->err.c_str(), NAPI_AUTO_LENGTH, &msgVal);
-                napi_call_function(env, undefined, cb, 1, &msgVal, &undefined);
-            }
-        }
-    }
+      } else if (msg->type == SUBMSG_ERROR) {
+          if (core != nullptr && core->GetErrorCallback() != nullptr) {
+              napi_value cb = nullptr;
+              napi_get_reference_value(env, core->GetErrorCallback(), &cb);
+              if (cb != nullptr) {
+                  napi_value msgVal = nullptr;
+                  napi_create_string_utf8(env, msg->err.c_str(), NAPI_AUTO_LENGTH, &msgVal);
+                  napi_call_function(env, undefined, cb, 1, &msgVal, &undefined);
+              }
+          }
+      } else if (msg->type == SUBMSG_PES) {
+          if (core != nullptr && core->GetPesCallback() != nullptr &&
+              msg->pes != nullptr && msg->pesLen > 0) {
+              napi_value cb = nullptr;
+              napi_get_reference_value(env, core->GetPesCallback(), &cb);
+              if (cb != nullptr) {
+                  void* abData = nullptr;
+                  napi_value ab = nullptr;
+                  if (napi_create_arraybuffer(env, msg->pesLen, &abData, &ab) == napi_ok) {
+                      memcpy(abData, msg->pes, msg->pesLen);
+                      napi_value ptsVal = nullptr;
+                      napi_create_double(env, msg->pesPts, &ptsVal);
+                      napi_value cbArgs[2] = { ab, ptsVal };
+                      napi_call_function(env, undefined, cb, 2, cbArgs, &undefined);
+                  }
+              }
+          }
+      }
 
-    if (msg->rgba != nullptr) {
-        free(msg->rgba);
-    }
-    delete msg;
-}
+      if (msg->rgba != nullptr) {
+          free(msg->rgba);
+      }
+      if (msg->pes != nullptr) {
+          free(msg->pes);
+      }
+      delete msg;
+  }
 
 void CoreFinalize(napi_env env, void* data, void* hint)
 {
@@ -893,8 +1087,10 @@ napi_value FFSubtitleDecoderOn(napi_env env, napi_callback_info info)
         slot = core->EndSlot();
     } else if (event == "error") {
         slot = core->ErrorSlot();
+    } else if (event == "pes") {
+        slot = core->PesSlot();
     } else {
-        napi_throw_type_error(env, nullptr, "unsupported event, expect 'subtitle' | 'end' | 'error'");
+        napi_throw_type_error(env, nullptr, "unsupported event, expect 'subtitle' | 'end' | 'error' | 'pes'");
         return nullptr;
     }
     if (*slot != nullptr) {
@@ -966,8 +1162,42 @@ napi_value FFSubtitleDecoderClose(napi_env env, napi_callback_info info)
     SubtitleDecoderCore* core = GetCore(env, info);
     if (core != nullptr) {
         core->Stop();
+        // Detach the shared demux subscription synchronously (queue + claim
+        // released; the session reference drops on a helper thread). Waiting
+        // for the GC finalizer to run CloseCodec left the subscriber count
+        // growing +N per rebuild cycle — a wedged demux session was never
+        // released. CloseCodec in the finalizer remains as the codec-free
+        // safety net.
+        core->DetachDemux();
         core->ReleaseTsfn();
     }
+    return nullptr;
+}
+
+napi_value FFSubtitleDecoderDetach(napi_env env, napi_callback_info info)
+{
+    SubtitleDecoderCore* core = GetCore(env, info);
+    if (core != nullptr) {
+        core->DetachDemux();
+    }
+    return nullptr;
+}
+
+napi_value FFSubtitleDecoderSetRawPump(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    SubtitleDecoderCore* core = GetCore(env, info);
+    if (core == nullptr) {
+        napi_throw_error(env, nullptr, "FFSubtitleDecoder is not constructed");
+        return nullptr;
+    }
+    bool raw = false;
+    if (argc > 0 && args[0] != nullptr) {
+        napi_get_value_bool(env, args[0], &raw);
+    }
+    core->SetRawPump(raw);
     return nullptr;
 }
 

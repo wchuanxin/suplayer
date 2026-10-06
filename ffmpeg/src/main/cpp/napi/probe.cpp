@@ -1,5 +1,6 @@
 #include "probe.h"
 #include "net_options.h"
+#include "demux_session.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -108,23 +109,32 @@ std::string DictGet(const AVDictionary* dict, const char* key)
 void ProbeExecute(napi_env env, void* data)
 {
     auto* ctx = static_cast<ProbeContext*>(data);
+    // B1 shared demux: when a live session exists for this source + matching
+    // demux options, reuse its already-open context for the metadata read —
+    // no extra connection, no packet consumption. The shared_ptr keeps the
+    // session alive until the metadata is copied.
+    std::shared_ptr<DemuxSession> reuse = DemuxSession::Find(ctx->src, ctx->netOpts);
     AVFormatContext* fmt = nullptr;
-    AVDictionary* dict = nullptr;
-    ApplyOpenOptions(nullptr, &dict, ctx->netOpts);
-    int ret = avformat_open_input(&fmt, ctx->src.c_str(), nullptr, &dict);
-    av_dict_free(&dict);
-    if (ret < 0) {
-        ctx->error = "avformat_open_input failed: " + ErrToStr(ret);
-        return;
-    }
-    if (ctx->netOpts.analyzeMs > 0) {
-        fmt->max_analyze_duration = static_cast<int64_t>(ctx->netOpts.analyzeMs) * 1000;
-    }
-    ret = avformat_find_stream_info(fmt, nullptr);
-    if (ret < 0) {
-        ctx->error = "avformat_find_stream_info failed: " + ErrToStr(ret);
-        avformat_close_input(&fmt);
-        return;
+    if (reuse != nullptr) {
+        fmt = reuse->fmt();
+    } else {
+        AVDictionary* dict = nullptr;
+        ApplyOpenOptions(nullptr, &dict, ctx->netOpts);
+        int ret = avformat_open_input(&fmt, ctx->src.c_str(), nullptr, &dict);
+        av_dict_free(&dict);
+        if (ret < 0) {
+            ctx->error = "avformat_open_input failed: " + ErrToStr(ret);
+            return;
+        }
+        if (ctx->netOpts.analyzeMs > 0) {
+            fmt->max_analyze_duration = static_cast<int64_t>(ctx->netOpts.analyzeMs) * 1000;
+        }
+        ret = avformat_find_stream_info(fmt, nullptr);
+        if (ret < 0) {
+            ctx->error = "avformat_find_stream_info failed: " + ErrToStr(ret);
+            avformat_close_input(&fmt);
+            return;
+        }
     }
 
     ctx->format = fmt->iformat != nullptr && fmt->iformat->name != nullptr ? fmt->iformat->name : "";
@@ -195,7 +205,11 @@ void ProbeExecute(napi_env env, void* data)
         ctx->streams.push_back(s);
     }
 
-    avformat_close_input(&fmt);
+    if (reuse == nullptr) {
+        avformat_close_input(&fmt);
+    }
+    // `reuse` releases its session reference here; the session itself stays
+    // alive while any decoder still holds one.
 }
 
 void ProbeComplete(napi_env env, napi_status status, void* data)

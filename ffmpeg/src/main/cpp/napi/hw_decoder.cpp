@@ -271,6 +271,7 @@ void HwVideoDecoder::RenderLoop()
     bool pausing = false;
     auto pauseStart = std::chrono::steady_clock::now();
     int rendered = 0;
+    int droppedPreStart = 0;
 
     while (true) {
         OutputItem item {};
@@ -316,6 +317,22 @@ void HwVideoDecoder::RenderLoop()
             continue;
         }
 
+        // Precise-start filter: release pre-target output buffers without
+        // rendering. Guard cap protects streams with broken timestamps from
+        // dropping forever.
+        if (dropBeforeUs_ > 0) {
+            if (item.ptsUs < dropBeforeUs_) {
+                OH_VideoDecoder_FreeOutputBuffer(codec_, item.index);
+                if (++droppedPreStart > 1800) {
+                    dropBeforeUs_ = 0;
+                    OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFVideoHW",
+                        "pre-target drop guard hit, rendering from current frame");
+                }
+                continue;
+            }
+            dropBeforeUs_ = 0;
+        }
+
         // real-time pacing based on pts delta (same semantics as the software path)
         if (firstPtsUs == INT64_MIN) {
             firstPtsUs = item.ptsUs;
@@ -325,7 +342,14 @@ void HwVideoDecoder::RenderLoop()
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - startWall).count();
             int64_t waitMs = static_cast<int64_t>(targetMs) - static_cast<int64_t>(elapsed);
-            if (waitMs > 0 && waitMs < 1000) {
+            if (waitMs >= 1000) {
+                // Forward pts jump (live skip / edge reconnect): re-anchor the
+                // pacing instead of bursting frames at full speed — same
+                // semantics as the software path. A burst would desync from
+                // the (re-anchored) audio pacing.
+                firstPtsUs = item.ptsUs;
+                startWall = std::chrono::steady_clock::now();
+            } else if (waitMs > 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
             }
         }

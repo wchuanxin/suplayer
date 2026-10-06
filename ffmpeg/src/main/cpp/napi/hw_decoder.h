@@ -49,6 +49,11 @@ public:
     // The window is not owned by this class (caller keeps it alive until Stop()).
     bool Start(OHNativeWindow* window, const char* mime, int width, int height, double fps);
 
+    // Precise-start filter: output frames with pts below `us` are released
+    // without rendering. Call before Start(). Cleared automatically once the
+    // first frame at/after the target passes (or the drop guard cap is hit).
+    void SetDropBeforeUs(int64_t us) { dropBeforeUs_ = us; }
+
     // Pre-flight hardware capability probe; no decoder instance is created.
     // mime: OH_AVCODEC_MIMETYPE_VIDEO_AVC / OH_AVCODEC_MIMETYPE_VIDEO_HEVC.
     // profile: OHOS AVC_PROFILE_* / HEVC_PROFILE_* value, or -1 when unknown.
@@ -104,6 +109,7 @@ private:
     std::atomic<bool> alive_{ false };
     std::atomic<bool> stop_{ false };
     std::atomic<bool> paused_{ false };
+    int64_t dropBeforeUs_ = 0; // read-only after Start() (set via SetDropBeforeUs)
 };
 
 } // namespace ffmpeg

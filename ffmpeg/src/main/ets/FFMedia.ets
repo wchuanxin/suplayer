@@ -84,6 +84,33 @@ export interface FFNetOptions {
    *  disconnects and HTTP 4xx/5xx segment responses are retried with a capped
    *  backoff before surfacing an error (default true). */
   reconnect?: boolean;
+  /** Audio track decode mode (FFAudioDecoder): 'all' (default) decodes every
+   *  audio track in parallel so switchTrack is a zero-gap re-route; 'first'
+   *  decodes only the selected track and opens the target track lazily on
+   *  switchTrack — lower CPU/power, with a brief splice on switch. */
+  audioTracks?: 'all' | 'first';
+  /** Minimum interval in ms between FFVideoDecoder 'frame' events
+   *  (0 = every frame, default). Throttles the NAPI bridge traffic for apps
+   *  that only need periodic PTS updates (A/V sync, progress). The first
+   *  frame is always emitted. */
+  frameEventMs?: number;
+  /** VOD start position in ms: the decoder seeks to the keyframe at/before
+   *  the target and drops pre-target frames so playback starts precisely at
+   *  the requested position (resume/seek support). 0 (default) = from head.
+   *  Ignored when the source is not seekable (live streams). */
+  startTimeMs?: number;
+  /** Shared demuxer (B1): when true, every decoder (video / audio / subtitle)
+   *  opened for the same source + matching demux options shares ONE network
+   *  connection through a process-wide demux session, instead of one
+   *  connection per decoder. false (default) keeps per-decoder private
+   *  connections. Attachers start at the session's current demux position and
+   *  compensate with their own startTimeMs pre-target drop. */
+  sharedDemux?: boolean;
+  /** Source is a live stream. Live video subscribers use a catch-up overflow
+   *  policy: when their queue is full the backlog is dropped and routing
+   *  resumes at the next keyframe, instead of blocking the shared demux
+   *  thread (which would starve the audio subscribers). Default false. */
+  live?: boolean;
 }
 
 export interface FFAudioOpenInfo {

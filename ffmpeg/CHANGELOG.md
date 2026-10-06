@@ -1,5 +1,173 @@
 # Changelog
 
+## 1.7.5 (2026-10-04)
+
+Live A/V desync recovery + zombie session cleanup.
+
+- New `FFVideoDecoder.flushToKeyframe()` / `FFAudioDecoder.flushBacklog()`:
+  live A/V resync primitives. Drops the shared-queue backlog and resumes at
+  the newest queued keyframe (video) or the next routed packet (audio),
+  re-anchoring a lagging track to the live edge. The still-running worker
+  re-anchors its pacing on the forward pts jump, exactly like a native
+  live-overflow skip. No-op on private (non-shared) connections.
+- New `detach()` on all three decoders: leak-path zombie cleanup. When the
+  app deliberately skips `stop()`/`close()` to avoid a main-thread join
+  deadlock, the leaked decoder's queue stayed subscribed to the shared demux
+  session — the demux thread kept routing packets into the orphaned queue,
+  producing an endless "dropped 300 packets" high-water storm (observed for
+  30+ minutes) plus a wasted network connection. `detach()` unsubscribes
+  without joining anything; the still-running worker sees the detached queue
+  fail fast, feeds EOS and exits on its own, and the session reference is
+  released on a helper thread so a possible last-reference shutdown (interrupt
+  + join demux thread + close connection) never runs on the JS thread. All
+  decode workers now hold their own session reference for their lifetime,
+  keeping the borrowed `AVFormatContext` valid while they drain.
+- `HwVideoDecoder::RenderLoop` pacing now re-anchors on a forward pts jump
+  (`waitMs >= 1000`) instead of bursting frames at full speed — same
+  semantics as the software path; a burst desynced from the (re-anchored)
+  audio pacing after live skips.
+
+## 1.7.4 (2026-10-03)
+
+Adaptive live backpressure grace + PCM headroom.
+
+- Shared-queue live catch-up now anchors its backpressure grace window to the
+  consumer's LAST POP instead of a fixed 500ms fill wait: a healthy or even
+  heavily CPU-starved consumer (app-start contention, system-side stalls)
+  keeps the demux pacing behind it with stable latency and no backlog drop;
+  only a consumer with no pop for `LIVE_STUCK_MS` (3s, paused/hung) falls
+  back to the immediate stuck drop. Eliminates startup mis-drops under CPU
+  contention.
+- Audio PCM threadsafe queue cap raised 32 -> 96 (~3s headroom) so
+  sub-second JS-thread stalls never reach the native drop path.
+
+## 1.7.3 (2026-10-02)
+
+Live periodic-skip elimination.
+
+- Demux live queue overflow switched from immediate backlog drop to bounded
+  backpressure-first (grace wait before dropping); audio and software video
+  pacing loops re-anchor on a forward pts jump (waitMs >= 1000) instead of
+  bursting after a skip.
+
+## 1.7.2 (2026-10-01)
+
+Emit deadlock fix.
+
+- All decoder `Emit` calls are now non-blocking (`napi_tsfn_nonblocking`):
+  realtime payloads drop on a full queue, critical events retry briefly.
+  A blocking send with a full threadsafe queue deadlocked against the JS
+  thread joining the emitting worker in `stop()`/`close()` (6s appfreeze).
+
+## 1.7.1 (2026-09-30)
+
+Software-render crash fix (out-of-bounds write).
+
+- Fixed a heap-corruption crash in the software video render path
+  (`FFVideoDecoder::RenderFrame`): `SET_BUFFER_GEOMETRY` is negotiated
+  asynchronously with the surface consumer, so the first requested buffers can
+  still carry the old, smaller surface geometry — `sws_scale` then wrote a
+  full-size RGBA frame (e.g. 1920x1080) into a smaller buffer, corrupting the
+  heap and crashing inside jemalloc (`je_memalign`/`posix_memalign`) on the
+  next `av_malloc`, typically a fraction of a second into playback.
+- Every requested buffer's actual `width`/`height`/`stride` is now validated
+  before writing. When the buffer covers the frame, frames are converted in
+  place as before (no extra copy); when it is smaller, the frame is converted
+  into an exact-size scratch buffer and copied row-by-row, clamped to the
+  buffer bounds — worst case a cropped render instead of a crash.
+- Tolerates devices that report `BufferHandle::stride` in pixels instead of
+  bytes (re-derives the byte pitch).
+- `SET_BUFFER_GEOMETRY`/`SET_FORMAT`/`SET_USAGE` return codes are now logged
+  instead of silently discarded, and an `OH_NativeBuffer_Unmap` leak on the
+  sws-context allocation failure path was fixed.
+- New `FFNetOptions.audioTracks` (`'all'` default / `'first'`): `'first'`
+  decodes only the selected audio track instead of every track in parallel —
+  lower CPU and power on multi-track sources. `switchTrack` opens the target
+  track lazily on demand; the switch has a brief splice instead of the
+  parallel path's zero-gap re-route.
+- New `FFNetOptions.frameEventMs` (default `0` = every frame): throttles the
+  `FFVideoDecoder` `'frame'` event to at most one per interval, cutting the
+  NAPI bridge traffic for apps that only need periodic PTS updates. The first
+  frame is always emitted.
+- New `FFNetOptions.startTimeMs` (default `0` = from head): VOD start position.
+  The decoder seeks to the keyframe at/before the target and drops pre-target
+  output (video frames are decoded but not rendered, audio frames are not
+  resampled or emitted), so playback starts precisely at the requested
+  position — enables resume-from-position and app-level seek via reopen.
+  Non-seekable sources (live) fall back to normal startup; a drop-guard cap
+  protects streams with broken timestamps.
+- New `FFNetOptions.sharedDemux` (default `false`): shared demuxer. Every
+  decoder (video / audio / subtitle) opened for the same source with matching
+  demux options now shares ONE network connection through a process-wide
+  `DemuxSession` registry, instead of one connection per decoder. A single
+  demux thread routes packets to per-subscriber bounded queues (300 packets /
+  64 MB high-water backpressure preserves the self-pacing semantics of
+  private connections). Concurrent first openers race and the loser attaches
+  to the winner, keeping startup parallelism while the steady state holds a
+  single connection. Attachers requesting a different `startTimeMs` compensate
+  with their own pre-target drop filter; `probe()` reuses a live session's
+  context for metadata reads without a new connection. Also fixed the
+  hw-eligibility peek losing the first video packet on non-Annex-B streams
+  (the peeked keyframe is now kept for the software path).
+- Fixed a shared-demux main-thread freeze (appfreeze `THREAD_BLOCK_3S`):
+  - The hw-eligibility peek runs synchronously on the JS main thread
+    (`start()`); with a shared queue whose demux thread was still fetching the
+    first segment or backpressured by another subscriber, the peek could
+    block its full 3s deadline and trip the watchdog. The shared-path peek
+    deadline is now 500ms (falls back to software decode instead).
+  - `PacketQueue::Pop` polled its abort flag only when woken, and setting the
+    decoder stop flag never woke the queue — `stop()`/`close()` on the main
+    thread could hang forever joining a worker blocked on an empty, stalled
+    queue. Pop now re-checks abort on a 100ms `wait_for` interval, and
+    `StopInternal` calls the new `PacketQueue::Wake()`.
+  - Startup grace: a subscriber that has subscribed but not started consuming
+    yet (the app's video/audio open rendezvous gates the audio start) no
+    longer backpressures the shared read at the normal 300-packet watermark —
+    it buffers up to 4000 packets until its first pop, so one not-yet-started
+    decoder cannot starve the others' first frames.
+- Fixed slow-consumer audio starvation on live streams (shared demux): a
+  persistently slow video subscriber (e.g. software-decoded 1080p50 on a
+  forced-software live setting) filled its 300-packet queue and blocked the
+  demux thread in `Route()` indefinitely — audio subscribers starved
+  (silence, PCM queue-full drops) and the HLS reader fell off the live edge
+  (whole-segment skips, PTS jumps of minutes). New `FFNetOptions.live`
+  (default `false`): the video subscriber queue switches to a catch-up
+  overflow policy — on a full queue the backlog is dropped and routing
+  resumes at the next keyframe (clean IDR restart), so the demux thread never
+  blocks on a slow live consumer and audio keeps flowing in real time.
+- Extended the live catch-up overflow policy to audio queues: an audio
+  subscriber whose consumer never drains (e.g. the app-side AudioRenderer
+  `start()` IPC hangs while the app is backgrounded/locked) filled its queue
+  and blocked `Route()` forever — the whole shared session deadlocked (video
+  frozen too, stall watchdog recovery looped into a zombie state). Audio
+  queues now flush their backlog on overflow and resume at the next packet
+  (audio frames are independently decodable, no keyframe wait); the demux
+  thread can no longer deadlock on any live subscriber. VOD playback and
+  subtitle queues keep the blocking backpressure semantics.
+
+## 1.7.0 (2026-09-29)
+
+Chinese broadcast codec support (AVS2/AVS3) and true pause/resume. **License
+change:** the prebuilt `libffmpeg.so` is now **GPL-3.0-or-later** — the build
+enables `--enable-gpl --enable-version3` for libdavs2 (AVS2, GPL-2.0-or-later)
+and OpenSSL 3.x (Apache-2.0). 1.6.x remains the last LGPL-2.1-or-later build.
+
+- AVS2 (AVS2-P2/IEEE.1857.4, GB/T 33475.2) software decoding via the
+  cross-compiled davs2 library — CCTV 4K/UHD broadcast TS streams (stream
+  type 0xd2) now decode end to end (`codec: avs2`).
+- AVS3 (AVS3-P2/IEEE.1857.10) software decoding via the cross-compiled
+  uavs3d library (BSD-2-Clause), with NEON assembly on arm64 — stream
+  type 0xd4 (`codec: avs3`).
+- AVS1 (CAVS) continues to decode in its Jizhun baseline profile only; the
+  AVS+ broadcast profile (AVS-P16) is not supported by upstream FFmpeg/davs2.
+  AVS streams always use the software path (no hardware MIME exists).
+- Native decoders shift their pacing anchors on `pause()`: `resume()`
+  continues from the paused position instead of bursting through the backlog
+  (video software renderer, hardware path and audio decoder).
+- New build scripts `tools/ffmpeg-build/build-davs2.sh` and
+  `build-uavs3d.sh`; FFmpeg rebuilt with
+  `--enable-gpl --enable-version3 --enable-libdavs2 --enable-libuavs3d`.
+
 ## 1.6.1 (2026-09-29)
 
 Package metadata fix (no code changes).
