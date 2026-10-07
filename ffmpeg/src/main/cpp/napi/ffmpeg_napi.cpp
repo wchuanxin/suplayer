@@ -51,6 +51,8 @@ static napi_value Init(napi_env env, napi_value exports)
         { "flushBacklog", nullptr, ffmpeg::FFAudioDecoderFlushBacklog, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setRate", nullptr, ffmpeg::FFAudioDecoderSetRate, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "detach", nullptr, ffmpeg::FFAudioDecoderDetach, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "getBufferStats", nullptr, ffmpeg::FFAudioDecoderGetBufferStats, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "getStats", nullptr, ffmpeg::FFAudioDecoderGetStats, nullptr, nullptr, nullptr, napi_default, nullptr },
     };
     napi_value cls = nullptr;
     napi_define_class(env, "FFAudioDecoder", NAPI_AUTO_LENGTH, ffmpeg::FFAudioDecoderConstructor,
@@ -67,6 +69,8 @@ static napi_value Init(napi_env env, napi_value exports)
         { "close", nullptr, ffmpeg::FFVideoDecoderClose, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "flushToKeyframe", nullptr, ffmpeg::FFVideoDecoderFlushToKeyframe, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "detach", nullptr, ffmpeg::FFVideoDecoderDetach, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "getBufferStats", nullptr, ffmpeg::FFVideoDecoderGetBufferStats, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "getStats", nullptr, ffmpeg::FFVideoDecoderGetStats, nullptr, nullptr, nullptr, napi_default, nullptr },
     };
     napi_value vcls = nullptr;
     napi_define_class(env, "FFVideoDecoder", NAPI_AUTO_LENGTH, ffmpeg::FFVideoDecoderConstructor,

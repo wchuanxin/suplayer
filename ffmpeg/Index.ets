@@ -18,5 +18,9 @@ export {
   FFSubtitleEvent,
   FFTranscodeOptions,
   FFTranscodeResult,
-  FFNetOptions
+  FFNetOptions,
+  FFOverflowEvent,
+  FFDiscontinuityEvent,
+  FFBufferStats,
+  FFPlaybackStats
 } from './src/main/ets/FFMedia';

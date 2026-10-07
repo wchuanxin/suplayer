@@ -2,11 +2,10 @@
 #define FFMPEG_NAPI_DEMUX_SESSION_H
 
 #include "net_options.h"
+#include "packet_queue.h"
 
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -51,85 +50,6 @@ namespace ffmpeg {
 //    stopping (interrupt callback aborts a blocked network read), detach all
 //    queues (unblocks a demux thread waiting on a full queue), join the
 //    demux thread, close the context.
-
-// Bounded blocking packet queue between the demux thread and one subscriber.
-class PacketQueue {
-public:
-    PacketQueue() = default;
-    ~PacketQueue();
-
-    PacketQueue(const PacketQueue&) = delete;
-    PacketQueue& operator=(const PacketQueue&) = delete;
-
-    // Blocking pop for the subscriber decode thread. Returns av_read_frame
-    // compatible status: 0 = packet returned (ownership moved into `out`,
-    // caller unrefs), <0 = end of stream OR aborted (subscriber stop flag /
-    // queue detached). EOF is sticky: once the end marker arrives, every
-    // subsequent pop fails fast. `deadlineSteadyMs` (0 = none) bounds the
-    // wait; a deadline hit also returns <0 (used by the hw-eligibility peek
-    // on streams that are declared but never carry data).
-    int Pop(AVPacket* out, std::atomic<bool>& abort, int64_t deadlineSteadyMs = 0);
-
-    // Demux-thread side. Route() drops packets outside the subscribed set;
-    // Push blocks while the queue is at its high-water mark (backpressure).
-    void SetStreams(const std::vector<int>& streams);
-    void Route(const AVPacket* pkt);
-    void PushEof();
-    void Detach();
-
-    // Subscriber-thread side, before the decode thread starts popping.
-    // Live catch-up mode: when the queue is already at its high-water mark,
-    // instead of blocking the demux thread (which would starve every other
-    // subscriber of the shared session) the backlog is dropped. Video queues
-    // resume at the next keyframe (clean IDR restart); audio queues resume at
-    // the next packet (audio frames are independently decodable). The audio
-    // variant also covers a consumer that never pops at all — e.g. the app
-    // renderer start hangs while the app is backgrounded — which must not
-    // deadlock the shared demux read on backpressure.
-    void SetLiveDrop(bool enabled, bool skipToKeyframe);
-
-    // Subscriber-thread side: wake a blocked Pop so it re-checks its abort
-    // flag promptly (stop while the queue is empty and the demux thread is
-    // stalled would otherwise sleep until the next packet). Idempotent and
-    // harmless when no Pop is waiting.
-    void Wake();
-
-    // Control-thread side (A/V resync): drop the entire backlog and resume
-    // at the NEWEST keyframe still queued (video), or at the next routed
-    // packet when no keyframe is queued / skipToKey is off (audio). Used to
-    // re-anchor a lagging track to the live edge when the decoded tracks
-    // have drifted apart by more than freeze-based correction can close.
-    void DropBacklogToKeyframe();
-
-private:
-    bool WantsStream(int streamIndex) const;
-
-    std::mutex mtx_;
-    std::condition_variable notEmpty_;
-    std::condition_variable notFull_;
-    std::deque<AVPacket*> packets_;
-    std::vector<int> streams_;
-    size_t bytes_ = 0;
-    bool eof_ = false;
-    bool detached_ = false;
-    // True once the consumer has popped at least once. Until then the queue
-    // is in its startup grace window: the subscriber has subscribed but its
-    // decode thread has not been released yet (A1 video/audio rendezvous,
-    // hw/sw decision), and it must not backpressure the shared demux read —
-    // the other subscribers would starve behind a queue nobody drains.
-    bool popped_ = false;
-    // Live catch-up policy (see SetLiveDrop).
-    bool liveDrop_ = false;
-    bool skipToKey_ = false;
-    bool skipUntilKey_ = false;
-    // Steady-clock ms of the consumer's last Pop (0 before the first pop).
-    // A full live queue paces the demux behind the consumer only while the
-    // consumer is alive: once now - lastPopWallMs_ exceeds LIVE_STUCK_MS the
-    // consumer is deemed stuck (paused / hung) and every full-queue packet
-    // drops immediately — per-packet grace waits would crawl the shared demux
-    // read and starve the other subscribers. The next Pop re-arms the wait.
-    int64_t lastPopWallMs_ = 0;
-};
 
 class DemuxSession {
 public:

@@ -193,6 +193,48 @@ export interface FFTranscodeResult {
   frames: number;
 }
 
+/** Shared-queue overflow episode: the live catch-up valve dropped queued
+ *  packets to keep the session near the live edge. */
+export interface FFOverflowEvent {
+  /** Packets dropped in this episode */
+  dropped: number;
+}
+
+/** Stream discontinuity raised by an explicit backlog resync (flushToKeyframe
+ *  / flushBacklog); more reasons (variant switch, reconnect) may follow. */
+export interface FFDiscontinuityEvent {
+  reason: string;
+}
+
+/** Network/queue health of a decoder fed by the shared demux session.
+ *  Values are 0 on a private (non-shared) connection where not applicable. */
+export interface FFBufferStats {
+  /** Media duration of the stats-stream packets currently queued (ms) */
+  bufferedAheadMs: number;
+  /** Total demuxed bytes read by this decoder (packets it consumed) */
+  readBytes: number;
+  /** EWMA bitrate over 5s windows (bits per second) */
+  measuredBitrateBps: number;
+  /** Live edge latency (ms); -1 until playlist-level timing is wired */
+  liveLatencyMs: number;
+  /** Number of overflow episodes (see FFOverflowEvent) */
+  overflowCount: number;
+  /** Automatic reconnects (token self-healing); 0 until wired */
+  reconnectCount: number;
+}
+
+/** Decode-side playback statistics of a decoder. */
+export interface FFPlaybackStats {
+  /** Frames/packets decoded and emitted to JS */
+  decodedFrames: number;
+  /** Frames decoded but dropped (pre-target seek skip, render failures) */
+  droppedFrames: number;
+  overflowCount: number;
+  reconnectCount: number;
+  /** Stream discontinuities observed (resyncs so far) */
+  discontinuityCount: number;
+}
+
 export const probe: (src: string, options?: FFNetOptions) => Promise<FFMediaInfo>;
 
 export const extractFrame: (src: string, timeMs: number) => Promise<FFFrame>;
@@ -205,6 +247,8 @@ export class FFAudioDecoder {
   on(event: 'end', callback: () => void): void;
   on(event: 'error', callback: (msg: string) => void): void;
   on(event: 'switched', callback: (info: FFAudioOpenInfo) => void): void;
+  on(event: 'overflow', callback: (ev: FFOverflowEvent) => void): void;
+  on(event: 'discontinuity', callback: (ev: FFDiscontinuityEvent) => void): void;
   start(paced?: boolean): void;
   /** Instant hot switch: all audio tracks of the source (within the locked
    *  program) are decoded in parallel, so switching just re-routes the output —
@@ -228,6 +272,10 @@ export class FFAudioDecoder {
    *  consume each packet 2% faster with no discontinuity. Applied on the
    *  worker thread before the next decoded frame. */
   setRate(rate: number): void;
+  /** Network/queue health of the shared demux subscription (see FFBufferStats). */
+  getBufferStats(): FFBufferStats;
+  /** Decode-side playback statistics (see FFPlaybackStats). */
+  getStats(): FFPlaybackStats;
 }
 
 export class FFVideoDecoder {
@@ -236,6 +284,8 @@ export class FFVideoDecoder {
   on(event: 'info', callback: (info: FFVideoInfoEvent) => void): void;
   on(event: 'end', callback: () => void): void;
   on(event: 'error', callback: (msg: string) => void): void;
+  on(event: 'overflow', callback: (ev: FFOverflowEvent) => void): void;
+  on(event: 'discontinuity', callback: (ev: FFDiscontinuityEvent) => void): void;
   start(surfaceId: string): void;
   pause(): void;
   resume(): void;
@@ -248,6 +298,10 @@ export class FFVideoDecoder {
    *  stopping the decoder (no thread joins). The still-running worker exits
    *  on its own once the queue is detached. */
   detach(): void;
+  /** Network/queue health of the shared demux subscription (see FFBufferStats). */
+  getBufferStats(): FFBufferStats;
+  /** Decode-side playback statistics (see FFPlaybackStats). */
+  getStats(): FFPlaybackStats;
 }
 
 export class FFSubtitleDecoder {
@@ -264,6 +318,8 @@ export class FFSubtitleDecoder {
      *  data_identifier; pts is in stream time_base units (90kHz for MPEG-TS),
      *  -1 when absent. Subscribe before start(). */
     on(event: 'pes', callback: (payload: ArrayBuffer, pts: number) => void): void;
+    on(event: 'overflow', callback: (ev: FFOverflowEvent) => void): void;
+    on(event: 'discontinuity', callback: (ev: FFDiscontinuityEvent) => void): void;
     /** Enables raw PES pump mode: skip avcodec decoding and forward subtitle
      *  packets as-is (see the 'pes' event). Call before start(). */
     setRawPump(enable: boolean): void;

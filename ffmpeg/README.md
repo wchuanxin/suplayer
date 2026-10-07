@@ -35,8 +35,12 @@ HarmonyOS 6.1.1 and later). Ships as a HAR with prebuilt native libraries for
   plain TS over HTTP. `src` accepts URLs anywhere a file path is accepted.
 
 All processing runs in native worker threads; the JS API is promise/callback
-based and never blocks the UI thread. FFmpeg diagnostics are forwarded to
-`hilog` (domain `0xFF00`, tag `FFmpeg`).
+based and never blocks the UI thread. Native diagnostics are forwarded to
+`hilog` under domain `0xFF00`; entries are app-type logs, so they print with
+the leading type marker — filter with `0xff00` (shown as `A0xff00` in raw
+output). Tags: `FFmpeg` (libavformat/libavcodec log forward), `FFDemux`
+(shared demuxer session), `FFVideo` / `FFVideoHW` (software / hardware video
+path), `FFAudioSW` (audio), `FFSub` / `FFSubtitle` (subtitles).
 
 ## Installation
 

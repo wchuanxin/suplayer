@@ -204,6 +204,48 @@ export interface FFTranscodeResult {
   frames: number;
 }
 
+/** Shared-queue overflow episode: the live catch-up valve dropped queued
+ *  packets to keep the session near the live edge. */
+export interface FFOverflowEvent {
+  /** Packets dropped in this episode */
+  dropped: number;
+}
+
+/** Stream discontinuity raised by an explicit backlog resync (flushToKeyframe
+ *  / flushBacklog); more reasons (variant switch, reconnect) may follow. */
+export interface FFDiscontinuityEvent {
+  reason: string;
+}
+
+/** Network/queue health of a decoder fed by the shared demux session.
+ *  Values are 0 on a private (non-shared) connection where not applicable. */
+export interface FFBufferStats {
+  /** Media duration of the stats-stream packets currently queued (ms) */
+  bufferedAheadMs: number;
+  /** Total demuxed bytes read by this decoder (packets it consumed) */
+  readBytes: number;
+  /** EWMA bitrate over 5s windows (bits per second) */
+  measuredBitrateBps: number;
+  /** Live edge latency (ms); -1 until playlist-level timing is wired */
+  liveLatencyMs: number;
+  /** Number of overflow episodes (see FFOverflowEvent) */
+  overflowCount: number;
+  /** Automatic reconnects (token self-healing); 0 until wired */
+  reconnectCount: number;
+}
+
+/** Decode-side playback statistics of a decoder. */
+export interface FFPlaybackStats {
+  /** Frames/packets decoded and emitted to JS */
+  decodedFrames: number;
+  /** Frames decoded but dropped (pre-target seek skip, render failures) */
+  droppedFrames: number;
+  overflowCount: number;
+  reconnectCount: number;
+  /** Stream discontinuities observed (resyncs so far) */
+  discontinuityCount: number;
+}
+
 export function probe(src: string, options?: FFNetOptions): Promise<FFMediaInfo> {
   return ffmpeg.probe(src, options);
 }

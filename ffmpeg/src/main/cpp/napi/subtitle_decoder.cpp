@@ -31,6 +31,8 @@ enum SubMsgType {
     SUBMSG_ERROR = 2,
     // raw PES passthrough (DVB pump mode): payload + pts pushed to JS as-is
     SUBMSG_PES = 3,
+    SUBMSG_OVERFLOW = 4,
+    SUBMSG_DISCONTINUITY = 5,
 };
 
 // One decoded subtitle display set, composited into a single RGBA bitmap that
@@ -56,6 +58,7 @@ struct SubMsg {
     uint8_t* pes = nullptr;
     size_t pesLen = 0;
     double pesPts = -1.0;
+    uint64_t count = 0; // SUBMSG_OVERFLOW: packets dropped in the episode
 };
 
 struct RgbaRect {
@@ -110,6 +113,14 @@ public:
     {
         return &pesRef_;
     }
+    napi_ref* OverflowSlot()
+    {
+        return &overflowRef_;
+    }
+    napi_ref* DiscontinuitySlot()
+    {
+        return &discontinuityRef_;
+    }
     napi_ref GetSubtitleCallback() const
     {
         return subtitleRef_;
@@ -125,6 +136,14 @@ public:
     napi_ref GetPesCallback() const
     {
         return pesRef_;
+    }
+    napi_ref GetOverflowCallback() const
+    {
+        return overflowRef_;
+    }
+    napi_ref GetDiscontinuityCallback() const
+    {
+        return discontinuityRef_;
     }
     // Raw PES pump mode: skip avcodec decoding entirely and forward subtitle
     // packets as-is. Must be set before start(); open() runs unchanged (the
@@ -262,12 +281,15 @@ public:
         declared_ = true;
         if (sharedFmt_ && session_ != nullptr) {
             queue_ = session_->Subscribe({ streamIndex_ });
+            queue_->SetStatsStream(streamIndex_);
             // Live catch-up overflow policy, same as audio: a subtitle queue
             // that never pops (no track selected by the app) must not
             // backpressure the shared demux read into a permanent wedge once
             // the pre-start cap fills — the demux thread would block forever
             // in Route() and starve every other subscriber of the session.
-            queue_->SetLiveDrop(netOpts.live, false);
+            BackpressurePolicy policy;
+            policy.liveDrop = netOpts.live;
+            queue_->SetPolicy(policy);
         }
         opened_ = true;
         OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFSub",
@@ -713,6 +735,41 @@ private:
             tight.data(), tight.size());
     }
 
+    void EmitOverflow(uint64_t dropped)
+    {
+        auto* msg = new SubMsg();
+        msg->type = SUBMSG_OVERFLOW;
+        msg->count = dropped;
+        Emit(msg);
+    }
+
+    void EmitDiscontinuity(const std::string& reason)
+    {
+        auto* msg = new SubMsg();
+        msg->type = SUBMSG_DISCONTINUITY;
+        msg->err = reason;
+        Emit(msg);
+    }
+
+    // Worker-side polling of the shared queue's overflow counter (F3): the
+    // demux thread never calls back into a decoder; the worker notices a new
+    // overflow episode on its next loop pass and emits. Also fires while
+    // paused — a paused (or never-started) subtitle consumer is exactly when
+    // the backlog overflows.
+    void PollQueueEvents()
+    {
+        if (queue_ == nullptr) {
+            return;
+        }
+        const uint64_t events = queue_->OverflowEvents();
+        if (events != lastOverflowSeen_) {
+            const uint64_t droppedTotal = queue_->DroppedPackets();
+            EmitOverflow(droppedTotal - lastDroppedSeen_);
+            lastOverflowSeen_ = events;
+            lastDroppedSeen_ = droppedTotal;
+        }
+    }
+
     // Unified packet source: the shared demux queue when attached, the private
     // av_read_frame otherwise. Returns av_read_frame-compatible status
     // (0 = ok, <0 = EOF or aborted).
@@ -738,6 +795,8 @@ private:
         auto pauseStart = std::chrono::steady_clock::now();
 
         while (!stop_) {
+            PollQueueEvents();
+
             if (paused_) {
                 if (!pausing) {
                     pausing = true;
@@ -823,6 +882,11 @@ private:
     napi_ref endRef_ = nullptr;
     napi_ref errorRef_ = nullptr;
     napi_ref pesRef_ = nullptr;
+    napi_ref overflowRef_ = nullptr;
+    napi_ref discontinuityRef_ = nullptr;
+    // worker-side overflow episode bookkeeping (see PollQueueEvents)
+    uint64_t lastOverflowSeen_ = 0;
+    uint64_t lastDroppedSeen_ = 0;
 };
 
 struct OpenContext {
@@ -973,6 +1037,32 @@ void TsfnDispatcher(napi_env env, napi_value jsCallback, void* context, void* da
                   }
               }
           }
+      } else if (msg->type == SUBMSG_OVERFLOW) {
+          if (core != nullptr && core->GetOverflowCallback() != nullptr) {
+              napi_value cb = nullptr;
+              napi_get_reference_value(env, core->GetOverflowCallback(), &cb);
+              if (cb != nullptr) {
+                  napi_value ev = nullptr;
+                  napi_create_object(env, &ev);
+                  napi_value dropped = nullptr;
+                  napi_create_int64(env, static_cast<int64_t>(msg->count), &dropped);
+                  napi_set_named_property(env, ev, "dropped", dropped);
+                  napi_call_function(env, undefined, cb, 1, &ev, &undefined);
+              }
+          }
+      } else if (msg->type == SUBMSG_DISCONTINUITY) {
+          if (core != nullptr && core->GetDiscontinuityCallback() != nullptr) {
+              napi_value cb = nullptr;
+              napi_get_reference_value(env, core->GetDiscontinuityCallback(), &cb);
+              if (cb != nullptr) {
+                  napi_value ev = nullptr;
+                  napi_create_object(env, &ev);
+                  napi_value reason = nullptr;
+                  napi_create_string_utf8(env, msg->err.c_str(), NAPI_AUTO_LENGTH, &reason);
+                  napi_set_named_property(env, ev, "reason", reason);
+                  napi_call_function(env, undefined, cb, 1, &ev, &undefined);
+              }
+          }
       }
 
       if (msg->rgba != nullptr) {
@@ -988,10 +1078,19 @@ void CoreFinalize(napi_env env, void* data, void* hint)
 {
     (void)hint;
     auto* core = static_cast<SubtitleDecoderCore*>(data);
+    // The JS object died without close(): unsubscribe the shared demux
+    // session BEFORE the delete — a zombie queue keeps receiving routed
+    // packets until the destructor runs (endless high-water drop storm, and
+    // the demux thread can sit blocked on the queue's full mark while the
+    // queue object is being destroyed).
+    core->DetachDemux();
     core->ReleaseTsfn();
     napi_ref sub = core->GetSubtitleCallback();
     napi_ref end = core->GetEndCallback();
     napi_ref err = core->GetErrorCallback();
+    napi_ref pes = core->GetPesCallback();
+    napi_ref overflow = core->GetOverflowCallback();
+    napi_ref discont = core->GetDiscontinuityCallback();
     if (sub != nullptr) {
         napi_delete_reference(env, sub);
     }
@@ -1000,6 +1099,15 @@ void CoreFinalize(napi_env env, void* data, void* hint)
     }
     if (err != nullptr) {
         napi_delete_reference(env, err);
+    }
+    if (pes != nullptr) {
+        napi_delete_reference(env, pes);
+    }
+    if (overflow != nullptr) {
+        napi_delete_reference(env, overflow);
+    }
+    if (discont != nullptr) {
+        napi_delete_reference(env, discont);
     }
     delete core;
 }
@@ -1089,8 +1197,13 @@ napi_value FFSubtitleDecoderOn(napi_env env, napi_callback_info info)
         slot = core->ErrorSlot();
     } else if (event == "pes") {
         slot = core->PesSlot();
+    } else if (event == "overflow") {
+        slot = core->OverflowSlot();
+    } else if (event == "discontinuity") {
+        slot = core->DiscontinuitySlot();
     } else {
-        napi_throw_type_error(env, nullptr, "unsupported event, expect 'subtitle' | 'end' | 'error' | 'pes'");
+        napi_throw_type_error(env, nullptr,
+            "unsupported event, expect 'subtitle' | 'end' | 'error' | 'pes' | 'overflow' | 'discontinuity'");
         return nullptr;
     }
     if (*slot != nullptr) {

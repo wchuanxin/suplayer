@@ -35,12 +35,15 @@ enum MsgType {
     MSG_END = 1,
     MSG_ERROR = 2,
     MSG_INFO = 3,
+    MSG_OVERFLOW = 4,
+    MSG_DISCONTINUITY = 5,
 };
 
 struct DecoderMsg {
     int type = MSG_FRAME;
     double ptsMs = 0.0;
-    std::string err;
+    uint64_t count = 0; // MSG_OVERFLOW: packets dropped in the episode
+    std::string err;    // MSG_ERROR: message; MSG_DISCONTINUITY: reason
     std::string backend;
 };
 
@@ -230,6 +233,22 @@ public:
     {
         return infoRef_;
     }
+    napi_ref* OverflowSlot()
+    {
+        return &overflowRef_;
+    }
+    napi_ref* DiscontinuitySlot()
+    {
+        return &discontRef_;
+    }
+    napi_ref GetOverflowCallback() const
+    {
+        return overflowRef_;
+    }
+    napi_ref GetDiscontinuityCallback() const
+    {
+        return discontRef_;
+    }
 
     napi_threadsafe_function GetTsfn() const
     {
@@ -372,10 +391,14 @@ public:
         fps_ = (fr.num > 0 && fr.den > 0) ? av_q2d(fr) : 0.0;
         if (sharedFmt_ && session_ != nullptr) {
             queue_ = session_->Subscribe({ streamIndex_ });
+            queue_->SetStatsStream(streamIndex_);
             // Live video: catch-up overflow policy. A slow (e.g. software
             // decoded 1080p50) video consumer must never block the shared
             // demux thread — that would starve the audio subscribers.
-            queue_->SetLiveDrop(netOpts.live, true);
+            BackpressurePolicy policy;
+            policy.liveDrop = netOpts.live;
+            policy.skipToKeyframe = true;
+            queue_->SetPolicy(policy);
         }
         opened_ = true;
         return true;
@@ -427,6 +450,38 @@ public:
     std::string GetColorRange() const
     {
         return (opened_ && dec_ != nullptr) ? ColorRangeToStr(dec_->color_range) : "";
+    }
+
+    // ---- Buffer / playback stats (D4/B2) ------------------------------
+    // Media duration of the stats-stream packets currently queued in the
+    // shared demux queue; 0 on a private connection (no queue).
+    int64_t GetBufferedAheadMs() const
+    {
+        return queue_ != nullptr ? queue_->BufferedAheadMs() : 0;
+    }
+    uint64_t GetReadBytes() const
+    {
+        return readBytes_.load(std::memory_order_relaxed);
+    }
+    uint64_t GetMeasuredBitrateBps() const
+    {
+        return measuredBitrateBps_.load(std::memory_order_relaxed);
+    }
+    uint64_t GetDecodedFrames() const
+    {
+        return decodedFrames_.load(std::memory_order_relaxed);
+    }
+    uint64_t GetDroppedFrames() const
+    {
+        return droppedFrames_.load(std::memory_order_relaxed);
+    }
+    uint64_t GetOverflowEvents() const
+    {
+        return queue_ != nullptr ? queue_->OverflowEvents() : 0;
+    }
+    uint64_t GetDiscontinuityCount() const
+    {
+        return discontinuityCount_.load(std::memory_order_relaxed);
     }
 
     bool Start(uint64_t surfaceId)
@@ -522,6 +577,9 @@ public:
             return; // private connection: no dropable backlog
         }
         queue_->DropBacklogToKeyframe();
+        // The drop shifts the timeline forward: the app's progress anchor is
+        // now wrong by the dropped span — surface it as a discontinuity.
+        EmitDiscontinuity("resync");
     }
 
     // Leak-path zombie cleanup: unsubscribe from the shared demux session
@@ -693,6 +751,42 @@ private:
         Emit(msg);
     }
 
+    void EmitOverflow(uint64_t dropped)
+    {
+        auto* msg = new DecoderMsg();
+        msg->type = MSG_OVERFLOW;
+        msg->count = dropped;
+        Emit(msg);
+    }
+
+    void EmitDiscontinuity(const std::string& reason)
+    {
+        discontinuityCount_.fetch_add(1, std::memory_order_relaxed);
+        auto* msg = new DecoderMsg();
+        msg->type = MSG_DISCONTINUITY;
+        msg->err = reason;
+        Emit(msg);
+    }
+
+    // Worker-side polling of the shared queue's overflow counter (F3): the
+    // demux thread never calls back into a decoder (a dying decoder's queue
+    // would dangle the callback); instead the worker notices a new overflow
+    // episode on its next loop pass and emits. Also fires while paused —
+    // a paused live consumer is exactly when the backlog overflows.
+    void PollQueueEvents()
+    {
+        if (queue_ == nullptr) {
+            return;
+        }
+        const uint64_t events = queue_->OverflowEvents();
+        if (events != lastOverflowSeen_) {
+            const uint64_t droppedTotal = queue_->DroppedPackets();
+            EmitOverflow(droppedTotal - lastDroppedSeen_);
+            lastOverflowSeen_ = events;
+            lastDroppedSeen_ = droppedTotal;
+        }
+    }
+
     // Unified packet source: the shared demux queue when attached, the private
     // av_read_frame otherwise. Returns av_read_frame-compatible status
     // (0 = ok, <0 = EOF or aborted). `deadlineSteadyMs` (0 = none) bounds a
@@ -701,17 +795,48 @@ private:
     // block the open path forever.
     int ReadPacket(AVPacket* pkt, int64_t deadlineSteadyMs = 0)
     {
+        int ret = -1;
         if (queue_ != nullptr) {
-            return queue_->Pop(pkt, stop_, deadlineSteadyMs);
+            ret = queue_->Pop(pkt, stop_, deadlineSteadyMs);
+        } else {
+            if (deadlineSteadyMs > 0) {
+                peekDeadlineMs_.store(deadlineSteadyMs);
+            }
+            ret = av_read_frame(fmt_, pkt);
+            if (deadlineSteadyMs > 0) {
+                peekDeadlineMs_.store(0);
+            }
         }
-        if (deadlineSteadyMs > 0) {
-            peekDeadlineMs_.store(deadlineSteadyMs);
-        }
-        int ret = av_read_frame(fmt_, pkt);
-        if (deadlineSteadyMs > 0) {
-            peekDeadlineMs_.store(0);
+        if (ret == 0) {
+            AccountReadBytes(static_cast<uint64_t>(pkt->size));
         }
         return ret;
+    }
+
+    // Byte counter + measured bitrate over a 5s window (D4). Called from the
+    // worker thread and, during the hw-eligibility peek, from the JS thread
+    // — never concurrently (the worker is not running while the peek runs).
+    void AccountReadBytes(uint64_t bytes)
+    {
+        readBytes_.fetch_add(bytes, std::memory_order_relaxed);
+        const int64_t now = NowMs();
+        if (rateWindowStartMs_ == 0) {
+            rateWindowStartMs_ = now;
+            rateWindowBytes_ = 0;
+        }
+        rateWindowBytes_ += bytes;
+        const int64_t span = now - rateWindowStartMs_;
+        if (span >= 5000) {
+            const uint64_t instant = static_cast<uint64_t>(
+                static_cast<double>(rateWindowBytes_) * 8.0 * 1000.0 / static_cast<double>(span));
+            // Blend the just-closed window into the published rate (EWMA) so
+            // a single-window spike does not jump the stat.
+            const uint64_t prev = measuredBitrateBps_.load(std::memory_order_relaxed);
+            const uint64_t blended = prev == 0 ? instant : prev / 2 + instant / 2;
+            measuredBitrateBps_.store(blended, std::memory_order_relaxed);
+            rateWindowStartMs_ = now;
+            rateWindowBytes_ = 0;
+        }
     }
 
     // Decide whether the current stream is eligible for the hardware decoder and
@@ -799,7 +924,10 @@ private:
             return false;
         }
         hw_ = std::make_unique<HwVideoDecoder>();
-        hw_->onFrame = [this](double ptsMs) { EmitFrame(ptsMs); };
+        hw_->onFrame = [this](double ptsMs) {
+            decodedFrames_.fetch_add(1, std::memory_order_relaxed);
+            EmitFrame(ptsMs);
+        };
         hw_->onEnd = [this]() { EmitEnd(); };
         hw_->onError = [this](const std::string& err) { EmitError(err); };
         // startTimeMs precise start: the render loop releases pre-target
@@ -983,6 +1111,7 @@ private:
             av_packet_free(&hwPendingPkt_);
         }
         while (!stop_) {
+            PollQueueEvents();
             if (paused_) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
@@ -1034,6 +1163,7 @@ private:
         }
 
         while (!stop_) {
+            PollQueueEvents();
             if (paused_) {
                 if (!pausing) {
                     pausing = true;
@@ -1121,7 +1251,13 @@ private:
                 }
             }
 
-            RenderFrame(frame) ? rendered++ : failed++;
+            if (RenderFrame(frame)) {
+                rendered++;
+                decodedFrames_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                failed++;
+                droppedFrames_.fetch_add(1, std::memory_order_relaxed);
+            }
             EmitFrame(ptsMs);
             av_frame_unref(frame);
         }
@@ -1179,6 +1315,19 @@ private:
     napi_ref endRef_ = nullptr;
     napi_ref errorRef_ = nullptr;
     napi_ref infoRef_ = nullptr;
+    napi_ref overflowRef_ = nullptr;
+    napi_ref discontRef_ = nullptr;
+
+    // Buffer / playback stats (D4/B2/F3)
+    std::atomic<uint64_t> readBytes_{ 0 };
+    std::atomic<uint64_t> measuredBitrateBps_{ 0 };
+    int64_t rateWindowStartMs_ = 0;
+    uint64_t rateWindowBytes_ = 0;
+    std::atomic<uint64_t> decodedFrames_{ 0 };
+    std::atomic<uint64_t> droppedFrames_{ 0 };
+    std::atomic<uint64_t> discontinuityCount_{ 0 };
+    uint64_t lastOverflowSeen_ = 0;
+    uint64_t lastDroppedSeen_ = 0;
 };
 
 struct OpenContext {
@@ -1285,6 +1434,32 @@ void TsfnDispatcher(napi_env env, napi_value jsCallback, void* context, void* da
                 napi_call_function(env, undefined, cb, 1, &ev, &undefined);
             }
         }
+    } else if (msg->type == MSG_OVERFLOW) {
+        if (core != nullptr && core->GetOverflowCallback() != nullptr) {
+            napi_value cb = nullptr;
+            napi_get_reference_value(env, core->GetOverflowCallback(), &cb);
+            if (cb != nullptr) {
+                napi_value ev = nullptr;
+                napi_create_object(env, &ev);
+                napi_value dropped = nullptr;
+                napi_create_int64(env, static_cast<int64_t>(msg->count), &dropped);
+                napi_set_named_property(env, ev, "dropped", dropped);
+                napi_call_function(env, undefined, cb, 1, &ev, &undefined);
+            }
+        }
+    } else if (msg->type == MSG_DISCONTINUITY) {
+        if (core != nullptr && core->GetDiscontinuityCallback() != nullptr) {
+            napi_value cb = nullptr;
+            napi_get_reference_value(env, core->GetDiscontinuityCallback(), &cb);
+            if (cb != nullptr) {
+                napi_value ev = nullptr;
+                napi_create_object(env, &ev);
+                napi_value reason = nullptr;
+                napi_create_string_utf8(env, msg->err.c_str(), NAPI_AUTO_LENGTH, &reason);
+                napi_set_named_property(env, ev, "reason", reason);
+                napi_call_function(env, undefined, cb, 1, &ev, &undefined);
+            }
+        }
     } else if (msg->type == MSG_ERROR) {
         if (core != nullptr && core->GetErrorCallback() != nullptr) {
             napi_value cb = nullptr;
@@ -1303,11 +1478,19 @@ void CoreFinalize(napi_env env, void* data, void* hint)
 {
     (void)hint;
     auto* core = static_cast<VideoDecoderCore*>(data);
+    // The JS object died without close(): unsubscribe the shared demux
+    // session BEFORE the delete — a zombie queue keeps receiving routed
+    // packets until the destructor runs (endless high-water drop storm, and
+    // the demux thread can sit blocked on the queue's full mark while the
+    // queue object is being destroyed).
+    core->DetachDemux();
     core->ReleaseTsfn();
     napi_ref frame = core->GetFrameCallback();
     napi_ref end = core->GetEndCallback();
     napi_ref err = core->GetErrorCallback();
     napi_ref info = core->GetInfoCallback();
+    napi_ref overflow = core->GetOverflowCallback();
+    napi_ref discont = core->GetDiscontinuityCallback();
     if (frame != nullptr) {
         napi_delete_reference(env, frame);
     }
@@ -1319,6 +1502,12 @@ void CoreFinalize(napi_env env, void* data, void* hint)
     }
     if (info != nullptr) {
         napi_delete_reference(env, info);
+    }
+    if (overflow != nullptr) {
+        napi_delete_reference(env, overflow);
+    }
+    if (discont != nullptr) {
+        napi_delete_reference(env, discont);
     }
     delete core;
 }
@@ -1409,8 +1598,13 @@ napi_value FFVideoDecoderOn(napi_env env, napi_callback_info info)
         slot = core->ErrorSlot();
     } else if (event == "info") {
         slot = core->InfoSlot();
+    } else if (event == "overflow") {
+        slot = core->OverflowSlot();
+    } else if (event == "discontinuity") {
+        slot = core->DiscontinuitySlot();
     } else {
-        napi_throw_type_error(env, nullptr, "unsupported event, expect 'frame' | 'end' | 'error' | 'info'");
+        napi_throw_type_error(env, nullptr,
+            "unsupported event, expect 'frame' | 'end' | 'error' | 'info' | 'overflow' | 'discontinuity'");
         return nullptr;
     }
     if (*slot != nullptr) {
@@ -1526,6 +1720,56 @@ napi_value FFVideoDecoderDetach(napi_env env, napi_callback_info info)
         core->DetachDemux();
     }
     return nullptr;
+}
+
+napi_value FFVideoDecoderGetBufferStats(napi_env env, napi_callback_info info)
+{
+    VideoDecoderCore* core = GetCore(env, info);
+    if (core == nullptr) {
+        napi_throw_error(env, nullptr, "FFVideoDecoder is not constructed");
+        return nullptr;
+    }
+    napi_value result = nullptr;
+    napi_create_object(env, &result);
+    napi_value v = nullptr;
+    napi_create_int64(env, core->GetBufferedAheadMs(), &v);
+    napi_set_named_property(env, result, "bufferedAheadMs", v);
+    napi_create_int64(env, static_cast<int64_t>(core->GetReadBytes()), &v);
+    napi_set_named_property(env, result, "readBytes", v);
+    napi_create_int64(env, static_cast<int64_t>(core->GetMeasuredBitrateBps()), &v);
+    napi_set_named_property(env, result, "measuredBitrateBps", v);
+    // Live latency needs playlist-level timing (LL-HLS / PVR-DVR); -1 until wired.
+    napi_create_int64(env, -1, &v);
+    napi_set_named_property(env, result, "liveLatencyMs", v);
+    napi_create_int64(env, static_cast<int64_t>(core->GetOverflowEvents()), &v);
+    napi_set_named_property(env, result, "overflowCount", v);
+    // Automatic reconnects (token self-healing) land with the live work; 0 until then.
+    napi_create_int64(env, 0, &v);
+    napi_set_named_property(env, result, "reconnectCount", v);
+    return result;
+}
+
+napi_value FFVideoDecoderGetStats(napi_env env, napi_callback_info info)
+{
+    VideoDecoderCore* core = GetCore(env, info);
+    if (core == nullptr) {
+        napi_throw_error(env, nullptr, "FFVideoDecoder is not constructed");
+        return nullptr;
+    }
+    napi_value result = nullptr;
+    napi_create_object(env, &result);
+    napi_value v = nullptr;
+    napi_create_int64(env, static_cast<int64_t>(core->GetDecodedFrames()), &v);
+    napi_set_named_property(env, result, "decodedFrames", v);
+    napi_create_int64(env, static_cast<int64_t>(core->GetDroppedFrames()), &v);
+    napi_set_named_property(env, result, "droppedFrames", v);
+    napi_create_int64(env, static_cast<int64_t>(core->GetOverflowEvents()), &v);
+    napi_set_named_property(env, result, "overflowCount", v);
+    napi_create_int64(env, 0, &v);
+    napi_set_named_property(env, result, "reconnectCount", v);
+    napi_create_int64(env, static_cast<int64_t>(core->GetDiscontinuityCount()), &v);
+    napi_set_named_property(env, result, "discontinuityCount", v);
+    return result;
 }
 
 } // namespace ffmpeg

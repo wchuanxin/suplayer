@@ -15,6 +15,8 @@ napi_value FFVideoDecoderStop(napi_env env, napi_callback_info info);
 napi_value FFVideoDecoderClose(napi_env env, napi_callback_info info);
 napi_value FFVideoDecoderFlushToKeyframe(napi_env env, napi_callback_info info);
 napi_value FFVideoDecoderDetach(napi_env env, napi_callback_info info);
+napi_value FFVideoDecoderGetBufferStats(napi_env env, napi_callback_info info);
+napi_value FFVideoDecoderGetStats(napi_env env, napi_callback_info info);
 
 } // namespace ffmpeg
 

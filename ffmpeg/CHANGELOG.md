@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.8.0 (unreleased)
+
+In development — entries accumulate here as features land. The interim
+1.7.6–1.7.10 builds below are folded into this release.
+
+## 1.7.6 – 1.7.10 (2026-10-04 – 2026-10-05, internal iteration builds)
+
+Audio varispeed, raw subtitle PES pump, and live-connection watchdogs. These
+versions were internal iteration builds consumed directly by the app; their
+changes ship in 1.8.0.
+
+- New `FFAudioDecoder.setRate(rate)`: audio varispeed playback. The decode
+  worker rebuilds each track's `SwrContext` with the resampler output rate
+  scaled to `outRate / rate` (rate clamped to [0.5, 2.0]), so the renderer
+  keeps its fixed sample rate and buffer format — no `AudioRenderer`
+  reconfiguration. The rate is applied lazily by the worker at packet
+  boundaries (threadsafe, callable during playback); a failed reconfig keeps
+  the previous rate.
+- New `FFSubtitleDecoder.setRawPump(true)` + `'pes'` event: raw PES pump
+  mode. Skips avcodec subtitle decoding entirely and forwards each demuxed
+  subtitle packet as-is (payload, pts, stream index) for app-side DVB
+  parsing. Must be set before `start()`; `open()` runs unchanged (the codec
+  context is opened but unused in raw mode).
+- Live read-stall watchdog (shared demux, live sources): a live connection
+  that has not delivered a single packet for 30s (`LIVE_READ_STALL_MS`) is
+  dead — a server that closed silently or a network black hole, where
+  `av_read_frame` blocks forever because the interrupt callback only aborts
+  on stop. The watchdog fires the interrupt so the blocked read fails, the
+  demux thread exits, and the app's recovery machinery can rebuild the
+  session on the next open.
+- Live slow-starve watchdog (shared demux, live sources): a server-throttled
+  connection trickles packets (the no-packet watchdog never fires) while
+  playback crawls at a fraction of realtime. The demuxer now measures the
+  video stream's media-time progress per 10s wall window (per-packet
+  duration, immune to prestart bursts and pts jumps): progress below 15% of
+  realtime sustained for 15s aborts the session (read ends, EOF to all
+  subscribers) instead of hanging on a dead-but-connected stream.
+
 ## 1.7.5 (2026-10-04)
 
 Live A/V desync recovery + zombie session cleanup.

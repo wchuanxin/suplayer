@@ -20,11 +20,12 @@ add_library(ffmpeg SHARED
     napi/ffmpeg_napi.cpp
     napi/probe.cpp
     napi/frame_extractor.cpp
-napi/audio_decoder.cpp
-napi/video_decoder.cpp
-napi/subtitle_decoder.cpp
-napi/hw_decoder.cpp
-napi/demux_session.cpp
+    napi/audio_decoder.cpp
+    napi/video_decoder.cpp
+    napi/subtitle_decoder.cpp
+    napi/hw_decoder.cpp
+    napi/demux_session.cpp
+    napi/packet_queue.cpp
     napi/transcoder.cpp
 )
 
