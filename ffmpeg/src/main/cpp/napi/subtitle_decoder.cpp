@@ -1,6 +1,7 @@
 #include "subtitle_decoder.h"
 #include "net_options.h"
 #include "demux_session.h"
+#include "hls_playlist.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -195,9 +196,16 @@ public:
             fmt_ = avformat_alloc_context();
             fmt_->interrupt_callback.callback = InterruptOnStop;
             fmt_->interrupt_callback.opaque = &stop_;
+            // A2/F1: variant/latency resolution (infallible — falls back to
+            // the original URL) before the private open.
+            const SourceResolution res = ResolveSource(src, netOpts, &InterruptOnStop, &stop_);
+            NetOptions effOpts = netOpts;
+            if (res.liveStartIndex != INT32_MIN) {
+                effOpts.liveStartIndex = res.liveStartIndex;
+            }
             AVDictionary* dict = nullptr;
-            ApplyOpenOptions(fmt_, &dict, netOpts);
-            int ret = avformat_open_input(&fmt_, src.c_str(), nullptr, &dict);
+            ApplyOpenOptions(fmt_, &dict, effOpts);
+            int ret = avformat_open_input(&fmt_, res.url.c_str(), nullptr, &dict);
             av_dict_free(&dict);
             if (ret < 0) {
                 lastError_ = "avformat_open_input failed: " + ErrToStr(ret);
@@ -755,7 +763,9 @@ private:
     // demux thread never calls back into a decoder; the worker notices a new
     // overflow episode on its next loop pass and emits. Also fires while
     // paused — a paused (or never-started) subtitle consumer is exactly when
-    // the backlog overflows.
+    // the backlog overflows. A reconnect (A3) surfaces as a plain
+    // discontinuity('reconnect'): the subtitle core carries no stats and no
+    // dedicated reconnected event.
     void PollQueueEvents()
     {
         if (queue_ == nullptr) {
@@ -767,6 +777,11 @@ private:
             EmitOverflow(droppedTotal - lastDroppedSeen_);
             lastOverflowSeen_ = events;
             lastDroppedSeen_ = droppedTotal;
+        }
+        const uint64_t reconnects = queue_->ReconnectEvents();
+        if (reconnects != lastReconnectSeen_) {
+            lastReconnectSeen_ = reconnects;
+            EmitDiscontinuity("reconnect");
         }
     }
 
@@ -887,6 +902,7 @@ private:
     // worker-side overflow episode bookkeeping (see PollQueueEvents)
     uint64_t lastOverflowSeen_ = 0;
     uint64_t lastDroppedSeen_ = 0;
+    uint64_t lastReconnectSeen_ = 0;
 };
 
 struct OpenContext {
@@ -1159,7 +1175,7 @@ napi_value FFSubtitleDecoderOpen(napi_env env, napi_callback_info info)
     if (argc >= 3 && !ParseNetOptions(env, args[2], ctx->netOpts)) {
         delete ctx;
         napi_throw_type_error(env, nullptr,
-            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, program?, httpPersistent?, reconnect? }");
+            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, program?, httpPersistent?, reconnect?, variantIndex?, maxBandwidth?, targetLatencyMs?, autoReconnect?, reconnectMaxRetries?, dvrSeek? }");
         return nullptr;
     }
 

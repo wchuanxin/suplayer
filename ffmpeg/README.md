@@ -192,14 +192,47 @@ Optional network/live options accepted by `probe` and both decoders' `open`:
 | `program` | unset | MPEG-TS program number to lock playback to. When set, only streams of that program are demuxed; automatic stream selection stays inside the program and explicit `streamIndex` values are validated against it. Unknown program numbers fail the `open` |
 | `httpPersistent` | `true` | Keep one HTTP/TCP connection alive across HLS playlist refreshes and segment downloads (`http_persistent=1`) instead of reconnecting for every request — cuts live-edge latency and TLS handshakes |
 | `reconnect` | `true` | Auto-retry failed network requests: `reconnect=1`, `reconnect_streamed=1`, `reconnect_on_network_error=1`, `reconnect_on_http_error=4xx,5xx`, `reconnect_delay_max=5` — survives CDN edge-misses (momentary 404/410 on freshly announced segments) and brief network drops |
+| `variantIndex` | unset | HLS master-playlist variant selection: pick the variant at this 0-based index. Takes precedence over `maxBandwidth` |
+| `maxBandwidth` | `0` | HLS variant bandwidth cap: pick the highest-bandwidth variant whose `BANDWIDTH <= maxBandwidth` (all exceeding → the lowest). `0` = no cap. The master playlist is fetched once before the open and the chosen variant URL replaces the source; any fetch/parse failure falls back to the original URL |
+| `targetLatencyMs` | `0` | Live target latency: derive `liveStartIndex` from the media playlist's `TARGETDURATION` (`-ceil(target/segDur)`, clamped 1..30) when no explicit `liveStartIndex` is set, and keep converging on it — the shared session drops subscriber backlogs exceeding `target + max(2s, target/2)` every ~5s. `0` = off |
+| `autoReconnect` | auto | In-place session rebuild after 401/403/404/429 read errors (token expiry, sliding-window miss, rate limit): the shared session re-resolves the source (fresh CDN token) and reopens, verifying the stream layout; subscribers get `'reconnected'` + `discontinuity('reconnect')`. `true` = always on, `false` = always off, unset = auto (live on, VOD off) |
+| `reconnectMaxRetries` | `3` | Rebuild attempts before the session gives up (EOF); exponential backoff 1s..8s (2s..16s for HTTP 429) |
+| `dvrSeek` | `false` | Reserved (DVR window seek over the shared connection); no effect yet |
 | `audioTracks` | `'all'` | `FFAudioDecoder` track decode mode: `'all'` decodes every audio track in parallel (zero-gap hot switching); `'first'` decodes only the selected track and opens the target track lazily on `switchTrack` — lower CPU/power on multi-track sources, with a brief splice instead of a seamless switch |
 | `frameEventMs` | `0` | Minimum interval in ms between `FFVideoDecoder` `'frame'` events (`0` = every frame). The first frame is always emitted; larger values throttle the NAPI bridge traffic for apps that only need periodic PTS updates (A/V sync, progress) |
 | `startTimeMs` | `0` | VOD start position in ms: the decoder seeks to the keyframe at/before the target and drops pre-target frames (video: decode but no render/emit, audio: no resample/emit), so playback starts precisely at the requested position. `0` = from head. Ignored when the source is not seekable (live streams fall back to normal startup) |
-| `sharedDemux` | `false` | Shared demuxer: every decoder (video / audio / subtitle) opened for the same source with matching demux options (`userAgent`/`headers`/`allowedExtensions`/`liveStartIndex`/`analyzeMs`/`program`/`httpPersistent`/`reconnect`) shares ONE network connection through a process-wide demux session, instead of one connection per decoder. A single demux thread routes packets to per-decoder bounded queues; queue high-water backpressure keeps the self-pacing semantics of private connections (a paused decoder stalls the shared read exactly like it used to stall its own). Concurrent first openers race; the loser attaches to the winner (startup stays parallel, steady state is one connection). Attachers compensate a different `startTimeMs` with their own pre-target drop. `probe()` reuses a live session's context for metadata reads without opening a new connection |
+| `sharedDemux` | `false` | Shared demuxer: every decoder (video / audio / subtitle) opened for the same source with matching demux options (`userAgent`/`headers`/`allowedExtensions`/`liveStartIndex`/`analyzeMs`/`program`/`httpPersistent`/`reconnect`/`variantIndex`/`maxBandwidth`/`targetLatencyMs`/`autoReconnect`/`reconnectMaxRetries`) shares ONE network connection through a process-wide demux session, instead of one connection per decoder. A single demux thread routes packets to per-decoder bounded queues; queue high-water backpressure keeps the self-pacing semantics of private connections (a paused decoder stalls the shared read exactly like it used to stall its own). Concurrent first openers race; the loser attaches to the winner (startup stays parallel, steady state is one connection). Attachers compensate a different `startTimeMs` with their own pre-target drop. `probe()` reuses a live session's context for metadata reads without opening a new connection |
 
 For live streams `durationMs` is `0` and the `'end'` event never fires; use
 `stop()` to end playback. `stop()` also aborts in-flight network reads
 immediately.
+
+### Live queue events, recovery & statistics
+
+All three decoders expose the live health of their shared demux
+subscription:
+
+- `'overflow'` (`{ dropped }`): the queue's live catch-up valve dropped a
+  backlog episode — packets dropped in this episode. Also fires while
+  paused (worker-side counter polling), which is exactly when a live
+  backlog overflows.
+- `'discontinuity'` (`{ reason }`): stream discontinuity. `'resync'` after
+  an explicit `flushToKeyframe()` / `flushBacklog()` or a queue backlog
+  drop; `'reconnect'` after the session rebuilt its connection in place.
+- `'reconnected'` (video/audio only, no payload): the shared session
+  recovered from a 401/403/404/429 by re-resolving the source and
+  reopening; stream indexes stay valid. Followed by
+  `discontinuity('reconnect')`.
+- `getBufferStats()` (video/audio): `{ bufferedAheadMs, readBytes,
+  measuredBitrateBps, liveLatencyMs, overflowCount, reconnectCount }` —
+  queue depth, consumed bytes, EWMA bitrate (5s windows) and the
+  overflow/reconnect counters.
+- `getStats()` (video/audio): `{ decodedFrames, droppedFrames,
+  overflowCount, reconnectCount, discontinuityCount }`.
+
+`FFMediaInfo.programs[].bandwidth` carries the HLS variant's `BANDWIDTH`
+(`0` for plain MPEG-TS programs), so apps can rank/pick variants by real
+bandwidth via `probe()`.
 
 ### `FFAudioDecoder`
 
@@ -209,8 +242,16 @@ on(event: 'pcm', cb: (packet: FFAudioPacket) => void): void   // F32LE interleav
 on(event: 'end', cb: () => void): void
 on(event: 'error', cb: (msg: string) => void): void
 on(event: 'switched', cb: (info: FFAudioOpenInfo) => void): void
+on(event: 'overflow', cb: (ev: FFOverflowEvent) => void): void
+on(event: 'discontinuity', cb: (ev: FFDiscontinuityEvent) => void): void
+on(event: 'reconnected', cb: () => void): void
 start(paced?: boolean): void      // default true = realtime pacing
 switchTrack(streamIndex: number): void  // instant hot switch, mid-playback
+flushBacklog(): void              // live A/V resync: drop queue backlog
+detach(): void                    // leak-path cleanup, no thread joins
+setRate(rate: number): void       // varispeed [0.98, 1.02] for A/V sync
+getBufferStats(): FFBufferStats
+getStats(): FFPlaybackStats
 pause(): void; resume(): void
 stop(): void; close(): void
 ```
@@ -234,7 +275,14 @@ on(event: 'frame', cb: (ev: FFVideoFrameEvent) => void): void
 on(event: 'end', cb: () => void): void
 on(event: 'error', cb: (msg: string) => void): void
 on(event: 'info', cb: (ev: FFVideoInfoEvent) => void): void  // { backend: 'hw' | 'sw' }
+on(event: 'overflow', cb: (ev: FFOverflowEvent) => void): void
+on(event: 'discontinuity', cb: (ev: FFDiscontinuityEvent) => void): void
+on(event: 'reconnected', cb: () => void): void
 start(surfaceId: string): void    // renders into XComponent surface
+flushToKeyframe(): void            // live A/V resync: drop backlog to newest keyframe
+detach(): void                     // leak-path cleanup, no thread joins
+getBufferStats(): FFBufferStats
+getStats(): FFPlaybackStats
 pause(): void; resume(): void
 stop(): void; close(): void
 ```
@@ -273,9 +321,14 @@ renders RGBA, which cannot reproduce HDR anyway.
 ```ts
 open(src: string, streamIndex?: number, options?: FFNetOptions): Promise<FFSubtitleOpenInfo>
 on(event: 'subtitle', cb: (ev: FFSubtitleEvent) => void): void
+on(event: 'pes', cb: (payload: ArrayBuffer, pts: number) => void): void  // raw PES pump
 on(event: 'end', cb: () => void): void
 on(event: 'error', cb: (msg: string) => void): void
+on(event: 'overflow', cb: (ev: FFOverflowEvent) => void): void
+on(event: 'discontinuity', cb: (ev: FFDiscontinuityEvent) => void): void
+setRawPump(enable: boolean): void  // before start(): forward PES as-is
 start(paced?: boolean): void      // default true = presentation-time pacing
+detach(): void                    // leak-path cleanup, no thread joins
 pause(): void; resume(): void
 stop(): void; close(): void
 ```

@@ -45,6 +45,21 @@ struct NetOptions {
                                         // next keyframe) instead of blocking the shared demux
                                         // thread, so a slow video consumer can never starve the
                                         // audio subscribers or push the HLS reader off the edge.
+    int32_t variantIndex = INT32_MIN;   // A2: HLS master-playlist variant to open (0-based index
+                                        // into EXT-X-STREAM-INF order); INT32_MIN = not set
+    int64_t maxBandwidth = 0;           // A2: pick the highest-bandwidth variant <= this (bits
+                                        // per second); 0 = no bandwidth-based selection
+    int64_t targetLatencyMs = 0;        // F1: target live latency; derives live_start_index from
+                                        // the playlist segment duration and arms runtime
+                                        // catch-up (drop backlog when buffered latency exceeds
+                                        // the target + tolerance); 0 = disabled
+    int32_t autoReconnect = -1;         // A3: rebuild the session in place on HTTP 401/403/404/
+                                        // 429 (re-fetch playlist for a fresh token). -1 = auto
+                                        // (live: on, VOD: off), 0 = off, 1 = on
+    int32_t reconnectMaxRetries = 3;    // A3/A4: rebuild attempts before giving up (EOF)
+    bool dvrSeek = false;               // F2 (experimental): allow seekTo on live DVR windows;
+                                        // success still depends on the hls demuxer keeping the
+                                        // target segment inside its sliding window
 };
 
 // Parse optional JS options object into NetOptions.
@@ -184,8 +199,28 @@ inline bool ParseNetOptions(napi_env env, napi_value val, NetOptions& out)
         return true;
     };
 
-    auto readAudioTracks = [&](const char* name, bool& dst) -> bool {
+    auto readTri = [&](const char* name, int32_t& dst) -> bool {
         napi_value v = nullptr;
+        if (napi_get_named_property(env, val, name, &v) != napi_ok) {
+            return true;
+        }
+        napi_valuetype vt = napi_undefined;
+        napi_typeof(env, v, &vt);
+        if (vt == napi_undefined || vt == napi_null) {
+            return true;
+        }
+        if (vt != napi_boolean) {
+            return false;
+        }
+        bool b = false;
+        if (napi_get_value_bool(env, v, &b) != napi_ok) {
+            return false;
+        }
+        dst = b ? 1 : 0;
+        return true;
+    };
+
+    auto readAudioTracks = [&](const char* name, bool& dst) -> bool {        napi_value v = nullptr;
         if (napi_get_named_property(env, val, name, &v) != napi_ok) {
             return true;
         }
@@ -224,7 +259,10 @@ inline bool ParseNetOptions(napi_env env, napi_value val, NetOptions& out)
         !readBool("httpPersistent", out.httpPersistent) || !readBool("reconnect", out.reconnect) ||
         !readAudioTracks("audioTracks", out.audioAllTracks) || !readInt("frameEventMs", out.frameEventMs) ||
         !readInt64("startTimeMs", out.startTimeMs) || !readBool("sharedDemux", out.sharedDemux) ||
-        !readBool("live", out.live)) {
+        !readBool("live", out.live) || !readInt("variantIndex", out.variantIndex) ||
+        !readInt64("maxBandwidth", out.maxBandwidth) || !readInt64("targetLatencyMs", out.targetLatencyMs) ||
+        !readTri("autoReconnect", out.autoReconnect) ||
+        !readInt("reconnectMaxRetries", out.reconnectMaxRetries) || !readBool("dvrSeek", out.dvrSeek)) {
         return false;
     }
     return true;

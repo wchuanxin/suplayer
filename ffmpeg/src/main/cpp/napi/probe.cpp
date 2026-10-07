@@ -10,6 +10,7 @@ extern "C" {
 }
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -41,6 +42,10 @@ struct ProgramResult {
     int32_t pcrPid = -1;
     int32_t pmtVersion = -1;
     int32_t flags = 0; // AV_PROGRAM_RUNNING = 1
+    // HLS variant bandwidth (BANDWIDTH attribute, bits/s) — the FFmpeg hls
+    // demuxer publishes it as the program's "variant_bitrate" metadata; 0
+    // when absent (plain mpegts etc.).
+    int64_t bandwidth = 0;
     std::string serviceName;
     std::string serviceProvider;
     std::vector<int32_t> streamIndexes;
@@ -163,6 +168,12 @@ void ProbeExecute(napi_env env, void* data)
         pr.flags = prog->flags;
         pr.serviceName = DictGet(prog->metadata, "service_name");
         pr.serviceProvider = DictGet(prog->metadata, "service_provider");
+        // HLS variant BANDWIDTH (A2): expose it so the app can rank/pick
+        // variants by real bandwidth instead of guessing from resolution.
+        const std::string variantBitrate = DictGet(prog->metadata, "variant_bitrate");
+        if (!variantBitrate.empty()) {
+            pr.bandwidth = strtoll(variantBitrate.c_str(), nullptr, 10);
+        }
         for (unsigned int k = 0; k < prog->nb_stream_indexes; ++k) {
             pr.streamIndexes.push_back(static_cast<int32_t>(prog->stream_index[k]));
         }
@@ -269,6 +280,7 @@ void ProbeComplete(napi_env env, napi_status status, void* data)
             SetNumberProp(env, obj, "pcrPid", p.pcrPid);
             SetNumberProp(env, obj, "pmtVersion", p.pmtVersion);
             SetNumberProp(env, obj, "flags", p.flags);
+            SetNumberProp(env, obj, "bandwidth", static_cast<double>(p.bandwidth));
             SetStringProp(env, obj, "serviceName", p.serviceName);
             SetStringProp(env, obj, "serviceProvider", p.serviceProvider);
             napi_value arr = nullptr;
@@ -314,7 +326,7 @@ napi_value Probe(napi_env env, napi_callback_info info)
     if (argc >= 2 && !ParseNetOptions(env, args[1], ctx->netOpts)) {
         delete ctx;
         napi_throw_type_error(env, nullptr,
-            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect? }");
+            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect?, variantIndex?, maxBandwidth?, targetLatencyMs?, autoReconnect?, reconnectMaxRetries?, dvrSeek? }");
         return nullptr;
     }
 

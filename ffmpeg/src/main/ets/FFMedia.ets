@@ -32,6 +32,9 @@ export interface FFProgramInfo {
   pmtVersion: number;
   /** Program flags; bit 0 (1) = AV_PROGRAM_RUNNING */
   flags: number;
+  /** HLS variant BANDWIDTH (bits/s) from the master playlist; 0 when absent
+   *  (plain MPEG-TS programs, single-variant HLS). */
+  bandwidth: number;
   /** SDT service name, empty when absent */
   serviceName: string;
   /** SDT service provider, empty when absent */
@@ -84,6 +87,33 @@ export interface FFNetOptions {
    *  disconnects and HTTP 4xx/5xx segment responses are retried with a capped
    *  backoff before surfacing an error (default true). */
   reconnect?: boolean;
+  /** HLS master-playlist variant selection (A2): pick the variant at this
+   *  0-based index from the master playlist. Takes precedence over
+   *  maxBandwidth. Unset = no explicit selection. */
+  variantIndex?: number;
+  /** HLS master-playlist bandwidth cap (A2): pick the highest-bandwidth
+   *  variant whose BANDWIDTH <= maxBandwidth (falls back to the lowest when
+   *  every variant exceeds the cap). 0 (default) = no cap. Ignored when
+   *  variantIndex is set. */
+  maxBandwidth?: number;
+  /** Live target latency (F1): derive the HLS live start index from the
+   *  playlist's TARGETDURATION so playback enters ~this far behind the live
+   *  edge; a runtime catch-up drops backlog that exceeds the target by more
+   *  than max(2s, target/2). 0 (default) = off. Ignored for VOD and when
+   *  liveStartIndex is set explicitly. */
+  targetLatencyMs?: number;
+  /** In-place session rebuild after token expiry / sliding-window /
+   *  rate-limit HTTP errors (A3): true = always on, false = always off,
+   *  unset = auto (live on, VOD off). Rebuilds re-resolve the source (fresh
+   *  CDN token), verify the stream layout and drop subscriber backlogs;
+   *  listeners get 'reconnected' + discontinuity('reconnect'). */
+  autoReconnect?: boolean;
+  /** A3 rebuild attempts before the session gives up and surfaces EOF
+   *  (default 3). Exponential backoff 1s..8s (2s..16s for HTTP 429). */
+  reconnectMaxRetries?: number;
+  /** DVR window seek over the shared connection (F2, reserved): no effect
+   *  in 1.8.0's demux layer; the native seek path consumes it. */
+  dvrSeek?: boolean;
   /** Audio track decode mode (FFAudioDecoder): 'all' (default) decodes every
    *  audio track in parallel so switchTrack is a zero-gap re-route; 'first'
    *  decodes only the selected track and opens the target track lazily on
@@ -211,8 +241,9 @@ export interface FFOverflowEvent {
   dropped: number;
 }
 
-/** Stream discontinuity raised by an explicit backlog resync (flushToKeyframe
- *  / flushBacklog); more reasons (variant switch, reconnect) may follow. */
+/** Stream discontinuity: 'resync' = explicit backlog resync
+ *  (flushToKeyframe / flushBacklog), 'reconnect' = the shared demux session
+ *  rebuilt its connection in place (see the 'reconnected' event). */
 export interface FFDiscontinuityEvent {
   reason: string;
 }
@@ -230,7 +261,7 @@ export interface FFBufferStats {
   liveLatencyMs: number;
   /** Number of overflow episodes (see FFOverflowEvent) */
   overflowCount: number;
-  /** Automatic reconnects (token self-healing); 0 until wired */
+  /** In-place session rebuilds after token/window/rate-limit errors (A3) */
   reconnectCount: number;
 }
 

@@ -1,6 +1,7 @@
 #ifndef FFMPEG_NAPI_DEMUX_SESSION_H
 #define FFMPEG_NAPI_DEMUX_SESSION_H
 
+#include "hls_playlist.h"
 #include "net_options.h"
 #include "packet_queue.h"
 
@@ -96,9 +97,26 @@ private:
     // Live throughput watchdog bookkeeping (see members below). Called per
     // demuxed packet from the demux thread only.
     void TrackStarveWatchdog(const AVPacket* pkt);
+    // A3: rebuild the connection in place after a recoverable HTTP error.
+    // Closes fmt_, re-resolves the source (fresh CDN token) and reopens.
+    // Demux-thread only. Returns false when the stream layout changed (the
+    // subscriber stream indexes would dangle) or the reopen failed.
+    bool Rebuild(std::string& err);
+    // A3/A4: decide whether a read error is recoverable and run the bounded
+    // backoff+rebuild loop. Returns true when fmt_ is valid and the demux
+    // loop should continue; false when the session must end (EOF path).
+    // `attempts` carries the retry budget across loop iterations.
+    bool TryRecover(int readErr, int& attempts);
+    // F1: periodically drop subscriber backlogs that exceed the target
+    // latency + tolerance (runtime catch-up toward the live edge).
+    void MaybeCatchUp();
     void Shutdown();
     void AddClaim();
     bool HasSubscribersOrClaims();
+    // Snapshot of the stream layout (codec ids by stream index) used to
+    // validate an in-place rebuild: subscribers subscribe by index, so a
+    // changed layout aborts the recovery instead of mis-routing packets.
+    void SnapshotStreamLayout(std::vector<int>& out);
 
     static int InterruptCb(void* opaque);
     static std::string BuildKey(const std::string& src, const NetOptions& opts);
@@ -108,6 +126,11 @@ private:
     AVFormatContext* fmt_ = nullptr;
     AVProgram* program_ = nullptr;
     std::string key_;
+    // Original open parameters (A3 rebuild re-resolves from these so a
+    // token-protected CDN mints a fresh signed variant URL).
+    std::string src_;
+    NetOptions opts_;
+    std::vector<int> streamCodecs_; // layout guard for Rebuild()
 
     std::mutex subsMtx_;
     std::vector<std::shared_ptr<PacketQueue>> subscribers_;
@@ -139,6 +162,9 @@ private:
     int64_t starveLastVideoPts_ = AV_NOPTS_VALUE; // fallback progress source
     int64_t starveLowSinceMs_ = 0; // 0 = window rate currently not starved
     std::atomic<bool> starveAbort_{ false };
+    // F1 runtime catch-up: wall ms of the last BufferedAheadMs check
+    // (0 = none yet); only armed when targetLatencyMs > 0.
+    int64_t lastCatchupCheckMs_ = 0;
     std::thread demuxThread_;
 };
 

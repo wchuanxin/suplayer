@@ -98,6 +98,22 @@ public:
         return droppedPackets_.load(std::memory_order_relaxed);
     }
 
+    // ---- Session recovery (A3) ----------------------------------------
+    // The shared demux session rebuilt its connection in place (token
+    // refresh). Bumps the counter the subscriber's worker polls to emit
+    // 'reconnected' + 'discontinuity' and to feed getBufferStats().
+    // reconnectCount. Usually immediately followed by the session calling
+    // DropBacklogToKeyframe() to discard the old-timeline backlog.
+    void NotifyReconnect()
+    {
+        reconnectEvents_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    uint64_t ReconnectEvents() const
+    {
+        return reconnectEvents_.load(std::memory_order_relaxed);
+    }
+
 private:
     struct QueuedPacket {
         AVPacket* pkt = nullptr;
@@ -147,6 +163,7 @@ private:
     std::atomic<int64_t> bufferedMs_{ 0 };
     std::atomic<uint64_t> overflowEvents_{ 0 };
     std::atomic<uint64_t> droppedPackets_{ 0 };
+    std::atomic<uint64_t> reconnectEvents_{ 0 };
 };
 
 } // namespace ffmpeg

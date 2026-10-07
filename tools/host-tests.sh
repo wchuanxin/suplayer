@@ -53,4 +53,11 @@ export PATH="$CXX_BIN:/usr/bin:$PATH"
     "$CPP/napi/host_tests/test_packet_queue.cpp" \
     -o "$OUT/test_packet_queue"
 
+"$CXX" -std=c++17 -O1 -pthread -static \
+    -I"$CPP/napi" \
+    "$CPP/napi/hls_parse.cpp" \
+    "$CPP/napi/host_tests/test_hls_parse.cpp" \
+    -o "$OUT/test_hls_parse"
+
 "$OUT/test_packet_queue"
+"$OUT/test_hls_parse"

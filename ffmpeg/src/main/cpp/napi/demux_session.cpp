@@ -70,6 +70,11 @@ std::string DemuxSession::BuildKey(const std::string& src, const NetOptions& opt
     key += "|prog=" + std::to_string(opts.program);
     key += "|pers=" + std::to_string(opts.httpPersistent ? 1 : 0);
     key += "|rc=" + std::to_string(opts.reconnect ? 1 : 0);
+    key += "|vi=" + std::to_string(opts.variantIndex);
+    key += "|bw=" + std::to_string(opts.maxBandwidth);
+    key += "|lat=" + std::to_string(opts.targetLatencyMs);
+    key += "|arc=" + std::to_string(opts.autoReconnect);
+    key += "|rcm=" + std::to_string(opts.reconnectMaxRetries);
     return key;
 }
 
@@ -162,18 +167,28 @@ std::shared_ptr<DemuxSession> DemuxSession::Find(const std::string& src, const N
 
 bool DemuxSession::Init(const std::string& src, const NetOptions& opts, std::string& err)
 {
+    src_ = src;
+    opts_ = opts;
     // Arm the read-stall watchdog BEFORE the interrupt callback is attached:
     // open + find_stream_info already run under InterruptCb, and a zero
-    // lastReadWallMs_ would abort them immediately.
+    // lastReadWallMs_ would abort them immediately. The playlist resolve
+    // below also runs network I/O under the same callback.
     liveReadStallMs_ = opts.live ? LIVE_READ_STALL_MS : 0;
     lastReadWallMs_.store(NowSteadyMs(), std::memory_order_relaxed);
     readStallFired_.store(false, std::memory_order_relaxed);
+    // A2/F1: resolve variant selection + latency-derived live start index.
+    // Infallible: falls back to the original URL on any failure.
+    const SourceResolution res = ResolveSource(src, opts, &DemuxSession::InterruptCb, this);
+    NetOptions effOpts = opts;
+    if (res.liveStartIndex != INT32_MIN) {
+        effOpts.liveStartIndex = res.liveStartIndex;
+    }
     fmt_ = avformat_alloc_context();
     fmt_->interrupt_callback.callback = &DemuxSession::InterruptCb;
     fmt_->interrupt_callback.opaque = this;
     AVDictionary* dict = nullptr;
-    ApplyOpenOptions(fmt_, &dict, opts);
-    int ret = avformat_open_input(&fmt_, src.c_str(), nullptr, &dict);
+    ApplyOpenOptions(fmt_, &dict, effOpts);
+    int ret = avformat_open_input(&fmt_, res.url.c_str(), nullptr, &dict);
     av_dict_free(&dict);
     if (ret < 0) {
         err = "avformat_open_input failed";
@@ -195,6 +210,7 @@ bool DemuxSession::Init(const std::string& src, const NetOptions& opts, std::str
             return false;
         }
     }
+    SnapshotStreamLayout(streamCodecs_);
     // startTimeMs precise start: seek once per connection before the demux
     // thread starts. Attachers with a different (later) requested start
     // simply drop pre-target frames from the session's position.
@@ -247,9 +263,17 @@ void DemuxSession::DemuxLoop()
 {
     OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFDemux", "demux thread started");
     AVPacket* pkt = av_packet_alloc();
+    int reconnectAttempts = 0;
     while (!stopping_.load(std::memory_order_relaxed)) {
         int ret = av_read_frame(fmt_, pkt);
         if (ret < 0) {
+            // A3/A4: token expiry (401/403), sliding-window misses (404) and
+            // rate limiting (429) can be healed by rebuilding the connection
+            // from the original URL (fresh signed playlist). Give up after
+            // the retry budget and fall through to the EOF path.
+            if (TryRecover(ret, reconnectAttempts)) {
+                continue;
+            }
             // Hard EOF or unrecoverable read error: every subscriber sees a
             // sticky end marker (same semantics as a private connection).
             OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFDemux",
@@ -260,6 +284,7 @@ void DemuxSession::DemuxLoop()
             }
             break;
         }
+        reconnectAttempts = 0; // a delivered packet proves the link works
         auto subs = SnapshotSubscribers();
         // Media duration of this packet (ms) for subscriber buffer-depth
         // stats (BufferedAheadMs); 0 when unknown (no duration) — the stat
@@ -280,6 +305,10 @@ void DemuxSession::DemuxLoop()
             TrackStarveWatchdog(pkt);
         }
         av_packet_unref(pkt);
+        // F1: shed excess backlog so live latency converges on the target.
+        if (liveReadStallMs_ > 0 && opts_.targetLatencyMs > 0) {
+            MaybeCatchUp();
+        }
         // Read delivered: re-arm the live read-stall watchdog.
         lastReadWallMs_.store(NowSteadyMs(), std::memory_order_relaxed);
         readStallFired_.store(false, std::memory_order_relaxed);
@@ -287,6 +316,167 @@ void DemuxSession::DemuxLoop()
     av_packet_free(&pkt);
     demuxAlive_.store(false, std::memory_order_relaxed);
     OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFDemux", "demux thread exited");
+}
+
+void DemuxSession::SnapshotStreamLayout(std::vector<int>& out)
+{
+    out.clear();
+    if (fmt_ == nullptr) {
+        return;
+    }
+    out.reserve(fmt_->nb_streams);
+    for (unsigned int i = 0; i < fmt_->nb_streams; ++i) {
+        out.push_back(fmt_->streams[i] != nullptr && fmt_->streams[i]->codecpar != nullptr
+            ? static_cast<int>(fmt_->streams[i]->codecpar->codec_id)
+            : -1);
+    }
+}
+
+bool DemuxSession::Rebuild(std::string& err)
+{
+    // Demux-thread only (sole fmt_ owner).
+    avformat_close_input(&fmt_);
+    fmt_ = nullptr;
+    program_ = nullptr;
+    // Re-arm the watchdogs: the rebuild itself performs network I/O under
+    // InterruptCb and the fresh connection deserves a clean slate.
+    lastReadWallMs_.store(NowSteadyMs(), std::memory_order_relaxed);
+    readStallFired_.store(false, std::memory_order_relaxed);
+    starveAbort_.store(false, std::memory_order_relaxed);
+    starveVideoStreamIndex_ = -1;
+    starveWindowStartMs_ = 0;
+    starveWindowProgressMs_ = 0.0;
+    starveWindowVideoPkts_ = 0;
+    starveLastVideoPts_ = AV_NOPTS_VALUE;
+    starveLowSinceMs_ = 0;
+    // Re-resolve from the ORIGINAL source: a token-protected CDN mints a
+    // fresh signed variant URL on every master-playlist fetch (A3).
+    const SourceResolution res = ResolveSource(src_, opts_, &DemuxSession::InterruptCb, this);
+    NetOptions effOpts = opts_;
+    if (res.liveStartIndex != INT32_MIN) {
+        effOpts.liveStartIndex = res.liveStartIndex;
+    }
+    fmt_ = avformat_alloc_context();
+    fmt_->interrupt_callback.callback = &DemuxSession::InterruptCb;
+    fmt_->interrupt_callback.opaque = this;
+    AVDictionary* dict = nullptr;
+    ApplyOpenOptions(fmt_, &dict, effOpts);
+    int ret = avformat_open_input(&fmt_, res.url.c_str(), nullptr, &dict);
+    av_dict_free(&dict);
+    if (ret < 0) {
+        err = "avformat_open_input failed: " + std::to_string(ret);
+        avformat_free_context(fmt_);
+        fmt_ = nullptr;
+        return false;
+    }
+    ret = avformat_find_stream_info(fmt_, nullptr);
+    if (ret < 0) {
+        err = "avformat_find_stream_info failed";
+        avformat_close_input(&fmt_);
+        return false;
+    }
+    if (opts_.program != INT32_MIN) {
+        program_ = SelectProgram(fmt_, opts_.program);
+        if (program_ == nullptr) {
+            err = "program not found after rebuild: " + std::to_string(opts_.program);
+            avformat_close_input(&fmt_);
+            return false;
+        }
+    }
+    // Subscribers subscribe by stream index: a layout change would silently
+    // mis-route packets into wrong decoders. Abort the recovery instead —
+    // the EOF path lets the app rebuild its pipeline around the new layout.
+    std::vector<int> codecs;
+    SnapshotStreamLayout(codecs);
+    if (codecs != streamCodecs_) {
+        err = "stream layout changed after rebuild";
+        avformat_close_input(&fmt_);
+        return false;
+    }
+    return true;
+}
+
+bool DemuxSession::TryRecover(int readErr, int& attempts)
+{
+    if (stopping_.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    // autoReconnect: -1 = auto (live on, VOD off).
+    const bool autoReconnect = opts_.autoReconnect < 0 ? opts_.live : opts_.autoReconnect != 0;
+    if (!autoReconnect) {
+        return false;
+    }
+    const bool recoverable = readErr == AVERROR_HTTP_UNAUTHORIZED ||
+        readErr == AVERROR_HTTP_FORBIDDEN || readErr == AVERROR_HTTP_NOT_FOUND ||
+        readErr == AVERROR_HTTP_TOO_MANY_REQUESTS;
+    if (!recoverable) {
+        return false;
+    }
+    const int maxRetries = opts_.reconnectMaxRetries > 0 ? opts_.reconnectMaxRetries : 0;
+    while (attempts < maxRetries && !stopping_.load(std::memory_order_relaxed)) {
+        // Exponential backoff; 429 (rate limit) starts slower and climbs
+        // higher. The classic avio path cannot read the Retry-After header,
+        // so the schedule is our best guess (documented limitation).
+        int64_t delayMs = readErr == AVERROR_HTTP_TOO_MANY_REQUESTS ? 2000 : 1000;
+        for (int i = 0; i < attempts; ++i) {
+            delayMs *= 2;
+        }
+        const int64_t capMs = readErr == AVERROR_HTTP_TOO_MANY_REQUESTS ? 16000 : 8000;
+        if (delayMs > capMs) {
+            delayMs = capMs;
+        }
+        attempts++;
+        OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFDemux",
+            "recoverable http error %{public}d, rebuild attempt %{public}d/%{public}d in %{public}lldms",
+            readErr, attempts, maxRetries, static_cast<long long>(delayMs));
+        for (int64_t slept = 0; slept < delayMs && !stopping_.load(std::memory_order_relaxed);
+            slept += 100) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (stopping_.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        std::string err;
+        if (Rebuild(err)) {
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFDemux",
+                "session rebuilt after http error %{public}d (attempt %{public}d)", readErr, attempts);
+            // Subscribers: count the reconnect (stats + 'reconnected'
+            // event via worker polling) and discard the old-timeline
+            // backlog; decode workers re-anchor on the next pts jump.
+            auto subs = SnapshotSubscribers();
+            for (auto& q : subs) {
+                q->NotifyReconnect();
+                q->DropBacklogToKeyframe();
+            }
+            return true;
+        }
+        OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFDemux",
+            "rebuild failed: %{public}s", err.c_str());
+    }
+    return false;
+}
+
+void DemuxSession::MaybeCatchUp()
+{
+    const int64_t now = NowSteadyMs();
+    if (lastCatchupCheckMs_ != 0 && now - lastCatchupCheckMs_ < 5000) {
+        return;
+    }
+    lastCatchupCheckMs_ = now;
+    // Tolerance: only shed when clearly above target (target + max(2s,
+    // target/2)) so the normal jitter band does not thrash the backlog.
+    const int64_t tolerance = opts_.targetLatencyMs / 2 > 2000 ? opts_.targetLatencyMs / 2 : 2000;
+    const int64_t threshold = opts_.targetLatencyMs + tolerance;
+    auto subs = SnapshotSubscribers();
+    for (auto& q : subs) {
+        const int64_t buffered = q->BufferedAheadMs();
+        if (buffered > threshold) {
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFDemux",
+                "latency catch-up: buffered %{public}lldms > target %{public}lldms + tol, dropping backlog",
+                static_cast<long long>(buffered), static_cast<long long>(opts_.targetLatencyMs));
+            q->DropBacklogToKeyframe();
+        }
+    }
 }
 
 void DemuxSession::TrackStarveWatchdog(const AVPacket* pkt)

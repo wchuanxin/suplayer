@@ -26,6 +26,8 @@ add_library(ffmpeg SHARED
     napi/hw_decoder.cpp
     napi/demux_session.cpp
     napi/packet_queue.cpp
+    napi/hls_parse.cpp
+    napi/hls_playlist.cpp
     napi/transcoder.cpp
 )
 

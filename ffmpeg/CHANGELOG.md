@@ -5,6 +5,69 @@
 In development — entries accumulate here as features land. The interim
 1.7.6–1.7.10 builds below are folded into this release.
 
+### Live queue events & decoder statistics (B2 / D4 / F3 / E2)
+
+- New `'overflow'` event on all three decoders: emitted whenever the shared
+  demux queue's live catch-up valve drops a backlog episode (payload:
+  packets dropped in that episode). Worker-side polling detects episodes
+  even while paused — a paused live consumer is exactly when the backlog
+  overflows.
+- New `'discontinuity'` event on all three decoders with reason `'resync'`
+  after explicit `flushToKeyframe()` / `flushBacklog()` calls and after a
+  queue backlog drop (payload: reason string).
+- New `FFVideoDecoder.getBufferStats()` / `FFAudioDecoder.getBufferStats()`
+  (`FFBufferStats`): `bufferedAheadMs`, `readBytes`, `measuredBitrateBps`
+  (EWMA over 5s windows), `liveLatencyMs` (reserved, -1), `overflowCount`,
+  `reconnectCount`.
+- New `FFVideoDecoder.getStats()` / `FFAudioDecoder.getStats()`
+  (`FFPlaybackStats`): `decodedFrames`, `droppedFrames`, `overflowCount`,
+  `reconnectCount`, `discontinuityCount`.
+- `FFAudioDecoder` no longer double-applies the varispeed rate at switch
+  boundaries, and the subtitle leak-path cleanup now actually detaches the
+  queue from the shared session and releases the PES references.
+
+### HLS source resolution & connection recovery (A2 / A3 / F1)
+
+- New `FFNetOptions` fields for HLS master-playlist variant selection (A2):
+  `variantIndex` (pick the variant at this 0-based index) and `maxBandwidth`
+  (pick the highest-bandwidth variant with `BANDWIDTH <= maxBandwidth`;
+  falls back to the lowest when every variant exceeds the cap). The source
+  URL is resolved before the demux open — the master playlist is fetched
+  once over FFmpeg avio (same user agent / headers / interrupt handling as
+  the demuxer, 1 MiB size cap) and the chosen variant URL replaces the
+  source. Resolution is infallible by design: any fetch or parse failure
+  logs and falls back to the original URL (pre-1.8.0 behavior). Works on
+  both the shared demux session and private decoder connections.
+- New `FFNetOptions.targetLatencyMs` (F1): live target latency. Derives the
+  HLS `live_start_index` from the media playlist's `EXT-X-TARGETDURATION`
+  (`-ceil(target/segmentDuration)`, clamped to 1..30 segments behind the
+  edge) when no explicit `liveStartIndex` is set. During playback the
+  shared demux session runs a runtime catch-up: every ~5s it drops any
+  subscriber backlog exceeding `target + max(2s, target/2)` so latency
+  converges on the target instead of drifting.
+- In-place session rebuild after recoverable HTTP errors (A3): when
+  `av_read_frame` fails with 401/403 (token expiry), 404 (sliding-window
+  miss) or 429 (rate limit), the shared demux session closes the context,
+  re-resolves the source (a token-protected CDN mints a fresh signed
+  playlist URL) and reopens in place — subscribers keep their stream
+  indexes. Guards: the rebuilt stream layout (codec ids per stream index)
+  must match the original, else the rebuild aborts to EOF so the app can
+  rebuild its pipeline around the new layout. Backoff is exponential,
+  1s..8s (2s..16s for 429), up to `reconnectMaxRetries` (default 3)
+  attempts; a successful read resets the budget. Controlled by the new
+  `FFNetOptions.autoReconnect` (true = on, false = off, unset = auto:
+  live on, VOD off).
+- New `'reconnected'` event on `FFVideoDecoder` / `FFAudioDecoder` (no
+  payload): emitted by the decode worker when the shared session rebuilt
+  its connection, immediately followed by `discontinuity` with reason
+  `'reconnect'`. `FFSubtitleDecoder` gets the discontinuity only. The
+  backlog drop after a rebuild surfaces through the existing
+  `'overflow'`/`'discontinuity'` plumbing; `getBufferStats().reconnectCount`
+  and `getStats().reconnectCount` are now live counters.
+- `FFMediaInfo.programs[].bandwidth` (probe): the HLS variant's BANDWIDTH
+  attribute as published by the FFmpeg hls demuxer (`variant_bitrate`
+  program metadata); 0 for plain MPEG-TS programs.
+
 ## 1.7.6 – 1.7.10 (2026-10-04 – 2026-10-05, internal iteration builds)
 
 Audio varispeed, raw subtitle PES pump, and live-connection watchdogs. These

@@ -1,6 +1,7 @@
 #include "audio_decoder.h"
 #include "net_options.h"
 #include "demux_session.h"
+#include "hls_playlist.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -30,6 +31,7 @@ enum MsgType {
     MSG_SWITCHED = 3,
     MSG_OVERFLOW = 4,
     MSG_DISCONTINUITY = 5,
+    MSG_RECONNECTED = 6,
 };
 
 struct DecoderMsg {
@@ -110,6 +112,10 @@ public:
     {
         return &discontinuityRef_;
     }
+    napi_ref* ReconnectedSlot()
+    {
+        return &reconnectedRef_;
+    }
     napi_ref GetPcmCallback() const
     {
         return pcmRef_;
@@ -133,6 +139,10 @@ public:
     napi_ref GetDiscontinuityCallback() const
     {
         return discontinuityRef_;
+    }
+    napi_ref GetReconnectedCallback() const
+    {
+        return reconnectedRef_;
     }
 
     napi_threadsafe_function GetTsfn() const
@@ -175,9 +185,16 @@ public:
             fmt_ = avformat_alloc_context();
             fmt_->interrupt_callback.callback = InterruptOnStop;
             fmt_->interrupt_callback.opaque = &stop_;
+            // A2/F1: variant/latency resolution (infallible — falls back to
+            // the original URL) before the private open.
+            const SourceResolution res = ResolveSource(src, netOpts, &InterruptOnStop, &stop_);
+            NetOptions effOpts = netOpts;
+            if (res.liveStartIndex != INT32_MIN) {
+                effOpts.liveStartIndex = res.liveStartIndex;
+            }
             AVDictionary* dict = nullptr;
-            ApplyOpenOptions(fmt_, &dict, netOpts);
-            int ret = avformat_open_input(&fmt_, src.c_str(), nullptr, &dict);
+            ApplyOpenOptions(fmt_, &dict, effOpts);
+            int ret = avformat_open_input(&fmt_, res.url.c_str(), nullptr, &dict);
             av_dict_free(&dict);
             if (ret < 0) {
                 lastError_ = "avformat_open_input failed: " + ErrToStr(ret);
@@ -526,6 +543,11 @@ public:
     {
         return queue_ != nullptr ? queue_->OverflowEvents() : 0;
     }
+
+    uint64_t GetReconnectEvents() const
+    {
+        return queue_ != nullptr ? queue_->ReconnectEvents() : 0;
+    }
     uint64_t GetDiscontinuityCount() const
     {
         return discontinuityCount_.load(std::memory_order_relaxed);
@@ -752,10 +774,19 @@ private:
         Emit(msg);
     }
 
+    void EmitReconnected()
+    {
+        auto* msg = new DecoderMsg();
+        msg->type = MSG_RECONNECTED;
+        Emit(msg);
+    }
+
     // Worker-side polling of the shared queue's overflow counter (F3): the
     // demux thread never calls back into a decoder; the worker notices a new
     // overflow episode on its next loop pass and emits. Also fires while
     // paused — a paused live consumer is exactly when the backlog overflows.
+    // The reconnect counter (A3) is polled the same way: the session rebuilt
+    // its connection in place (fresh CDN token) and dropped our backlog.
     void PollQueueEvents()
     {
         if (queue_ == nullptr) {
@@ -767,6 +798,12 @@ private:
             EmitOverflow(droppedTotal - lastDroppedSeen_);
             lastOverflowSeen_ = events;
             lastDroppedSeen_ = droppedTotal;
+        }
+        const uint64_t reconnects = queue_->ReconnectEvents();
+        if (reconnects != lastReconnectSeen_) {
+            lastReconnectSeen_ = reconnects;
+            EmitReconnected();
+            EmitDiscontinuity("reconnect");
         }
     }
 
@@ -1062,6 +1099,7 @@ private:
     uint64_t rateWindowBytes_ = 0;
     uint64_t lastOverflowSeen_ = 0;
     uint64_t lastDroppedSeen_ = 0;
+    uint64_t lastReconnectSeen_ = 0;
 
     napi_threadsafe_function tsfn_ = nullptr;
     napi_ref pcmRef_ = nullptr;
@@ -1070,6 +1108,7 @@ private:
     napi_ref switchedRef_ = nullptr;
     napi_ref overflowRef_ = nullptr;
     napi_ref discontinuityRef_ = nullptr;
+    napi_ref reconnectedRef_ = nullptr;
 };
 
 struct OpenContext {
@@ -1219,6 +1258,16 @@ void TsfnDispatcher(napi_env env, napi_value jsCallback, void* context, void* da
                 napi_call_function(env, undefined, cb, 1, &ev, &undefined);
             }
         }
+    } else if (msg->type == MSG_RECONNECTED) {
+        // A3: the shared session rebuilt its connection (fresh CDN token);
+        // no payload — poll getBufferStats() for counters.
+        if (core != nullptr && core->GetReconnectedCallback() != nullptr) {
+            napi_value cb = nullptr;
+            napi_get_reference_value(env, core->GetReconnectedCallback(), &cb);
+            if (cb != nullptr) {
+                napi_call_function(env, undefined, cb, 0, nullptr, &undefined);
+            }
+        }
     }
 
     if (msg->data != nullptr) {
@@ -1244,6 +1293,7 @@ void CoreFinalize(napi_env env, void* data, void* hint)
     napi_ref sw = core->GetSwitchedCallback();
     napi_ref overflow = core->GetOverflowCallback();
     napi_ref discont = core->GetDiscontinuityCallback();
+    napi_ref reconnected = core->GetReconnectedCallback();
     if (pcm != nullptr) {
         napi_delete_reference(env, pcm);
     }
@@ -1261,6 +1311,9 @@ void CoreFinalize(napi_env env, void* data, void* hint)
     }
     if (discont != nullptr) {
         napi_delete_reference(env, discont);
+    }
+    if (reconnected != nullptr) {
+        napi_delete_reference(env, reconnected);
     }
     delete core;
 }
@@ -1312,7 +1365,7 @@ napi_value FFAudioDecoderOpen(napi_env env, napi_callback_info info)
     if (argc >= 3 && !ParseNetOptions(env, args[2], ctx->netOpts)) {
         delete ctx;
         napi_throw_type_error(env, nullptr,
-            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect? }");
+            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect?, variantIndex?, maxBandwidth?, targetLatencyMs?, autoReconnect?, reconnectMaxRetries?, dvrSeek? }");
         return nullptr;
     }
 
@@ -1355,9 +1408,11 @@ napi_value FFAudioDecoderOn(napi_env env, napi_callback_info info)
         slot = core->OverflowSlot();
     } else if (event == "discontinuity") {
         slot = core->DiscontinuitySlot();
+    } else if (event == "reconnected") {
+        slot = core->ReconnectedSlot();
     } else {
         napi_throw_type_error(env, nullptr,
-            "unsupported event, expect 'pcm' | 'end' | 'error' | 'switched' | 'overflow' | 'discontinuity'");
+            "unsupported event, expect 'pcm' | 'end' | 'error' | 'switched' | 'overflow' | 'discontinuity' | 'reconnected'");
         return nullptr;
     }
     if (*slot != nullptr) {
@@ -1531,8 +1586,8 @@ napi_value FFAudioDecoderGetBufferStats(napi_env env, napi_callback_info info)
     napi_set_named_property(env, result, "liveLatencyMs", v);
     napi_create_int64(env, static_cast<int64_t>(core->GetOverflowEvents()), &v);
     napi_set_named_property(env, result, "overflowCount", v);
-    // Automatic reconnects (token self-healing) land with the live work; 0 until then.
-    napi_create_int64(env, 0, &v);
+    // A3: in-place session rebuilds (token self-healing), from the queue.
+    napi_create_int64(env, static_cast<int64_t>(core->GetReconnectEvents()), &v);
     napi_set_named_property(env, result, "reconnectCount", v);
     return result;
 }
@@ -1553,7 +1608,7 @@ napi_value FFAudioDecoderGetStats(napi_env env, napi_callback_info info)
     napi_set_named_property(env, result, "droppedFrames", v);
     napi_create_int64(env, static_cast<int64_t>(core->GetOverflowEvents()), &v);
     napi_set_named_property(env, result, "overflowCount", v);
-    napi_create_int64(env, 0, &v);
+    napi_create_int64(env, static_cast<int64_t>(core->GetReconnectEvents()), &v);
     napi_set_named_property(env, result, "reconnectCount", v);
     napi_create_int64(env, static_cast<int64_t>(core->GetDiscontinuityCount()), &v);
     napi_set_named_property(env, result, "discontinuityCount", v);
