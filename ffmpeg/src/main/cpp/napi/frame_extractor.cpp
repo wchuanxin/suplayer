@@ -1,4 +1,5 @@
 #include "frame_extractor.h"
+#include "stream_io.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -36,14 +37,27 @@ std::string ErrToStr(int err)
 void ExtractExecute(napi_env env, void* data)
 {
     auto* ctx = static_cast<FrameContext*>(data);
-    AVFormatContext* fmt = nullptr;
+    AVFormatContext* fmt = avformat_alloc_context();
+    AVIOContext* ioPb = nullptr;
     AVCodecContext* dec = nullptr;
     AVFrame* frame = nullptr;
     AVPacket* pkt = nullptr;
     SwsContext* sws = nullptr;
+    int ret = 0;
 
-    int ret = avformat_open_input(&fmt, ctx->src.c_str(), nullptr, nullptr);
+    std::string ioErr;
+    if (!AttachStreamIO(fmt, ctx->src, ioErr)) {
+        if (!ioErr.empty()) {
+            ctx->error = ioErr;
+            goto cleanup;
+        }
+    }
+    ioPb = fmt->pb;
+    ret = avformat_open_input(&fmt, ctx->src.c_str(), nullptr, nullptr);
     if (ret < 0) {
+        // Open failure freed the context but never a custom AVIOContext.
+        ReleaseStreamIO(ioPb);
+        ioPb = nullptr;
         ctx->error = "avformat_open_input failed: " + ErrToStr(ret);
         goto cleanup;
     }
@@ -142,7 +156,11 @@ cleanup:
         avcodec_free_context(&dec);
     }
     if (fmt != nullptr) {
+        AVIOContext* pb = fmt->pb;
         avformat_close_input(&fmt);
+        ReleaseStreamIO(pb);
+    } else {
+        ReleaseStreamIO(ioPb);
     }
 }
 

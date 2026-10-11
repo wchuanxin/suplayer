@@ -1,5 +1,82 @@
 # Changelog
 
+## 1.10.0
+
+### Hardware decode for length-prefixed containers (MP4/MKV HDR)
+
+- The hardware path now covers MP4/MKV sources: when the eligibility peek
+  finds length-prefixed (hvcC/avcC) packet framing instead of Annex-B, an
+  `h264_mp4toannexb` / `hevc_mp4toannexb` bitstream filter is brought up and
+  every packet is converted on the fly before being fed to the OH hardware
+  decoder. The filter re-injects parameter sets ahead of IRAP frames, so
+  mid-stream flush/seek keeps working.
+- Practical effect: 4K HDR10/HLG HEVC inside MP4/MKV is no longer forced to
+  the software path (which dropped 10-bit HDR entirely via sws_scale RGBA
+  output); these sources now decode in hardware and go through the BT.2100
+  color-gamut / tone-mapping pipeline (`SET_COLOR_GAMUT`) like TS sources.
+- Fallback is unchanged: streams without avcC/hvcC extradata, or any
+  bitstream-filter failure, still go to software decode exactly as before.
+
+## 1.9.0 (unreleased)
+
+### Runtime VOD seek & frame capture
+
+- New `FFVideoDecoder.seekTo(targetMs)` / `FFAudioDecoder.seekTo(targetMs)`:
+  runtime seek on private connections (`sharedDemux: false`). Seeks to the
+  keyframe at/before the target, flushes the decoder (hardware decode is
+  flushed through `OH_VideoDecoder_Flush`), re-anchors the pacing clock and
+  drops pre-target frames so playback resumes precisely at the target.
+  Rejects on live/shared connections, while another seek is in flight, or
+  after a 15 s timeout.
+- New `FFVideoDecoder.captureFrame()`: resolves the next decoded frame as
+  RGBA8888 at native resolution (software decode only; rejects on a
+  hardware-decode connection — open with `hw: 'never'` when snapshots are
+  needed).
+
+### Custom AVIO — JS-backed byte sources
+
+- New module functions `registerStreamIO(id, callbacks)` /
+  `pushStreamIO(id, seq, value, data?)` / `closeStreamIO(id)`: register a
+  JS-backed byte source addressable as `"streamio:<id>"` by every API taking
+  a source URL (probe / extractFrame / transcode / all three decoders).
+  `read(seq, offset, length)` delivers up to 64 KiB per request and must
+  finish within 15 s via `pushStreamIO` (0 = EOF, negative = error); the
+  optional `seek(seq, offset, whence)` unlocks moov-at-end mp4 files
+  (whence 0 = absolute, 2 = size, 3 = from end). This lets apps bridge
+  native file/protocol libraries (SMB, custom caches, encrypted stores)
+  into the FFmpeg pipeline without touching the C++ layer.
+
+### Protocol options
+
+- New `FFNetOptions.rtspTransport` (`'tcp' | 'udp'`): RTSP transport
+  selection for rtsp:// sources.
+- New `FFNetOptions.bufferSize`: low-level socket buffer size (FFmpeg
+  `buffer_size`), useful for high-bitrate RTSP/multicast feeds.
+- New `FFNetOptions.rwTimeoutMs`: I/O read/write timeout (FFmpeg
+  `rw_timeout`) guarding against stalled sockets on non-HLS protocols.
+
+### Transcode remux & filters
+
+- New `FFTranscodeOptions.vcodec`: `'h264'` (default, libopenh264),
+  `'mpeg2'` (mpeg2video) or `'copy'` — remux the video track without
+  re-encoding (h264/hevc inputs are converted to Annex-B when the output
+  is mpegts).
+- New `FFTranscodeOptions.acodec`: `'aac'` (default), `'ac3'` or `'copy'`
+  — remux the audio track without re-encoding.
+- New `FFTranscodeOptions.filter`: extra libavfilter video chain inserted
+  before scale/fps (e.g. `'hqdn3d'`, `'unsharp'`).
+
+### Probe metadata
+
+- `FFMediaInfo.chapters` (`FFChapterInfo[]`): container chapters (mp4/MKV
+  chapter tracks) with `id` / `startMs` / `endMs` / `title`.
+- `FFMediaInfo.tags` (`Record<string, string>`): all container metadata
+  tags (title, artist, encoder, service_name, ...).
+- `FFStreamInfo.dispositionDefault` / `.dispositionForced`: container
+  disposition bits (default track selection, forced narratives).
+- `FFStreamInfo.rotation`: clockwise rotation in degrees derived from the
+  display matrix (0/90/180/270).
+
 ## 1.8.0 (unreleased)
 
 In development — entries accumulate here as features land. The interim

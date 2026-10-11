@@ -1,4 +1,5 @@
 #include "transcoder.h"
+#include "stream_io.h"
 
 #include <string>
 #include <cstring>
@@ -6,6 +7,7 @@
 extern "C" {
 #include "libavformat/avformat.h"
 #include "libavcodec/avcodec.h"
+#include "libavcodec/bsf.h"
 #include "libavfilter/avfilter.h"
 #include "libavfilter/buffersrc.h"
 #include "libavfilter/buffersink.h"
@@ -31,6 +33,9 @@ struct TranscodeWork {
     int64_t audioBitrate = 96000;
     int64_t startTimeMs = 0;
     int64_t durationMs = 0;
+    std::string vcodec; // "" / "h264" (libopenh264, default) | "mpeg2" | "copy"
+    std::string acodec; // "" / "aac" (default) | "ac3" | "copy"
+    std::string filter; // custom libavfilter video chain; replaces scale/fps
 
     int64_t outSize = 0;
     int64_t frames = 0;
@@ -53,6 +58,7 @@ struct VideoPipe {
     AVFilterContext* bufSink = nullptr;
     AVStream* inStream = nullptr;
     AVStream* outStream = nullptr;
+    AVBSFContext* bsf = nullptr; // copy mode: mp4/mkv -> mpegts Annex-B conversion
     int inIndex = -1;
 };
 
@@ -63,6 +69,7 @@ struct AudioPipe {
     AVAudioFifo* fifo = nullptr;
     AVStream* inStream = nullptr;
     AVStream* outStream = nullptr;
+    AVBSFContext* bsf = nullptr; // reserved (copy mode bookkeeping)
     int inIndex = -1;
     int64_t nextPts = 0; // in samples at output rate (normalized to 0)
     int64_t firstPtsSamples = AV_NOPTS_VALUE;
@@ -94,6 +101,55 @@ static bool SendFrameToEncoder(AVCodecContext* enc, AVFrame* frame, AVStream* os
     return true;
 }
 
+// Copy/remux path: write one input packet straight to the output stream,
+// rescaling timestamps from the input time base. `bsf` (optional) runs the
+// packet through a bitstream filter first (e.g. h264_mp4toannexb). The input
+// packet is not consumed.
+static bool WriteCopyPacket(AVBSFContext* bsf, const AVPacket* in, AVRational inTb, AVStream* ost,
+    AVFormatContext* ofmt, int64_t& frameCount, double* maxOutMs)
+{
+    AVPacket* pkt = av_packet_alloc();
+    if (pkt == nullptr) {
+        return false;
+    }
+    if (bsf != nullptr) {
+        if (av_packet_ref(pkt, in) < 0) {
+            av_packet_free(&pkt);
+            return false;
+        }
+        if (av_bsf_send_packet(bsf, pkt) < 0) {
+            av_packet_unref(pkt);
+            av_packet_free(&pkt);
+            return false;
+        }
+        av_packet_unref(pkt);
+        if (av_bsf_receive_packet(bsf, pkt) < 0) {
+            // EAGAIN: filter consumed the packet without emitting one yet
+            av_packet_free(&pkt);
+            return true;
+        }
+    } else if (av_packet_ref(pkt, in) < 0) {
+        av_packet_free(&pkt);
+        return false;
+    }
+    av_packet_rescale_ts(pkt, inTb, ost->time_base);
+    pkt->stream_index = ost->index;
+    if (maxOutMs != nullptr && pkt->pts != AV_NOPTS_VALUE) {
+        double endMs = static_cast<double>(pkt->pts + (pkt->duration > 0 ? pkt->duration : 0)) *
+            av_q2d(ost->time_base) * 1000.0;
+        if (endMs > *maxOutMs) {
+            *maxOutMs = endMs;
+        }
+    }
+    bool ok = av_interleaved_write_frame(ofmt, pkt) >= 0;
+    av_packet_unref(pkt);
+    av_packet_free(&pkt);
+    if (ok) {
+        frameCount++;
+    }
+    return ok;
+}
+
 static bool WriteVideoFrame(VideoPipe& vp, AVFrame* frame, AVFormatContext* ofmt, int64_t& frameCount,
     double* maxOutMs)
 {
@@ -117,7 +173,9 @@ static bool WriteVideoFrame(VideoPipe& vp, AVFrame* frame, AVFormatContext* ofmt
 static bool FlushVideoPipe(VideoPipe& vp, AVFormatContext* ofmt, int64_t& frameCount, double* maxOutMs)
 {
     if (vp.bufSrc != nullptr && vp.bufSink != nullptr) {
-        av_buffersrc_add_frame_flags(vp.bufSrc, nullptr, 0);
+        if (av_buffersrc_add_frame_flags(vp.bufSrc, nullptr, 0) < 0) {
+            return false; // EOF signal rejected: filter graph in error state
+        }
         AVFrame* oframe = av_frame_alloc();
         while (av_buffersink_get_frame(vp.bufSink, oframe) >= 0) {
             if (!SendFrameToEncoder(vp.enc, oframe, vp.outStream, ofmt, frameCount, maxOutMs)) {
@@ -217,17 +275,25 @@ static bool FlushAudioPipe(AudioPipe& ap, AVFormatContext* ofmt, int64_t& frameC
 
 static void RunTranscode(TranscodeWork* w)
 {
-    AVFormatContext* ifmt = nullptr;
+    AVFormatContext* ifmt = avformat_alloc_context();
+    AVIOContext* inIoPb = nullptr; // custom input AVIOContext (streamio sources)
     AVFormatContext* ofmt = nullptr;
     VideoPipe vp;
     AudioPipe ap;
     bool ofmtOpened = false;
+    const bool vcopy = w->vcodec == "copy";
+    const bool acopy = w->acodec == "copy";
 
     auto fail = [&](const std::string& msg) {
         w->err = msg;
         if (ifmt != nullptr) {
+            AVIOContext* pb = ifmt->pb;
             avformat_close_input(&ifmt);
+            ReleaseStreamIO(pb);
         }
+        // A failed avformat_open_input frees the context but never a custom
+        // AVIOContext; release it here (no-op for libavformat-owned pb).
+        ReleaseStreamIO(inIoPb);
         if (ofmt != nullptr) {
             if (ofmtOpened && !(ofmt->oformat->flags & AVFMT_NOFILE)) {
                 avio_closep(&ofmt->pb);
@@ -237,12 +303,22 @@ static void RunTranscode(TranscodeWork* w)
         if (vp.dec != nullptr) avcodec_free_context(&vp.dec);
         if (vp.enc != nullptr) avcodec_free_context(&vp.enc);
         if (vp.graph != nullptr) avfilter_graph_free(&vp.graph);
+        if (vp.bsf != nullptr) av_bsf_free(&vp.bsf);
         if (ap.dec != nullptr) avcodec_free_context(&ap.dec);
         if (ap.enc != nullptr) avcodec_free_context(&ap.enc);
         if (ap.swr != nullptr) swr_free(&ap.swr);
         if (ap.fifo != nullptr) av_audio_fifo_free(ap.fifo);
+        if (ap.bsf != nullptr) av_bsf_free(&ap.bsf);
     };
 
+    std::string ioErr;
+    if (!AttachStreamIO(ifmt, w->src, ioErr)) {
+        if (!ioErr.empty()) {
+            fail(ioErr);
+            return;
+        }
+    }
+    inIoPb = ifmt->pb;
     int ret = avformat_open_input(&ifmt, w->src.c_str(), nullptr, nullptr);
     if (ret < 0) {
         fail("avformat_open_input failed: " + ErrToStr(ret));
@@ -257,8 +333,8 @@ static void RunTranscode(TranscodeWork* w)
     ap.inIndex = (w->audioBitrate > 0)
         ? av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0) : -1;
 
-    // ---- video decode ----
-    if (vp.inIndex >= 0) {
+    // ---- video decode (skipped in copy/remux mode) ----
+    if (vp.inIndex >= 0 && !vcopy) {
         vp.inStream = ifmt->streams[vp.inIndex];
         const AVCodec* decCodec = avcodec_find_decoder(vp.inStream->codecpar->codec_id);
         if (decCodec == nullptr) {
@@ -273,8 +349,8 @@ static void RunTranscode(TranscodeWork* w)
         }
     }
 
-    // ---- audio decode ----
-    if (ap.inIndex >= 0) {
+    // ---- audio decode (skipped in copy/remux mode) ----
+    if (ap.inIndex >= 0 && !acopy) {
         ap.inStream = ifmt->streams[ap.inIndex];
         const AVCodec* decCodec = avcodec_find_decoder(ap.inStream->codecpar->codec_id);
         if (decCodec == nullptr) {
@@ -296,118 +372,166 @@ static void RunTranscode(TranscodeWork* w)
         return;
     }
 
-    // ---- video: filter graph (scale/fps/format) + libopenh264 encode ----
+    // ---- video output ----
     if (vp.inIndex >= 0) {
-        const AVCodec* encCodec = avcodec_find_encoder_by_name("libopenh264");
-        if (encCodec == nullptr) {
-            fail("libopenh264 encoder not found");
-            return;
-        }
-        vp.graph = avfilter_graph_alloc();
-        char args[512];
-        AVRational decTb = (vp.dec->time_base.num != 0) ? vp.dec->time_base
-            : vp.inStream->time_base;
-        AVRational sar = vp.dec->sample_aspect_ratio;
-        if (sar.num == 0) {
-            sar.num = 1;
-            sar.den = 1;
-        }
-        snprintf(args, sizeof(args),
-            "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
-            vp.dec->width, vp.dec->height, vp.dec->pix_fmt,
-            decTb.num, decTb.den, sar.num, sar.den);
-        const AVFilter* srcFilter = avfilter_get_by_name("buffer");
-        const AVFilter* sinkFilter = avfilter_get_by_name("buffersink");
-        if (avfilter_graph_create_filter(&vp.bufSrc, srcFilter, "in", args, nullptr, vp.graph) < 0) {
-            fail("buffersrc create failed");
-            return;
-        }
-        const enum AVPixelFormat pixFmts[] = { AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE };
-        if (avfilter_graph_create_filter(&vp.bufSink, sinkFilter, "out", nullptr, nullptr, vp.graph) < 0 ||
-            av_opt_set_int_list(vp.bufSink, "pix_fmts", pixFmts, AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN) < 0) {
-            fail("buffersink create failed");
-            return;
-        }
-        std::string filters = "setpts=PTS-STARTPTS";
-        if (w->width > 0 && w->height > 0) {
-            filters += ",scale=" + std::to_string(w->width) + ":" + std::to_string(w->height);
-        }
-        if (w->fps > 0) {
-            if (!filters.empty()) {
-                filters += ",";
-            }
-            filters += "fps=" + std::to_string(w->fps);
-        }
-        AVFilterInOut* inputs = avfilter_inout_alloc();
-        AVFilterInOut* outputs = avfilter_inout_alloc();
-        outputs->name = av_strdup("in");
-        outputs->filter_ctx = vp.bufSrc;
-        outputs->pad_idx = 0;
-        outputs->next = nullptr;
-        inputs->name = av_strdup("out");
-        inputs->filter_ctx = vp.bufSink;
-        inputs->pad_idx = 0;
-        inputs->next = nullptr;
-        ret = avfilter_graph_parse_ptr(vp.graph, filters.c_str(), &inputs, &outputs, nullptr);
-        avfilter_inout_free(&inputs);
-        avfilter_inout_free(&outputs);
-        if (ret < 0 || avfilter_graph_config(vp.graph, nullptr) < 0) {
-            fail("filter graph config failed: " + filters);
-            return;
-        }
-
-        vp.enc = avcodec_alloc_context3(encCodec);
-        vp.enc->width = av_buffersink_get_w(vp.bufSink);
-        vp.enc->height = av_buffersink_get_h(vp.bufSink);
-        vp.enc->pix_fmt = static_cast<AVPixelFormat>(av_buffersink_get_format(vp.bufSink));
-        vp.enc->time_base = av_buffersink_get_time_base(vp.bufSink);
-        vp.enc->bit_rate = w->videoBitrate;
-        vp.enc->gop_size = 30;
-        if (avcodec_open2(vp.enc, encCodec, nullptr) < 0) {
-            fail("libopenh264 encoder open failed");
-            return;
-        }
         vp.outStream = avformat_new_stream(ofmt, nullptr);
-        vp.outStream->time_base = vp.enc->time_base;
-        if (avcodec_parameters_from_context(vp.outStream->codecpar, vp.enc) < 0) {
-            fail("video stream params copy failed");
+        if (vp.outStream == nullptr) {
+            fail("video output stream alloc failed");
             return;
+        }
+        if (vcopy) {
+            // Remux: no decode/encode, codec parameters copied verbatim.
+            avcodec_parameters_copy(vp.outStream->codecpar, vp.inStream->codecpar);
+            vp.outStream->codecpar->codec_tag = 0; // let the muxer pick
+            vp.outStream->time_base = vp.inStream->time_base;
+            // h264/hevc from length-prefixed containers (mp4/mkv) must be
+            // converted to Annex-B for MPEG-TS.
+            const bool isTs = ofmt->oformat != nullptr && ofmt->oformat->name != nullptr &&
+                strstr(ofmt->oformat->name, "mpegts") != nullptr;
+            const AVCodecID cid = vp.outStream->codecpar->codec_id;
+            if (isTs && (cid == AV_CODEC_ID_H264 || cid == AV_CODEC_ID_HEVC)) {
+                const char* bsfName = (cid == AV_CODEC_ID_H264) ? "h264_mp4toannexb" : "hevc_mp4toannexb";
+                const AVBitStreamFilter* bsfFilter = av_bsf_get_by_name(bsfName);
+                if (bsfFilter == nullptr || av_bsf_alloc(bsfFilter, &vp.bsf) < 0) {
+                    fail(std::string("bsf alloc failed: ") + bsfName);
+                    return;
+                }
+                avcodec_parameters_copy(vp.bsf->par_in, vp.inStream->codecpar);
+                vp.bsf->time_base_in = vp.inStream->time_base;
+                if (av_bsf_init(vp.bsf) < 0) {
+                    fail(std::string("bsf init failed: ") + bsfName);
+                    return;
+                }
+            }
+        } else {
+            const char* encName = (w->vcodec == "mpeg2") ? "mpeg2video" : "libopenh264";
+            const AVCodec* encCodec = avcodec_find_encoder_by_name(encName);
+            if (encCodec == nullptr) {
+                fail(std::string("video encoder not found: ") + encName);
+                return;
+            }
+            vp.graph = avfilter_graph_alloc();
+            char args[512];
+            AVRational decTb = (vp.dec->time_base.num != 0) ? vp.dec->time_base
+                : vp.inStream->time_base;
+            AVRational sar = vp.dec->sample_aspect_ratio;
+            if (sar.num == 0) {
+                sar.num = 1;
+                sar.den = 1;
+            }
+            snprintf(args, sizeof(args),
+                "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+                vp.dec->width, vp.dec->height, vp.dec->pix_fmt,
+                decTb.num, decTb.den, sar.num, sar.den);
+            const AVFilter* srcFilter = avfilter_get_by_name("buffer");
+            const AVFilter* sinkFilter = avfilter_get_by_name("buffersink");
+            if (avfilter_graph_create_filter(&vp.bufSrc, srcFilter, "in", args, nullptr, vp.graph) < 0) {
+                fail("buffersrc create failed");
+                return;
+            }
+            const enum AVPixelFormat pixFmts[] = { AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE };
+            if (avfilter_graph_create_filter(&vp.bufSink, sinkFilter, "out", nullptr, nullptr, vp.graph) < 0 ||
+                av_opt_set_int_list(vp.bufSink, "pix_fmts", pixFmts, AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN) < 0) {
+                fail("buffersink create failed");
+                return;
+            }
+            // Custom filter chain: replaces the built-in scale/fps so the
+            // caller has full control (setpts stays to normalize timestamps).
+            std::string filters = "setpts=PTS-STARTPTS";
+            if (!w->filter.empty()) {
+                filters += ",";
+                filters += w->filter;
+            } else {
+                if (w->width > 0 && w->height > 0) {
+                    filters += ",scale=" + std::to_string(w->width) + ":" + std::to_string(w->height);
+                }
+                if (w->fps > 0) {
+                    filters += ",fps=" + std::to_string(w->fps);
+                }
+            }
+            AVFilterInOut* inputs = avfilter_inout_alloc();
+            AVFilterInOut* outputs = avfilter_inout_alloc();
+            outputs->name = av_strdup("in");
+            outputs->filter_ctx = vp.bufSrc;
+            outputs->pad_idx = 0;
+            outputs->next = nullptr;
+            inputs->name = av_strdup("out");
+            inputs->filter_ctx = vp.bufSink;
+            inputs->pad_idx = 0;
+            inputs->next = nullptr;
+            ret = avfilter_graph_parse_ptr(vp.graph, filters.c_str(), &inputs, &outputs, nullptr);
+            avfilter_inout_free(&inputs);
+            avfilter_inout_free(&outputs);
+            if (ret < 0 || avfilter_graph_config(vp.graph, nullptr) < 0) {
+                fail("filter graph config failed: " + filters);
+                return;
+            }
+
+            vp.enc = avcodec_alloc_context3(encCodec);
+            vp.enc->width = av_buffersink_get_w(vp.bufSink);
+            vp.enc->height = av_buffersink_get_h(vp.bufSink);
+            vp.enc->pix_fmt = static_cast<AVPixelFormat>(av_buffersink_get_format(vp.bufSink));
+            vp.enc->time_base = av_buffersink_get_time_base(vp.bufSink);
+            vp.enc->bit_rate = w->videoBitrate;
+            vp.enc->gop_size = 30;
+            if (avcodec_open2(vp.enc, encCodec, nullptr) < 0) {
+                fail(std::string("video encoder open failed: ") + encName);
+                return;
+            }
+            vp.outStream->time_base = vp.enc->time_base;
+            if (avcodec_parameters_from_context(vp.outStream->codecpar, vp.enc) < 0) {
+                fail("video stream params copy failed");
+                return;
+            }
         }
     }
 
-    // ---- audio: swr(fltp/44100/stereo) + aac encode ----
+    // ---- audio output ----
     if (ap.inIndex >= 0) {
-        const AVCodec* encCodec = avcodec_find_encoder(AV_CODEC_ID_AAC);
-        if (encCodec == nullptr) {
-            fail("aac encoder not found");
-            return;
-        }
-        ap.enc = avcodec_alloc_context3(encCodec);
-        ap.enc->sample_fmt = AV_SAMPLE_FMT_FLTP;
-        ap.enc->sample_rate = 44100;
-        AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
-        av_channel_layout_copy(&ap.enc->ch_layout, &stereo);
-        ap.enc->bit_rate = w->audioBitrate;
-        if (avcodec_open2(ap.enc, encCodec, nullptr) < 0) {
-            fail("aac encoder open failed");
-            return;
-        }
-        ret = swr_alloc_set_opts2(&ap.swr, &stereo, AV_SAMPLE_FMT_FLTP, ap.enc->sample_rate,
-            &ap.dec->ch_layout, ap.dec->sample_fmt, ap.dec->sample_rate, 0, nullptr);
-        if (ret < 0 || swr_init(ap.swr) < 0) {
-            fail("swr init failed");
-            return;
-        }
-        ap.fifo = av_audio_fifo_alloc(AV_SAMPLE_FMT_FLTP, 2, ap.enc->frame_size * 2);
-        if (ap.fifo == nullptr) {
-            fail("audio fifo alloc failed");
-            return;
-        }
         ap.outStream = avformat_new_stream(ofmt, nullptr);
-        ap.outStream->time_base = ap.enc->time_base;
-        if (avcodec_parameters_from_context(ap.outStream->codecpar, ap.enc) < 0) {
-            fail("audio stream params copy failed");
+        if (ap.outStream == nullptr) {
+            fail("audio output stream alloc failed");
             return;
+        }
+        if (acopy) {
+            // Remux: codec parameters copied verbatim, timestamps rescaled at
+            // write time.
+            avcodec_parameters_copy(ap.outStream->codecpar, ap.inStream->codecpar);
+            ap.outStream->codecpar->codec_tag = 0;
+            ap.outStream->time_base = ap.inStream->time_base;
+        } else {
+            const AVCodecID encId = (w->acodec == "ac3") ? AV_CODEC_ID_AC3 : AV_CODEC_ID_AAC;
+            const AVCodec* encCodec = avcodec_find_encoder(encId);
+            if (encCodec == nullptr) {
+                fail("audio encoder not found");
+                return;
+            }
+            ap.enc = avcodec_alloc_context3(encCodec);
+            ap.enc->sample_fmt = AV_SAMPLE_FMT_FLTP;
+            ap.enc->sample_rate = 44100;
+            AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+            av_channel_layout_copy(&ap.enc->ch_layout, &stereo);
+            ap.enc->bit_rate = w->audioBitrate;
+            if (avcodec_open2(ap.enc, encCodec, nullptr) < 0) {
+                fail("audio encoder open failed");
+                return;
+            }
+            ret = swr_alloc_set_opts2(&ap.swr, &stereo, AV_SAMPLE_FMT_FLTP, ap.enc->sample_rate,
+                &ap.dec->ch_layout, ap.dec->sample_fmt, ap.dec->sample_rate, 0, nullptr);
+            if (ret < 0 || swr_init(ap.swr) < 0) {
+                fail("swr init failed");
+                return;
+            }
+            ap.fifo = av_audio_fifo_alloc(AV_SAMPLE_FMT_FLTP, 2, ap.enc->frame_size * 2);
+            if (ap.fifo == nullptr) {
+                fail("audio fifo alloc failed");
+                return;
+            }
+            ap.outStream->time_base = ap.enc->time_base;
+            if (avcodec_parameters_from_context(ap.outStream->codecpar, ap.enc) < 0) {
+                fail("audio stream params copy failed");
+                return;
+            }
         }
     }
 
@@ -444,10 +568,16 @@ static void RunTranscode(TranscodeWork* w)
             AVRational{ 1, ap.enc->sample_rate });
     }
     int64_t endVideoPts = AV_NOPTS_VALUE;
-    if (w->durationMs > 0 && vp.bufSink != nullptr) {
-        // compare in buffersrc time_base (== input stream tb)
+    if (w->durationMs > 0 && (vp.bufSink != nullptr || vcopy)) {
+        // compare in input stream tb (buffersrc tb == input stream tb in the
+        // encode path; copy mode compares input packets directly)
         endVideoPts = av_rescale_q(w->startTimeMs + w->durationMs, AVRational{ 1, 1000 },
             vp.inStream->time_base);
+    }
+    int64_t endAudioPts = AV_NOPTS_VALUE;
+    if (w->durationMs > 0 && acopy) {
+        endAudioPts = av_rescale_q(w->startTimeMs + w->durationMs, AVRational{ 1, 1000 },
+            ap.inStream->time_base);
     }
     int64_t audioPkts = 0;
     double maxOutMs = 0.0;
@@ -474,7 +604,18 @@ static void RunTranscode(TranscodeWork* w)
     bool done = false;
     while (!done && av_read_frame(ifmt, pkt) >= 0) {
         if (pkt->stream_index == vp.inIndex) {
-            if (endVideoPts != AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE && pkt->pts > endVideoPts) {
+            if (vcopy) {
+                // Remux: no decode, straight copy (optional Annex-B bsf).
+                if (endVideoPts != AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE && pkt->pts > endVideoPts) {
+                    done = true;
+                } else if (!WriteCopyPacket(vp.bsf, pkt, vp.inStream->time_base, vp.outStream, ofmt,
+                    w->frames, &maxOutMs)) {
+                    fail("video remux write failed");
+                    av_frame_free(&frame);
+                    av_packet_free(&pkt);
+                    return;
+                }
+            } else if (endVideoPts != AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE && pkt->pts > endVideoPts) {
                 done = true;
             } else if (avcodec_send_packet(vp.dec, pkt) >= 0) {
                 while (avcodec_receive_frame(vp.dec, frame) >= 0) {
@@ -494,7 +635,18 @@ static void RunTranscode(TranscodeWork* w)
                 }
             }
         } else if (pkt->stream_index == ap.inIndex) {
-            if (avcodec_send_packet(ap.dec, pkt) >= 0) {
+            if (acopy) {
+                // Remux: no decode, straight copy.
+                if (endAudioPts != AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE && pkt->pts > endAudioPts) {
+                    done = true;
+                } else if (!WriteCopyPacket(nullptr, pkt, ap.inStream->time_base, ap.outStream, ofmt,
+                    audioPkts, &maxOutMs)) {
+                    fail("audio remux write failed");
+                    av_frame_free(&frame);
+                    av_packet_free(&pkt);
+                    return;
+                }
+            } else if (avcodec_send_packet(ap.dec, pkt) >= 0) {
                 uint8_t** convData = nullptr;
                 while (avcodec_receive_frame(ap.dec, frame) >= 0) {
                     alignAudioPts(frame);
@@ -677,6 +829,21 @@ napi_value Transcode(napi_env env, napi_callback_info info)
     w->audioBitrate = GetIntProp(env, args[1], "audioBitrate", 96000);
     w->startTimeMs = GetIntProp(env, args[1], "startTimeMs", 0);
     w->durationMs = GetIntProp(env, args[1], "durationMs", 0);
+    GetStringProp(env, args[1], "vcodec", w->vcodec);
+    GetStringProp(env, args[1], "acodec", w->acodec);
+    GetStringProp(env, args[1], "filter", w->filter);
+    if (!w->vcodec.empty() && w->vcodec != "h264" && w->vcodec != "mpeg2" && w->vcodec != "copy") {
+        delete w;
+        napi_throw_type_error(env, nullptr,
+            "vcodec must be 'h264' (default, libopenh264) | 'mpeg2' (mpeg2video) | 'copy' (remux without re-encode)");
+        return nullptr;
+    }
+    if (!w->acodec.empty() && w->acodec != "aac" && w->acodec != "ac3" && w->acodec != "copy") {
+        delete w;
+        napi_throw_type_error(env, nullptr,
+            "acodec must be 'aac' (default) | 'ac3' | 'copy' (remux without re-encode)");
+        return nullptr;
+    }
 
     napi_value promise = nullptr;
     napi_create_promise(env, &w->deferred, &promise);

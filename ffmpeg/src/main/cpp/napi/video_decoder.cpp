@@ -3,10 +3,12 @@
 #include "hw_decoder.h"
 #include "demux_session.h"
 #include "hls_playlist.h"
+#include "stream_io.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/mem.h>
@@ -47,6 +49,28 @@ struct DecoderMsg {
     uint64_t count = 0; // MSG_OVERFLOW: packets dropped in the episode
     std::string err;    // MSG_ERROR: message; MSG_DISCONTINUITY: reason
     std::string backend;
+};
+
+// Completion handshake for seekTo()/captureFrame(): the NAPI async work arms
+// the request and blocks on the condition variable; the worker thread applies
+// it and notifies. All fields are guarded by mtx.
+struct SeekAck {
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool done = false;
+    bool ok = false;
+    std::string err;
+};
+
+struct CaptureAck {
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool done = false;
+    bool ok = false;
+    std::string err;
+    int width = 0;
+    int height = 0;
+    std::vector<uint8_t> rgba; // width * height * 4 bytes, RGBA8888
 };
 
 std::string ErrToStr(int err)
@@ -329,9 +353,22 @@ public:
             }
             AVDictionary* dict = nullptr;
             ApplyOpenOptions(fmt_, &dict, effOpts);
+            std::string ioErr;
+            if (!AttachStreamIO(fmt_, res.url, ioErr)) {
+                if (!ioErr.empty()) {
+                    lastError_ = ioErr;
+                    avformat_free_context(fmt_);
+                    fmt_ = nullptr;
+                    return false;
+                }
+            }
+            // A failed open frees the context (and the default pb) but never
+            // a custom AVIOContext — keep the pointer to release it below.
+            AVIOContext* ioPb = fmt_->pb;
             int ret = avformat_open_input(&fmt_, res.url.c_str(), nullptr, &dict);
             av_dict_free(&dict);
             if (ret < 0) {
+                ReleaseStreamIO(ioPb);
                 lastError_ = "avformat_open_input failed: " + ErrToStr(ret);
                 return false;
             }
@@ -506,6 +543,71 @@ public:
         return discontinuityCount_.load(std::memory_order_relaxed);
     }
 
+    // ---- Runtime VOD seek (private connections only) --------------------
+    // Arms a seek; the worker applies it at the top of the decode loop
+    // (avformat_seek_file -> codec/ pacing reset -> pre-target drop filter)
+    // and completes `ack`. Returns false (with err) when unavailable: not
+    // started, shared demux session, or another seek still in flight.
+    bool RequestSeek(int64_t targetMs, SeekAck* ack, std::string& err)
+    {
+        if (!opened_ || !running_.load()) {
+            err = "decoder is not started";
+            return false;
+        }
+        if (sharedFmt_) {
+            err = "seekTo requires a private connection (open with sharedDemux: false)";
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(seekMtx_);
+        if (seekAck_ != nullptr) {
+            err = "another seek is already in progress";
+            return false;
+        }
+        seekAck_ = ack;
+        pendingSeekMs_.store(targetMs, std::memory_order_release);
+        return true;
+    }
+
+    // Timeout/stop path: disarm an armed request. When the worker already
+    // claimed the ack this is a no-op (the caller must keep the ack alive
+    // until the worker completes it).
+    void CancelSeekAck(SeekAck* ack)
+    {
+        std::lock_guard<std::mutex> lock(seekMtx_);
+        if (seekAck_ == ack) {
+            seekAck_ = nullptr;
+            pendingSeekMs_.store(INT64_MIN, std::memory_order_release);
+        }
+    }
+
+    // ---- Frame capture (software decode path) ----------------------------
+    // Arms a one-shot capture of the next decoded frame (after the pre-target
+    // drop filter, before render pacing) converted to RGBA at native size.
+    bool RequestCapture(CaptureAck* ack, std::string& err)
+    {
+        if (!opened_ || !running_.load()) {
+            err = "decoder is not started";
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(captureMtx_);
+        if (captureAck_ != nullptr) {
+            err = "another frame capture is already in progress";
+            return false;
+        }
+        captureAck_ = ack;
+        captureRequested_.store(true, std::memory_order_release);
+        return true;
+    }
+
+    void CancelCaptureAck(CaptureAck* ack)
+    {
+        std::lock_guard<std::mutex> lock(captureMtx_);
+        if (captureAck_ == ack) {
+            captureAck_ = nullptr;
+            captureRequested_.store(false, std::memory_order_release);
+        }
+    }
+
     bool Start(uint64_t surfaceId)
     {
         if (!opened_ || window_ != nullptr || running_.load()) {
@@ -637,11 +739,129 @@ private:
             queue_->Wake();
         }
         if (!running_.exchange(false)) {
+            CancelPendingRequests("decoder stopped");
             return;
         }
         if (worker_.joinable()) {
             worker_.join();
         }
+        // The worker exited without applying an armed seek/capture: complete
+        // it now so a blocked seekTo()/captureFrame() promise resolves.
+        CancelPendingRequests("decoder stopped");
+    }
+
+    // Complete any still-armed seek/capture with an error (stop path).
+    void CancelPendingRequests(const char* reason)
+    {
+        SeekAck* seekAck = nullptr;
+        CaptureAck* captureAck = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(seekMtx_);
+            seekAck = seekAck_;
+            seekAck_ = nullptr;
+            pendingSeekMs_.store(INT64_MIN, std::memory_order_release);
+        }
+        {
+            std::lock_guard<std::mutex> lock(captureMtx_);
+            captureAck = captureAck_;
+            captureAck_ = nullptr;
+            captureRequested_.store(false, std::memory_order_release);
+        }
+        if (seekAck != nullptr) {
+            FinishSeek(seekAck, false, reason);
+        }
+        if (captureAck != nullptr) {
+            FinishCapture(captureAck, false, 0, 0, nullptr, reason);
+        }
+    }
+
+    // Worker side: fetch an armed seek target + its ack (nullptr ack when the
+    // request was canceled between arming and claiming).
+    int64_t TakePendingSeek(SeekAck** outAck)
+    {
+        const int64_t target = pendingSeekMs_.exchange(INT64_MIN, std::memory_order_acquire);
+        if (target == INT64_MIN) {
+            return INT64_MIN;
+        }
+        std::lock_guard<std::mutex> lock(seekMtx_);
+        *outAck = seekAck_;
+        seekAck_ = nullptr;
+        return target;
+    }
+
+    void FinishSeek(SeekAck* ack, bool ok, const std::string& err)
+    {
+        if (ack == nullptr) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(ack->mtx);
+            ack->done = true;
+            ack->ok = ok;
+            ack->err = err;
+        }
+        ack->cv.notify_all();
+    }
+
+    // Worker side: fetch an armed capture ack (nullptr when canceled).
+    CaptureAck* TakePendingCapture()
+    {
+        std::lock_guard<std::mutex> lock(captureMtx_);
+        CaptureAck* ack = captureAck_;
+        captureAck_ = nullptr;
+        captureRequested_.store(false, std::memory_order_release);
+        return ack;
+    }
+
+    void FinishCapture(CaptureAck* ack, bool ok, int width, int height, std::vector<uint8_t>* rgba,
+        const std::string& err)
+    {
+        if (ack == nullptr) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(ack->mtx);
+            ack->done = true;
+            ack->ok = ok;
+            ack->width = width;
+            ack->height = height;
+            if (rgba != nullptr) {
+                ack->rgba = std::move(*rgba);
+            }
+            ack->err = err;
+        }
+        ack->cv.notify_all();
+    }
+
+    // Software-path frame capture: convert `frame` to RGBA at native size.
+    void CaptureFrameToAck(const AVFrame* frame, CaptureAck* ack)
+    {
+        if (frame->width <= 0 || frame->height <= 0) {
+            FinishCapture(ack, false, 0, 0, nullptr, "invalid frame geometry");
+            return;
+        }
+        // sws_ is normally already configured by RenderFrame; reconfigure
+        // defensively (capture may run on the very first frame).
+        if (sws_ == nullptr || swsW_ != frame->width || swsH_ != frame->height ||
+            swsFmt_ != static_cast<AVPixelFormat>(frame->format)) {
+            if (sws_ != nullptr) {
+                sws_freeContext(sws_);
+            }
+            swsW_ = frame->width;
+            swsH_ = frame->height;
+            swsFmt_ = static_cast<AVPixelFormat>(frame->format);
+            sws_ = sws_getContext(swsW_, swsH_, swsFmt_,
+                swsW_, swsH_, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (sws_ == nullptr) {
+                FinishCapture(ack, false, 0, 0, nullptr, "sws_getContext failed");
+                return;
+            }
+        }
+        std::vector<uint8_t> rgba(static_cast<size_t>(frame->width) * static_cast<size_t>(frame->height) * 4);
+        uint8_t* dst[4] = { rgba.data(), nullptr, nullptr, nullptr };
+        int dstStride[4] = { frame->width * 4, 0, 0, 0 };
+        sws_scale(sws_, frame->data, frame->linesize, 0, frame->height, dst, dstStride);
+        FinishCapture(ack, true, frame->width, frame->height, &rgba, "");
     }
 
     void ReleaseWindow()
@@ -656,6 +876,9 @@ private:
     {
         if (hwPendingPkt_ != nullptr) {
             av_packet_free(&hwPendingPkt_);
+        }
+        if (bsf_ != nullptr) {
+            av_bsf_free(&bsf_);
         }
         if (sws_ != nullptr) {
             sws_freeContext(sws_);
@@ -685,7 +908,9 @@ private:
             session_ = nullptr;
         }
         if (fmt_ != nullptr && !sharedFmt_) {
+            AVIOContext* ioPb = fmt_->pb;
             avformat_close_input(&fmt_);
+            ReleaseStreamIO(ioPb);
         }
         fmt_ = nullptr;
         sharedFmt_ = false;
@@ -956,9 +1181,35 @@ private:
             av_packet_free(&peek);
         }
         if (!annexb) {
-            // hw not eligible; hwPendingPkt_ keeps the first packet for the
-            // software path (consumed at the head of the sw decode loop).
-            return false;
+            // Length-prefixed framing (MP4/MKV hvcC/avcC): bring up an
+            // mp4toannexb bitstream filter and convert packets on the fly so
+            // the hardware path (and with it the HDR color pipeline) covers
+            // these containers too. Requires avcC/hvcC extradata; any bsf
+            // failure falls back to software exactly as before.
+            bool converted = false;
+            if (dec_->extradata != nullptr && dec_->extradata_size > 0) {
+                const char* bsfName =
+                    (codecId == AV_CODEC_ID_H264) ? "h264_mp4toannexb" : "hevc_mp4toannexb";
+                const AVBitStreamFilter* bsfFilter = av_bsf_get_by_name(bsfName);
+                if (bsfFilter != nullptr && av_bsf_alloc(bsfFilter, &bsf_) >= 0) {
+                    avcodec_parameters_from_context(bsf_->par_in, dec_);
+                    bsf_->time_base_in = fmt_->streams[streamIndex_]->time_base;
+                    if (av_bsf_init(bsf_) >= 0) {
+                        converted = true;
+                        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFVideo",
+                            "length-prefixed stream: %{public}s conversion active for hw decode", bsfName);
+                    } else {
+                        av_bsf_free(&bsf_);
+                        lastError_ = std::string("bsf init failed: ") + bsfName;
+                    }
+                }
+            }
+            if (!converted) {
+                // hw not eligible; hwPendingPkt_ keeps the first packet for the
+                // software path (consumed at the head of the sw decode loop).
+                return false;
+            }
+            lastError_.clear();
         }
         hw_ = std::make_unique<HwVideoDecoder>();
         hw_->onFrame = [this](double ptsMs) {
@@ -1127,6 +1378,45 @@ private:
 
     // Hardware path: demux and push Annex-B packets into HwVideoDecoder; frame/end
     // events arrive from its render thread via the shared tsfn channel.
+    // Feed one demuxed packet to the hardware decoder, converting through the
+    // mp4toannexb filter first when the source is length-prefixed (bsf_ set).
+    bool FeedHw(const AVPacket* in, int64_t ptsUs)
+    {
+        if (bsf_ == nullptr) {
+            return hw_->FeedPacket(in->data, in->size, ptsUs, false);
+        }
+        AVPacket* tmp = av_packet_alloc();
+        if (tmp == nullptr) {
+            return false;
+        }
+        if (av_packet_ref(tmp, in) < 0) {
+            av_packet_free(&tmp);
+            return false;
+        }
+        bool ok = true;
+        if (av_bsf_send_packet(bsf_, tmp) < 0) {
+            ok = false;
+        } else {
+            while (true) {
+                const int ret = av_bsf_receive_packet(bsf_, tmp);
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                    break;
+                }
+                if (ret < 0) {
+                    ok = false;
+                    break;
+                }
+                if (!hw_->FeedPacket(tmp->data, tmp->size, ptsUs, false)) {
+                    ok = false;
+                    break;
+                }
+                av_packet_unref(tmp);
+            }
+        }
+        av_packet_free(&tmp);
+        return ok;
+    }
+
     void RunHw()
     {
         // Hold the shared session for the whole worker lifetime: DetachDemux
@@ -1144,11 +1434,43 @@ private:
             } else if (hwPendingPkt_->dts != AV_NOPTS_VALUE) {
                 ptsUs = av_rescale_q(hwPendingPkt_->dts, stream->time_base, usTimeBase);
             }
-            hw_->FeedPacket(hwPendingPkt_->data, hwPendingPkt_->size, ptsUs, false);
+            FeedHw(hwPendingPkt_, ptsUs);
             av_packet_free(&hwPendingPkt_);
         }
         while (!stop_) {
             PollQueueEvents();
+            // Runtime VOD seek (private connection): flush the codec, drop
+            // the connection to the target keyframe and re-arm the output
+            // pre-target filter.
+            if (pendingSeekMs_.load(std::memory_order_acquire) != INT64_MIN) {
+                SeekAck* seekAck = nullptr;
+                const int64_t seekMs = TakePendingSeek(&seekAck);
+                if (seekMs != INT64_MIN) {
+                    if (hw_ != nullptr) {
+                        hw_->Flush();
+                    }
+                    const int sret = avformat_seek_file(fmt_, -1, INT64_MIN, seekMs * 1000, INT64_MAX, 0);
+                    if (sret >= 0) {
+                        if (hw_ != nullptr) {
+                            hw_->SetDropBeforeUs(seekMs * 1000);
+                        }
+                        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFVideo",
+                            "seek applied (hw) target=%{public}lldms", static_cast<long long>(seekMs));
+                        FinishSeek(seekAck, true, "");
+                    } else {
+                        FinishSeek(seekAck, false, "avformat_seek_file failed: " + ErrToStr(sret));
+                    }
+                }
+                continue;
+            }
+            // Frame capture is software-path only; fail armed hw requests.
+            if (captureRequested_.load(std::memory_order_acquire)) {
+                CaptureAck* captureAck = TakePendingCapture();
+                if (captureAck != nullptr) {
+                    FinishCapture(captureAck, false, 0, 0, nullptr,
+                        "frame capture requires software decode (open with hw: 'never')");
+                }
+            }
             if (paused_) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
@@ -1166,7 +1488,7 @@ private:
                 } else if (pkt->dts != AV_NOPTS_VALUE) {
                     ptsUs = av_rescale_q(pkt->dts, stream->time_base, usTimeBase);
                 }
-                if (!hw_->FeedPacket(pkt->data, pkt->size, ptsUs, false)) {
+                if (!FeedHw(pkt, ptsUs)) {
                     break;
                 }
             }
@@ -1201,6 +1523,32 @@ private:
 
         while (!stop_) {
             PollQueueEvents();
+            // Runtime VOD seek (private connection): flush the decoder, seek
+            // the connection to the target keyframe, re-anchor pacing and
+            // re-arm the pre-target drop filter so playback resumes exactly
+            // at the requested position.
+            if (pendingSeekMs_.load(std::memory_order_acquire) != INT64_MIN) {
+                SeekAck* seekAck = nullptr;
+                const int64_t seekMs = TakePendingSeek(&seekAck);
+                if (seekMs != INT64_MIN) {
+                    avcodec_flush_buffers(dec_);
+                    av_frame_unref(frame);
+                    const int sret = avformat_seek_file(fmt_, -1, INT64_MIN, seekMs * 1000, INT64_MAX, 0);
+                    if (sret >= 0) {
+                        dropBeforeMs_ = static_cast<double>(seekMs);
+                        dropGuard = 0;
+                        firstPts = AV_NOPTS_VALUE;
+                        startWall = std::chrono::steady_clock::now();
+                        eofSent = false;
+                        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFVideo",
+                            "seek applied (sw) target=%{public}lldms", static_cast<long long>(seekMs));
+                        FinishSeek(seekAck, true, "");
+                    } else {
+                        FinishSeek(seekAck, false, "avformat_seek_file failed: " + ErrToStr(sret));
+                    }
+                }
+                continue;
+            }
             if (paused_) {
                 if (!pausing) {
                     pausing = true;
@@ -1266,6 +1614,15 @@ private:
                     continue;
                 }
                 dropBeforeMs_ = 0.0;
+            }
+
+            // One-shot frame capture: convert this frame to RGBA at native
+            // size (before render pacing, so the promise resolves promptly).
+            if (captureRequested_.load(std::memory_order_acquire)) {
+                CaptureAck* captureAck = TakePendingCapture();
+                if (captureAck != nullptr) {
+                    CaptureFrameToAck(frame, captureAck);
+                }
             }
 
             // real-time pacing based on pts delta
@@ -1338,6 +1695,9 @@ private:
     HwMode hwMode_ = HwMode::AUTO;
     std::atomic<bool> hwActive_{ false };
     AVPacket* hwPendingPkt_ = nullptr;
+    // mp4toannexb filter for length-prefixed (hvcC/avcC) sources on the
+    // hardware path; nullptr for native Annex-B streams.
+    AVBSFContext* bsf_ = nullptr;
     std::atomic<int64_t> peekDeadlineMs_{ 0 };
     bool opened_ = false;
     std::string lastError_;
@@ -1346,6 +1706,15 @@ private:
     std::atomic<bool> running_{ false };
     std::atomic<bool> stop_{ false };
     std::atomic<bool> paused_{ false };
+
+    // ---- Runtime seek (private connections) ----
+    std::atomic<int64_t> pendingSeekMs_{ INT64_MIN }; // INT64_MIN = none armed
+    SeekAck* seekAck_ = nullptr;                     // guarded by seekMtx_
+    std::mutex seekMtx_;
+    // ---- Frame capture (software path) ----
+    std::atomic<bool> captureRequested_{ false };
+    CaptureAck* captureAck_ = nullptr;               // guarded by captureMtx_
+    std::mutex captureMtx_;
 
     napi_threadsafe_function tsfn_ = nullptr;
     napi_ref frameRef_ = nullptr;
@@ -1612,7 +1981,7 @@ napi_value FFVideoDecoderOpen(napi_env env, napi_callback_info info)
     if (argc >= 3 && !ParseNetOptions(env, args[2], ctx->netOpts)) {
         delete ctx;
         napi_throw_type_error(env, nullptr,
-            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect?, variantIndex?, maxBandwidth?, targetLatencyMs?, autoReconnect?, reconnectMaxRetries?, dvrSeek? }");
+            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect?, variantIndex?, maxBandwidth?, targetLatencyMs?, autoReconnect?, reconnectMaxRetries?, dvrSeek?, rtspTransport?, bufferSize?, rwTimeoutMs? }");
         return nullptr;
     }
 
@@ -1825,6 +2194,207 @@ napi_value FFVideoDecoderGetStats(napi_env env, napi_callback_info info)
     napi_create_int64(env, static_cast<int64_t>(core->GetDiscontinuityCount()), &v);
     napi_set_named_property(env, result, "discontinuityCount", v);
     return result;
+}
+
+namespace {
+
+// seekTo()/captureFrame() request contexts: the Execute arms the request on
+// the core and blocks on the ack condvar until the worker applies it; the
+// Complete resolves/rejects the promise.
+struct VideoSeekContext {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    VideoDecoderCore* core = nullptr;
+    int64_t targetMs = 0;
+    SeekAck ack;
+    bool armed = false;
+    bool timedOut = false;
+};
+
+void VideoSeekExecute(napi_env env, void* data)
+{
+    auto* ctx = static_cast<VideoSeekContext*>(data);
+    std::string err;
+    if (!ctx->core->RequestSeek(ctx->targetMs, &ctx->ack, err)) {
+        ctx->ack.err = err;
+        return;
+    }
+    ctx->armed = true;
+    std::unique_lock<std::mutex> lock(ctx->ack.mtx);
+    if (!ctx->ack.cv.wait_for(lock, std::chrono::seconds(15), [&ctx] { return ctx->ack.done; })) {
+        ctx->timedOut = true;
+        // Disarm when the worker has not claimed the ack yet; when it has
+        // (e.g. blocked in a slow network seek), Complete keeps the context
+        // alive until the worker finishes it.
+        ctx->core->CancelSeekAck(&ctx->ack);
+    }
+}
+
+void VideoSeekComplete(napi_env env, napi_status status, void* data)
+{
+    auto* ctx = static_cast<VideoSeekContext*>(data);
+    if (ctx->timedOut) {
+        napi_value msg = nullptr;
+        napi_value err = nullptr;
+        napi_create_string_utf8(env, "seek timed out", NAPI_AUTO_LENGTH, &msg);
+        napi_create_error(env, nullptr, msg, &err);
+        napi_reject_deferred(env, ctx->deferred, err);
+        napi_delete_async_work(env, ctx->work);
+        if (!ctx->ack.done) {
+            std::thread([ctx]() {
+                std::unique_lock<std::mutex> lock(ctx->ack.mtx);
+                ctx->ack.cv.wait_for(lock, std::chrono::seconds(60), [&ctx] { return ctx->ack.done; });
+                delete ctx;
+            }).detach();
+            return;
+        }
+        delete ctx;
+        return;
+    }
+    if (!ctx->armed || !ctx->ack.ok) {
+        napi_value msg = nullptr;
+        napi_value err = nullptr;
+        napi_create_string_utf8(env, ctx->ack.err.c_str(), NAPI_AUTO_LENGTH, &msg);
+        napi_create_error(env, nullptr, msg, &err);
+        napi_reject_deferred(env, ctx->deferred, err);
+    } else {
+        napi_value undefined = nullptr;
+        napi_get_undefined(env, &undefined);
+        napi_resolve_deferred(env, ctx->deferred, undefined);
+    }
+    napi_delete_async_work(env, ctx->work);
+    delete ctx;
+}
+
+struct VideoCaptureContext {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    VideoDecoderCore* core = nullptr;
+    CaptureAck ack;
+    bool armed = false;
+    bool timedOut = false;
+};
+
+void VideoCaptureExecute(napi_env env, void* data)
+{
+    auto* ctx = static_cast<VideoCaptureContext*>(data);
+    std::string err;
+    if (!ctx->core->RequestCapture(&ctx->ack, err)) {
+        ctx->ack.err = err;
+        return;
+    }
+    ctx->armed = true;
+    std::unique_lock<std::mutex> lock(ctx->ack.mtx);
+    if (!ctx->ack.cv.wait_for(lock, std::chrono::seconds(15), [&ctx] { return ctx->ack.done; })) {
+        ctx->timedOut = true;
+        ctx->core->CancelCaptureAck(&ctx->ack);
+    }
+}
+
+void VideoCaptureComplete(napi_env env, napi_status status, void* data)
+{
+    auto* ctx = static_cast<VideoCaptureContext*>(data);
+    if (ctx->timedOut) {
+        napi_value msg = nullptr;
+        napi_value err = nullptr;
+        napi_create_string_utf8(env, "frame capture timed out", NAPI_AUTO_LENGTH, &msg);
+        napi_create_error(env, nullptr, msg, &err);
+        napi_reject_deferred(env, ctx->deferred, err);
+        napi_delete_async_work(env, ctx->work);
+        if (!ctx->ack.done) {
+            std::thread([ctx]() {
+                std::unique_lock<std::mutex> lock(ctx->ack.mtx);
+                ctx->ack.cv.wait_for(lock, std::chrono::seconds(60), [&ctx] { return ctx->ack.done; });
+                delete ctx;
+            }).detach();
+            return;
+        }
+        delete ctx;
+        return;
+    }
+    if (!ctx->armed || !ctx->ack.ok) {
+        napi_value msg = nullptr;
+        napi_value err = nullptr;
+        napi_create_string_utf8(env, ctx->ack.err.c_str(), NAPI_AUTO_LENGTH, &msg);
+        napi_create_error(env, nullptr, msg, &err);
+        napi_reject_deferred(env, ctx->deferred, err);
+    } else {
+        napi_value result = nullptr;
+        napi_create_object(env, &result);
+        napi_value v = nullptr;
+        napi_create_int32(env, ctx->ack.width, &v);
+        napi_set_named_property(env, result, "width", v);
+        napi_create_int32(env, ctx->ack.height, &v);
+        napi_set_named_property(env, result, "height", v);
+        napi_value ab = nullptr;
+        void* abData = nullptr;
+        napi_create_arraybuffer(env, ctx->ack.rgba.size(), &abData, &ab);
+        if (abData != nullptr && !ctx->ack.rgba.empty()) {
+            memcpy(abData, ctx->ack.rgba.data(), ctx->ack.rgba.size());
+        }
+        napi_set_named_property(env, result, "data", ab);
+        napi_resolve_deferred(env, ctx->deferred, result);
+    }
+    napi_delete_async_work(env, ctx->work);
+    delete ctx;
+}
+
+} // namespace
+
+napi_value FFVideoDecoderSeekTo(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_value thisVar = nullptr;
+    napi_get_cb_info(env, info, &argc, args, &thisVar, nullptr);
+    VideoDecoderCore* core = GetCore(env, info);
+    if (core == nullptr) {
+        napi_throw_error(env, nullptr, "FFVideoDecoder is not constructed");
+        return nullptr;
+    }
+    if (argc < 1) {
+        napi_throw_type_error(env, nullptr, "seekTo(targetMs: number) requires targetMs");
+        return nullptr;
+    }
+    double target = 0.0;
+    if (napi_get_value_double(env, args[0], &target) != napi_ok || target < 0.0) {
+        napi_throw_type_error(env, nullptr, "targetMs must be a non-negative number");
+        return nullptr;
+    }
+    auto* ctx = new VideoSeekContext();
+    ctx->core = core;
+    ctx->targetMs = static_cast<int64_t>(target);
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value resourceName = nullptr;
+    napi_create_string_utf8(env, "ffmpeg_video_seek", NAPI_AUTO_LENGTH, &resourceName);
+    napi_create_async_work(env, thisVar, resourceName, VideoSeekExecute, VideoSeekComplete, ctx, &ctx->work);
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+napi_value FFVideoDecoderCaptureFrame(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_value thisVar = nullptr;
+    napi_get_cb_info(env, info, &argc, args, &thisVar, nullptr);
+    VideoDecoderCore* core = GetCore(env, info);
+    if (core == nullptr) {
+        napi_throw_error(env, nullptr, "FFVideoDecoder is not constructed");
+        return nullptr;
+    }
+    (void)args;
+    auto* ctx = new VideoCaptureContext();
+    ctx->core = core;
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value resourceName = nullptr;
+    napi_create_string_utf8(env, "ffmpeg_video_capture", NAPI_AUTO_LENGTH, &resourceName);
+    napi_create_async_work(env, thisVar, resourceName, VideoCaptureExecute, VideoCaptureComplete, ctx,
+        &ctx->work);
+    napi_queue_async_work(env, ctx->work);
+    return promise;
 }
 
 } // namespace ffmpeg

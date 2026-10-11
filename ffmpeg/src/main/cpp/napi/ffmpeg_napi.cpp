@@ -5,6 +5,7 @@
 #include "video_decoder.h"
 #include "subtitle_decoder.h"
 #include "transcoder.h"
+#include "stream_io.h"
 
 extern "C" {
 #include <libavutil/log.h>
@@ -36,6 +37,9 @@ static napi_value Init(napi_env env, napi_value exports)
         { "probe", nullptr, ffmpeg::Probe, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "extractFrame", nullptr, ffmpeg::ExtractFrame, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "transcode", nullptr, ffmpeg::Transcode, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "registerStreamIO", nullptr, ffmpeg::FFRegisterStreamIO, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "pushStreamIO", nullptr, ffmpeg::FFPushStreamIO, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "closeStreamIO", nullptr, ffmpeg::FFCloseStreamIO, nullptr, nullptr, nullptr, napi_default, nullptr },
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
 
@@ -53,6 +57,7 @@ static napi_value Init(napi_env env, napi_value exports)
         { "detach", nullptr, ffmpeg::FFAudioDecoderDetach, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getBufferStats", nullptr, ffmpeg::FFAudioDecoderGetBufferStats, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getStats", nullptr, ffmpeg::FFAudioDecoderGetStats, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "seekTo", nullptr, ffmpeg::FFAudioDecoderSeekTo, nullptr, nullptr, nullptr, napi_default, nullptr },
     };
     napi_value cls = nullptr;
     napi_define_class(env, "FFAudioDecoder", NAPI_AUTO_LENGTH, ffmpeg::FFAudioDecoderConstructor,
@@ -71,6 +76,8 @@ static napi_value Init(napi_env env, napi_value exports)
         { "detach", nullptr, ffmpeg::FFVideoDecoderDetach, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getBufferStats", nullptr, ffmpeg::FFVideoDecoderGetBufferStats, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getStats", nullptr, ffmpeg::FFVideoDecoderGetStats, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "seekTo", nullptr, ffmpeg::FFVideoDecoderSeekTo, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "captureFrame", nullptr, ffmpeg::FFVideoDecoderCaptureFrame, nullptr, nullptr, nullptr, napi_default, nullptr },
     };
     napi_value vcls = nullptr;
     napi_define_class(env, "FFVideoDecoder", NAPI_AUTO_LENGTH, ffmpeg::FFVideoDecoderConstructor,

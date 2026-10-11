@@ -2,6 +2,7 @@
 #include "net_options.h"
 #include "demux_session.h"
 #include "hls_playlist.h"
+#include "stream_io.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -46,6 +47,16 @@ struct DecoderMsg {
     uint64_t count = 0; // MSG_OVERFLOW: packets dropped in the episode
     std::string err;    // MSG_ERROR: message; MSG_DISCONTINUITY: reason
     std::string codec;
+};
+
+// Completion handshake for seekTo(): the NAPI async work arms the request and
+// blocks on the condition variable; the worker applies it and notifies.
+struct SeekAck {
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool done = false;
+    bool ok = false;
+    std::string err;
 };
 
 // One parallel-decoding audio track: own decoder + resampler, so that
@@ -194,9 +205,22 @@ public:
             }
             AVDictionary* dict = nullptr;
             ApplyOpenOptions(fmt_, &dict, effOpts);
+            std::string ioErr;
+            if (!AttachStreamIO(fmt_, res.url, ioErr)) {
+                if (!ioErr.empty()) {
+                    lastError_ = ioErr;
+                    avformat_free_context(fmt_);
+                    fmt_ = nullptr;
+                    return false;
+                }
+            }
+            // A failed open frees the context (and the default pb) but never
+            // a custom AVIOContext — keep the pointer to release it below.
+            AVIOContext* ioPb = fmt_->pb;
             int ret = avformat_open_input(&fmt_, res.url.c_str(), nullptr, &dict);
             av_dict_free(&dict);
             if (ret < 0) {
+                ReleaseStreamIO(ioPb);
                 lastError_ = "avformat_open_input failed: " + ErrToStr(ret);
                 return false;
             }
@@ -582,6 +606,42 @@ public:
         pendingSwitch_ = streamIndex;
     }
 
+    // ---- Runtime VOD seek (private connections only) --------------------
+    // Arms a seek; the worker applies it at the top of the decode loop
+    // (avformat_seek_file -> flush all track decoders -> pacing re-anchor ->
+    // pre-target drop filter) and completes `ack`.
+    bool RequestSeek(int64_t targetMs, SeekAck* ack, std::string& err)
+    {
+        if (!opened_ || !running_.load()) {
+            err = "decoder is not started";
+            return false;
+        }
+        if (sharedFmt_) {
+            err = "seekTo requires a private connection (open with sharedDemux: false)";
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(seekMtx_);
+        if (seekAck_ != nullptr) {
+            err = "another seek is already in progress";
+            return false;
+        }
+        seekAck_ = ack;
+        pendingSeekMs_.store(targetMs, std::memory_order_release);
+        return true;
+    }
+
+    // Timeout/stop path: disarm an armed request. When the worker already
+    // claimed the ack this is a no-op (the caller keeps it alive until the
+    // worker completes it).
+    void CancelSeekAck(SeekAck* ack)
+    {
+        std::lock_guard<std::mutex> lock(seekMtx_);
+        if (seekAck_ == ack) {
+            seekAck_ = nullptr;
+            pendingSeekMs_.store(INT64_MIN, std::memory_order_release);
+        }
+    }
+
     // Varispeed (live A/V sync micro-correction): the renderer keeps consuming
     // at a FIXED outRate_, so playback speed = outRate_ / swr-out-rate. A rate
     // below 1.0 (slowdown) therefore RAISES the swr output rate: more samples
@@ -638,11 +698,57 @@ private:
             queue_->Wake();
         }
         if (!running_.exchange(false)) {
+            CancelPendingSeek("decoder stopped");
             return;
         }
         if (worker_.joinable()) {
             worker_.join();
         }
+        // The worker exited without applying an armed seek: complete it now
+        // so a blocked seekTo() promise resolves.
+        CancelPendingSeek("decoder stopped");
+    }
+
+    void CancelPendingSeek(const char* reason)
+    {
+        SeekAck* seekAck = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(seekMtx_);
+            seekAck = seekAck_;
+            seekAck_ = nullptr;
+            pendingSeekMs_.store(INT64_MIN, std::memory_order_release);
+        }
+        if (seekAck != nullptr) {
+            FinishSeek(seekAck, false, reason);
+        }
+    }
+
+    // Worker side: fetch an armed seek target + its ack (nullptr ack when the
+    // request was canceled between arming and claiming).
+    int64_t TakePendingSeek(SeekAck** outAck)
+    {
+        const int64_t target = pendingSeekMs_.exchange(INT64_MIN, std::memory_order_acquire);
+        if (target == INT64_MIN) {
+            return INT64_MIN;
+        }
+        std::lock_guard<std::mutex> lock(seekMtx_);
+        *outAck = seekAck_;
+        seekAck_ = nullptr;
+        return target;
+    }
+
+    void FinishSeek(SeekAck* ack, bool ok, const std::string& err)
+    {
+        if (ack == nullptr) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(ack->mtx);
+            ack->done = true;
+            ack->ok = ok;
+            ack->err = err;
+        }
+        ack->cv.notify_all();
     }
 
     void CloseCodec()
@@ -662,7 +768,9 @@ private:
             session_ = nullptr;
         }
         if (fmt_ != nullptr && !sharedFmt_) {
+            AVIOContext* ioPb = fmt_->pb;
             avformat_close_input(&fmt_);
+            ReleaseStreamIO(ioPb);
         }
         fmt_ = nullptr;
         sharedFmt_ = false;
@@ -870,6 +978,34 @@ private:
 
         while (!stop_) {
             PollQueueEvents();
+
+            // Runtime VOD seek (private connection): flush every track
+            // decoder, seek the connection to the target keyframe, re-anchor
+            // pacing and re-arm the pre-target drop filter.
+            if (pendingSeekMs_.load(std::memory_order_acquire) != INT64_MIN) {
+                SeekAck* seekAck = nullptr;
+                const int64_t seekMs = TakePendingSeek(&seekAck);
+                if (seekMs != INT64_MIN) {
+                    const int sret = avformat_seek_file(fmt_, -1, INT64_MIN, seekMs * 1000, INT64_MAX, 0);
+                    if (sret >= 0) {
+                        for (AudioTrack* t : tracks_) {
+                            avcodec_flush_buffers(t->dec);
+                            t->eof = false;
+                        }
+                        dropBeforeMs_ = static_cast<double>(seekMs);
+                        dropGuard = 0;
+                        firstPts = AV_NOPTS_VALUE;
+                        startWall = std::chrono::steady_clock::now();
+                        eofSent = false;
+                        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFAudioSW",
+                            "seek applied target=%{public}lldms", static_cast<long long>(seekMs));
+                        FinishSeek(seekAck, true, "");
+                    } else {
+                        FinishSeek(seekAck, false, "avformat_seek_file failed: " + ErrToStr(sret));
+                    }
+                }
+                continue;
+            }
 
             if (paused_) {
                 if (!pausing) {
@@ -1080,6 +1216,10 @@ private:
     std::atomic<bool> stop_{ false };
     std::atomic<bool> paused_{ false };
     std::atomic<int> pendingSwitch_{ -1 };
+    // ---- Runtime seek (private connections) ----
+    std::atomic<int64_t> pendingSeekMs_{ INT64_MIN }; // INT64_MIN = none armed
+    SeekAck* seekAck_ = nullptr;                     // guarded by seekMtx_
+    std::mutex seekMtx_;
     // varispeed request (milli-rate, 1000 = 1.0x); worker applies it by
     // reconfiguring every track swr with out rate = outRate_ * rate
     std::atomic<int> pendingRateMilli_{ 1000 };
@@ -1365,7 +1505,7 @@ napi_value FFAudioDecoderOpen(napi_env env, napi_callback_info info)
     if (argc >= 3 && !ParseNetOptions(env, args[2], ctx->netOpts)) {
         delete ctx;
         napi_throw_type_error(env, nullptr,
-            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect?, variantIndex?, maxBandwidth?, targetLatencyMs?, autoReconnect?, reconnectMaxRetries?, dvrSeek? }");
+            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect?, variantIndex?, maxBandwidth?, targetLatencyMs?, autoReconnect?, reconnectMaxRetries?, dvrSeek?, rtspTransport?, bufferSize?, rwTimeoutMs? }");
         return nullptr;
     }
 
@@ -1613,6 +1753,104 @@ napi_value FFAudioDecoderGetStats(napi_env env, napi_callback_info info)
     napi_create_int64(env, static_cast<int64_t>(core->GetDiscontinuityCount()), &v);
     napi_set_named_property(env, result, "discontinuityCount", v);
     return result;
+}
+
+namespace {
+
+struct AudioSeekContext {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    AudioDecoderCore* core = nullptr;
+    int64_t targetMs = 0;
+    SeekAck ack;
+    bool armed = false;
+    bool timedOut = false;
+};
+
+void AudioSeekExecute(napi_env env, void* data)
+{
+    auto* ctx = static_cast<AudioSeekContext*>(data);
+    std::string err;
+    if (!ctx->core->RequestSeek(ctx->targetMs, &ctx->ack, err)) {
+        ctx->ack.err = err;
+        return;
+    }
+    ctx->armed = true;
+    std::unique_lock<std::mutex> lock(ctx->ack.mtx);
+    if (!ctx->ack.cv.wait_for(lock, std::chrono::seconds(15), [&ctx] { return ctx->ack.done; })) {
+        ctx->timedOut = true;
+        ctx->core->CancelSeekAck(&ctx->ack);
+    }
+}
+
+void AudioSeekComplete(napi_env env, napi_status status, void* data)
+{
+    auto* ctx = static_cast<AudioSeekContext*>(data);
+    if (ctx->timedOut) {
+        napi_value msg = nullptr;
+        napi_value err = nullptr;
+        napi_create_string_utf8(env, "seek timed out", NAPI_AUTO_LENGTH, &msg);
+        napi_create_error(env, nullptr, msg, &err);
+        napi_reject_deferred(env, ctx->deferred, err);
+        napi_delete_async_work(env, ctx->work);
+        if (!ctx->ack.done) {
+            std::thread([ctx]() {
+                std::unique_lock<std::mutex> lock(ctx->ack.mtx);
+                ctx->ack.cv.wait_for(lock, std::chrono::seconds(60), [&ctx] { return ctx->ack.done; });
+                delete ctx;
+            }).detach();
+            return;
+        }
+        delete ctx;
+        return;
+    }
+    if (!ctx->armed || !ctx->ack.ok) {
+        napi_value msg = nullptr;
+        napi_value err = nullptr;
+        napi_create_string_utf8(env, ctx->ack.err.c_str(), NAPI_AUTO_LENGTH, &msg);
+        napi_create_error(env, nullptr, msg, &err);
+        napi_reject_deferred(env, ctx->deferred, err);
+    } else {
+        napi_value undefined = nullptr;
+        napi_get_undefined(env, &undefined);
+        napi_resolve_deferred(env, ctx->deferred, undefined);
+    }
+    napi_delete_async_work(env, ctx->work);
+    delete ctx;
+}
+
+} // namespace
+
+napi_value FFAudioDecoderSeekTo(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_value thisVar = nullptr;
+    napi_get_cb_info(env, info, &argc, args, &thisVar, nullptr);
+    AudioDecoderCore* core = GetCore(env, info);
+    if (core == nullptr) {
+        napi_throw_error(env, nullptr, "FFAudioDecoder is not constructed");
+        return nullptr;
+    }
+    if (argc < 1) {
+        napi_throw_type_error(env, nullptr, "seekTo(targetMs: number) requires targetMs");
+        return nullptr;
+    }
+    double target = 0.0;
+    if (napi_get_value_double(env, args[0], &target) != napi_ok || target < 0.0) {
+        napi_throw_type_error(env, nullptr, "targetMs must be a non-negative number");
+        return nullptr;
+    }
+    auto* ctx = new AudioSeekContext();
+    ctx->core = core;
+    ctx->targetMs = static_cast<int64_t>(target);
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value resourceName = nullptr;
+    napi_create_string_utf8(env, "ffmpeg_audio_seek", NAPI_AUTO_LENGTH, &resourceName);
+    napi_create_async_work(env, thisVar, resourceName, AudioSeekExecute, AudioSeekComplete, ctx, &ctx->work);
+    napi_queue_async_work(env, ctx->work);
+    return promise;
 }
 
 } // namespace ffmpeg

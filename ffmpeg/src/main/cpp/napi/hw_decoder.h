@@ -72,6 +72,12 @@ public:
     void Resume() { paused_ = false; }
     void Stop();
 
+    // Flush in place (VOD seek): the codec reclaims all outstanding input/
+    // output buffers (re-issued through the callbacks), queued outputs are
+    // discarded and the render-thread pacing anchor re-arms at the next
+    // frame. Call SetDropBeforeUs() right after to skip pre-target output.
+    void Flush();
+
     const std::string& GetLastError() const { return lastError_; }
 
 private:
@@ -109,6 +115,9 @@ private:
     std::atomic<bool> alive_{ false };
     std::atomic<bool> stop_{ false };
     std::atomic<bool> paused_{ false };
+    // Set by Flush(): the render loop re-arms its pacing anchor (first pts)
+    // at the next output frame instead of bursting post-seek frames.
+    std::atomic<bool> resetPacing_{ false };
     int64_t dropBeforeUs_ = 0; // read-only after Start() (set via SetDropBeforeUs)
 };
 

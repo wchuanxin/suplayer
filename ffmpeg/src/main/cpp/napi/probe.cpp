@@ -1,6 +1,7 @@
 #include "probe.h"
 #include "net_options.h"
 #include "demux_session.h"
+#include "stream_io.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -11,8 +12,10 @@ extern "C" {
 
 #include <cstdint>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ffmpeg {
@@ -33,6 +36,9 @@ struct StreamResult {
     int64_t bitRate = 0;
     int32_t pid = -1;        // MPEG-TS packet id (AVStream::id), -1 when unknown
     int32_t programIndex = -1; // index into ProbeContext::programs, -1 when not in any program
+    bool dispositionDefault = false; // AV_DISPOSITION_DEFAULT (user-facing default track)
+    bool dispositionForced = false;  // AV_DISPOSITION_FORCED (forced subtitle/narration track)
+    int32_t rotation = 0;    // video: clockwise display rotation in degrees (0/90/180/270)
 };
 
 struct ProgramResult {
@@ -51,6 +57,13 @@ struct ProgramResult {
     std::vector<int32_t> streamIndexes;
 };
 
+struct ChapterResult {
+    int64_t id = 0;
+    double startMs = 0.0;
+    double endMs = 0.0;
+    std::string title;
+};
+
 struct ProbeContext {
     napi_async_work work = nullptr;
     napi_deferred deferred = nullptr;
@@ -64,6 +77,8 @@ struct ProbeContext {
     int64_t bitRate = 0;
     std::vector<StreamResult> streams;
     std::vector<ProgramResult> programs;
+    std::vector<ChapterResult> chapters;
+    std::vector<std::pair<std::string, std::string>> tags;
 };
 
 std::string ErrToStr(int err)
@@ -111,6 +126,23 @@ std::string DictGet(const AVDictionary* dict, const char* key)
     return entry == nullptr ? std::string() : std::string(entry->value);
 }
 
+// Rotation angle (degrees, counterclockwise-positive like
+// av_display_rotation_get) from the 16.16 fixed-point 3x3 display matrix.
+// Computed locally to avoid depending on libavutil/display symbols.
+double DisplayMatrixRotation(const int32_t* m)
+{
+    const double a = static_cast<double>(m[0]) / 65536.0;
+    const double b = static_cast<double>(m[3]) / 65536.0;
+    const double c = static_cast<double>(m[1]) / 65536.0;
+    const double d = static_cast<double>(m[4]) / 65536.0;
+    const double sx = std::sqrt(a * a + b * b);
+    const double sy = std::sqrt(c * c + d * d);
+    if (sx <= 0.0 || sy <= 0.0) {
+        return 0.0;
+    }
+    return -std::atan2(c / sy, a / sx) * (180.0 / 3.14159265358979323846);
+}
+
 void ProbeExecute(napi_env env, void* data)
 {
     auto* ctx = static_cast<ProbeContext*>(data);
@@ -125,6 +157,17 @@ void ProbeExecute(napi_env env, void* data)
     } else {
         AVDictionary* dict = nullptr;
         ApplyOpenOptions(nullptr, &dict, ctx->netOpts);
+        fmt = avformat_alloc_context();
+        std::string ioErr;
+        if (!AttachStreamIO(fmt, ctx->src, ioErr)) {
+            if (!ioErr.empty()) {
+                avformat_free_context(fmt);
+                fmt = nullptr;
+                ctx->error = ioErr;
+                return;
+            }
+        }
+        StreamIOGuard ioGuard(fmt);
         int ret = avformat_open_input(&fmt, ctx->src.c_str(), nullptr, &dict);
         av_dict_free(&dict);
         if (ret < 0) {
@@ -148,6 +191,27 @@ void ProbeExecute(napi_env env, void* data)
     ctx->title = DictGet(fmt->metadata, "title");
     ctx->duration = fmt->duration > 0 ? static_cast<double>(fmt->duration) / AV_TIME_BASE : 0.0;
     ctx->bitRate = fmt->bit_rate;
+
+    // Container metadata tags (everything the demuxer exposes: title, artist,
+    // encoder, comment, service_name, ...). "title" stays duplicated as the
+    // top-level field for 1.x compatibility.
+    const AVDictionaryEntry* tag = nullptr;
+    while ((tag = av_dict_iterate(fmt->metadata, tag)) != nullptr) {
+        if (tag->key != nullptr && tag->value != nullptr) {
+            ctx->tags.emplace_back(tag->key, tag->value);
+        }
+    }
+
+    // Chapters (Matroska/MP4 chapter tracks, HLS ID3, ...); empty when absent.
+    for (unsigned int c = 0; c < fmt->nb_chapters; ++c) {
+        const AVChapter* ch = fmt->chapters[c];
+        ChapterResult cr;
+        cr.id = ch->id;
+        cr.startMs = static_cast<double>(ch->start) * av_q2d(ch->time_base) * 1000.0;
+        cr.endMs = static_cast<double>(ch->end) * av_q2d(ch->time_base) * 1000.0;
+        cr.title = DictGet(ch->metadata, "title");
+        ctx->chapters.push_back(cr);
+    }
 
     // AVStream::id only carries an MPEG-TS PID for the raw mpegts demuxer; for
     // MP4 it is the track id and for HLS the playlist index, so gate on it.
@@ -202,6 +266,22 @@ void ProbeExecute(napi_env env, void* data)
             stream->duration > 0 ? static_cast<double>(stream->duration) * av_q2d(stream->time_base) : 0.0;
         s.bitRate = par->bit_rate;
         s.pid = pidValid && stream->id > 0 ? static_cast<int32_t>(stream->id) : -1;
+        s.dispositionDefault = (stream->disposition & AV_DISPOSITION_DEFAULT) != 0;
+        s.dispositionForced = (stream->disposition & AV_DISPOSITION_FORCED) != 0;
+        if (par->codec_type == AVMEDIA_TYPE_VIDEO) {
+            // Clockwise display rotation from the display-matrix side data
+            // (moov rotate / Matroska ProjectionPoseRoll), 0 when absent.
+            size_t matrixSize = 0;
+            const uint8_t* sd = av_stream_get_side_data(stream, AV_PKT_DATA_DISPLAYMATRIX, &matrixSize);
+            if (sd != nullptr && matrixSize >= 9 * sizeof(int32_t)) {
+                double clockwise = -DisplayMatrixRotation(reinterpret_cast<const int32_t*>(sd));
+                clockwise = std::fmod(clockwise, 360.0);
+                if (clockwise < 0.0) {
+                    clockwise += 360.0;
+                }
+                s.rotation = static_cast<int32_t>(clockwise + 0.5) % 360;
+            }
+        }
         for (size_t p = 0; p < ctx->programs.size(); ++p) {
             for (int32_t si : ctx->programs[p].streamIndexes) {
                 if (si == s.index) {
@@ -264,6 +344,12 @@ void ProbeComplete(napi_env env, napi_status status, void* data)
             SetNumberProp(env, obj, "bitRate", static_cast<double>(s.bitRate));
             SetNumberProp(env, obj, "pid", s.pid);
             SetNumberProp(env, obj, "programIndex", s.programIndex);
+            napi_value bv = nullptr;
+            napi_get_boolean(env, s.dispositionDefault, &bv);
+            napi_set_named_property(env, obj, "default", bv);
+            napi_get_boolean(env, s.dispositionForced, &bv);
+            napi_set_named_property(env, obj, "forced", bv);
+            SetNumberProp(env, obj, "rotation", s.rotation);
             napi_set_element(env, streams, static_cast<uint32_t>(i), obj);
         }
         napi_set_named_property(env, result, "streams", streams);
@@ -294,6 +380,30 @@ void ProbeComplete(napi_env env, napi_status status, void* data)
             napi_set_element(env, programs, static_cast<uint32_t>(i), obj);
         }
         napi_set_named_property(env, result, "programs", programs);
+
+        napi_value chapters = nullptr;
+        napi_create_array_with_length(env, ctx->chapters.size(), &chapters);
+        for (size_t i = 0; i < ctx->chapters.size(); ++i) {
+            const ChapterResult& c = ctx->chapters[i];
+            napi_value obj = nullptr;
+            napi_create_object(env, &obj);
+            SetNumberProp(env, obj, "id", static_cast<double>(c.id));
+            SetNumberProp(env, obj, "startMs", c.startMs);
+            SetNumberProp(env, obj, "endMs", c.endMs);
+            SetStringProp(env, obj, "title", c.title);
+            napi_set_element(env, chapters, static_cast<uint32_t>(i), obj);
+        }
+        napi_set_named_property(env, result, "chapters", chapters);
+
+        napi_value tags = nullptr;
+        napi_create_object(env, &tags);
+        for (const auto& kv : ctx->tags) {
+            napi_value v = nullptr;
+            napi_create_string_utf8(env, kv.second.c_str(), NAPI_AUTO_LENGTH, &v);
+            napi_set_named_property(env, tags, kv.first.c_str(), v);
+        }
+        napi_set_named_property(env, result, "tags", tags);
+
         napi_resolve_deferred(env, ctx->deferred, result);
     }
 
@@ -326,7 +436,7 @@ napi_value Probe(napi_env env, napi_callback_info info)
     if (argc >= 2 && !ParseNetOptions(env, args[1], ctx->netOpts)) {
         delete ctx;
         napi_throw_type_error(env, nullptr,
-            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect?, variantIndex?, maxBandwidth?, targetLatencyMs?, autoReconnect?, reconnectMaxRetries?, dvrSeek? }");
+            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect?, variantIndex?, maxBandwidth?, targetLatencyMs?, autoReconnect?, reconnectMaxRetries?, dvrSeek?, rtspTransport?, bufferSize?, rwTimeoutMs? }");
         return nullptr;
     }
 

@@ -179,6 +179,27 @@ bool HwVideoDecoder::FeedPacket(const uint8_t* data, int size, int64_t ptsUs, bo
     return true;
 }
 
+void HwVideoDecoder::Flush()
+{
+    if (codec_ == nullptr || !alive_.load() || stop_.load()) {
+        return;
+    }
+    OH_AVErrCode ret = OH_VideoDecoder_Flush(codec_);
+    if (ret != AV_ERR_OK) {
+        OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFVideoHW", "flush failed ret=%{public}d", ret);
+    }
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        // The codec reclaimed every outstanding buffer during Flush and will
+        // re-issue free inputs / fresh outputs through the callbacks.
+        freeInputs_.clear();
+        pendingOutputs_.clear();
+    }
+    resetPacing_.store(true, std::memory_order_release);
+    inputCv_.notify_all();
+    outputCv_.notify_all();
+}
+
 void HwVideoDecoder::Stop()
 {
     if (codec_ == nullptr && !renderThread_.joinable()) {
@@ -286,6 +307,11 @@ void HwVideoDecoder::RenderLoop()
             }
             item = pendingOutputs_.front();
             pendingOutputs_.pop_front();
+        }
+
+        if (resetPacing_.exchange(false, std::memory_order_acquire)) {
+            // Post-flush (VOD seek): re-arm the pacing anchor at this frame.
+            firstPtsUs = INT64_MIN;
         }
 
         if ((item.flags & AVCODEC_BUFFER_FLAGS_EOS) != 0) {

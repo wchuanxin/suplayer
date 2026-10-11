@@ -2,6 +2,7 @@
 #include "net_options.h"
 #include "demux_session.h"
 #include "hls_playlist.h"
+#include "stream_io.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -205,9 +206,22 @@ public:
             }
             AVDictionary* dict = nullptr;
             ApplyOpenOptions(fmt_, &dict, effOpts);
+            std::string ioErr;
+            if (!AttachStreamIO(fmt_, res.url, ioErr)) {
+                if (!ioErr.empty()) {
+                    lastError_ = ioErr;
+                    avformat_free_context(fmt_);
+                    fmt_ = nullptr;
+                    return false;
+                }
+            }
+            // A failed open frees the context (and the default pb) but never
+            // a custom AVIOContext — keep the pointer to release it below.
+            AVIOContext* ioPb = fmt_->pb;
             int ret = avformat_open_input(&fmt_, res.url.c_str(), nullptr, &dict);
             av_dict_free(&dict);
             if (ret < 0) {
+                ReleaseStreamIO(ioPb);
                 lastError_ = "avformat_open_input failed: " + ErrToStr(ret);
                 return false;
             }
@@ -421,7 +435,9 @@ private:
             session_ = nullptr;
         }
         if (fmt_ != nullptr && !sharedFmt_) {
+            AVIOContext* ioPb = fmt_->pb;
             avformat_close_input(&fmt_);
+            ReleaseStreamIO(ioPb);
         }
         fmt_ = nullptr;
         sharedFmt_ = false;

@@ -15,6 +15,13 @@ export interface FFStreamInfo {
   pid: number;
   /** Index into FFMediaInfo.programs, -1 when the stream is not part of any program */
   programIndex: number;
+  /** Container disposition: AV_DISPOSITION_DEFAULT bit */
+  dispositionDefault: boolean;
+  /** Container disposition: AV_DISPOSITION_FORCED bit */
+  dispositionForced: boolean;
+  /** Clockwise rotation in degrees derived from the display matrix
+   *  (0/90/180/270, 0 when absent). */
+  rotation: number;
 }
 
 export interface FFProgramInfo {
@@ -40,6 +47,17 @@ export interface FFProgramInfo {
   streamIndexes: Array<number>;
 }
 
+export interface FFChapterInfo {
+  /** AVChapter id */
+  id: number;
+  /** Chapter start in ms (container timebase) */
+  startMs: number;
+  /** Chapter end in ms (container timebase) */
+  endMs: number;
+  /** Chapter title (metadata 'title'), empty when absent */
+  title: string;
+}
+
 export interface FFMediaInfo {
   format: string;
   formatLongName: string;
@@ -49,6 +67,10 @@ export interface FFMediaInfo {
   streams: Array<FFStreamInfo>;
   /** MPEG-TS programs (PAT/PMT view); empty for containers without PSI */
   programs: Array<FFProgramInfo>;
+  /** Container chapters (mp4/MKV chapter tracks); empty when absent */
+  chapters: Array<FFChapterInfo>;
+  /** All container metadata tags (title, artist, encoder, service_name, ...) */
+  tags: Record<string, string>;
 }
 
 export interface FFFrame {
@@ -130,6 +152,16 @@ export interface FFNetOptions {
    *  resumes at the next keyframe, instead of blocking the shared demux
    *  thread (which would starve audio). Default false. */
   live?: boolean;
+  /** RTSP transport: 'tcp' (interleaved in the control connection) or 'udp'.
+   *  Default is FFmpeg's own (udp first). Applies to rtsp:// sources. */
+  rtspTransport?: 'tcp' | 'udp';
+  /** Low-level receive buffer size in bytes applied to UDP/TCP sockets
+   *  (FFmpeg 'buffer_size', default 0 = FFmpeg default). Large values help
+   *  high-bitrate RTSP/multicast feeds. */
+  bufferSize?: number;
+  /** I/O read/write timeout in ms (FFmpeg 'rw_timeout'; 0 = no timeout).
+   *  Guards against a stalled socket on non-HLS protocols. */
+  rwTimeoutMs?: number;
 }
 
 export interface FFAudioOpenInfo {
@@ -215,6 +247,15 @@ export interface FFTranscodeOptions {
   audioBitrate?: number;
   startTimeMs?: number;
   durationMs?: number;
+  /** Video codec: 'h264' (default, libopenh264), 'mpeg2' (mpeg2video) or
+   *  'copy' (remux without re-encode; requires a compatible input, h264/hevc
+   *  inputs are converted to Annex-B when the output is mpegts). */
+  vcodec?: 'h264' | 'mpeg2' | 'copy';
+  /** Audio codec: 'aac' (default), 'ac3' or 'copy' (remux without re-encode). */
+  acodec?: 'aac' | 'ac3' | 'copy';
+  /** Extra libavfilter video filter chain inserted before scale/fps
+   *  (e.g. 'hqdn3d=4:3:6:4.5', 'unsharp=5:5:1.0'). Empty = none. */
+  filter?: string;
 }
 
 export interface FFTranscodeResult {
@@ -272,6 +313,44 @@ export const extractFrame: (src: string, timeMs: number) => Promise<FFFrame>;
 
 export const transcode: (src: string, options: FFTranscodeOptions) => Promise<FFTranscodeResult>;
 
+/** A frame captured from the software decode path (RGBA8888, native size). */
+export interface FFCapturedFrame {
+  width: number;
+  height: number;
+  data: ArrayBuffer;
+}
+
+/** JS-backed byte source ("streamio:<id>" URLs) — see registerStreamIO. */
+export interface FFStreamIOCallbacks {
+  /** Deliver up to `length` bytes starting at `offset`. MUST finish by
+   *  calling pushStreamIO(id, seq, byteCount, data): byteCount = bytes read
+   *  (data must hold exactly byteCount bytes), 0 = EOF, negative = error. */
+  read: (seq: number, offset: number, length: number) => void;
+  /** Optional; without it the source is treated as non-seekable (moov-at-end
+   *  mp4 files will not open). Finish with pushStreamIO(id, seq, result):
+   *  whence 0 = new absolute offset after seeking to `offset` (>= 0) or -1;
+   *  whence 2 = total stream size or -1; whence 3 = resulting offset of
+   *  seeking to `offset` bytes relative to the end (usually size + offset). */
+  seek?: (seq: number, offset: number, whence: number) => void;
+  /** Optional; invoked once when the source is closed or the last consumer
+   *  disappears. No response required. */
+  close?: () => void;
+}
+
+/** Register a JS-backed byte source addressable as "streamio:<id>" by every
+ *  API taking a source URL (probe/extractFrame/transcode/decoders). Reads
+ *  are routed to the JS callbacks; each request must complete within 15 s
+ *  via pushStreamIO or the source fails permanently. */
+export const registerStreamIO: (id: number, callbacks: FFStreamIOCallbacks) => void;
+
+/** Complete a pending read/seek request (see FFStreamIOCallbacks). Returns
+ *  false when the response arrived too late or nobody was waiting. */
+export const pushStreamIO: (id: number, seq: number, value: number, data?: ArrayBuffer) => boolean;
+
+/** Close a registered streamio source: pending and future reads fail
+ *  immediately and the callbacks are released. Safe to call twice. */
+export const closeStreamIO: (id: number) => void;
+
 export class FFAudioDecoder {
   open(src: string, streamIndex?: number, options?: FFNetOptions): Promise<FFAudioOpenInfo>;
   on(event: 'pcm', callback: (packet: FFAudioPacket) => void): void;
@@ -311,6 +390,12 @@ export class FFAudioDecoder {
   getBufferStats(): FFBufferStats;
   /** Decode-side playback statistics (see FFPlaybackStats). */
   getStats(): FFPlaybackStats;
+  /** Runtime VOD seek on a private connection (open with sharedDemux: false):
+   *  seeks to the keyframe at/before the target, flushes the decoder and
+   *  re-anchors pacing; frames before the target are dropped. Rejects on
+   *  live/shared connections, when another seek is in flight, or after a
+   *  15 s timeout. */
+  seekTo(targetMs: number): Promise<void>;
 }
 
 export class FFVideoDecoder {
@@ -341,6 +426,17 @@ export class FFVideoDecoder {
   getBufferStats(): FFBufferStats;
   /** Decode-side playback statistics (see FFPlaybackStats). */
   getStats(): FFPlaybackStats;
+  /** Runtime VOD seek on a private connection (open with sharedDemux: false):
+   *  seeks to the keyframe at/before the target, flushes the decoder and
+   *  re-anchors pacing; frames before the target are dropped. Hardware
+   *  decoding is flushed the same way. Rejects on live/shared connections,
+   *  when another seek is in flight, or after a 15 s timeout. */
+  seekTo(targetMs: number): Promise<void>;
+  /** Capture the next decoded frame as RGBA8888 at native resolution.
+   *  Software decode only — rejects on a hardware-decode connection
+   *  (open with hw: 'never' when snapshots are needed). Resolves once per
+   *  call; safe to issue while playback is running or paused. */
+  captureFrame(): Promise<FFCapturedFrame>;
 }
 
 export class FFSubtitleDecoder {

@@ -60,6 +60,16 @@ struct NetOptions {
     bool dvrSeek = false;               // F2 (experimental): allow seekTo on live DVR windows;
                                         // success still depends on the hls demuxer keeping the
                                         // target segment inside its sliding window
+    std::string rtspTransport;          // RTSP/RTP transport: "tcp" | "udp" | "udp_multicast" |
+                                        // "http" | "https"; empty = FFmpeg default (udp probe ->
+                                        // tcp fallback). Also applied to sdp/rtmp-adjacent inputs
+                                        // that consume rtsp_transport (ignored elsewhere).
+    int32_t bufferSize = 0;             // Protocol receive/send buffer size in bytes
+                                        // (udp/tcp/http/rtsp); 0 = FFmpeg default.
+    int64_t rwTimeoutMs = 0;            // I/O read/write timeout in ms: a single read or write
+                                        // blocking longer than this aborts with ETIMEDOUT.
+                                        // 0 = no timeout (FFmpeg default). Applied to all
+                                        // protocol-based sources.
 };
 
 // Parse optional JS options object into NetOptions.
@@ -262,7 +272,9 @@ inline bool ParseNetOptions(napi_env env, napi_value val, NetOptions& out)
         !readBool("live", out.live) || !readInt("variantIndex", out.variantIndex) ||
         !readInt64("maxBandwidth", out.maxBandwidth) || !readInt64("targetLatencyMs", out.targetLatencyMs) ||
         !readTri("autoReconnect", out.autoReconnect) ||
-        !readInt("reconnectMaxRetries", out.reconnectMaxRetries) || !readBool("dvrSeek", out.dvrSeek)) {
+        !readInt("reconnectMaxRetries", out.reconnectMaxRetries) || !readBool("dvrSeek", out.dvrSeek) ||
+        !readString("rtspTransport", out.rtspTransport) || !readInt("bufferSize", out.bufferSize) ||
+        !readInt64("rwTimeoutMs", out.rwTimeoutMs)) {
         return false;
     }
     return true;
@@ -307,6 +319,19 @@ inline void ApplyOpenOptions(AVFormatContext* fmt, AVDictionary** dict, const Ne
         av_dict_set(dict, "reconnect_on_network_error", "1", 0);
         av_dict_set(dict, "reconnect_on_http_error", "4xx,5xx", 0);
         av_dict_set(dict, "reconnect_delay_max", "5", 0);
+    }
+    // Non-HLS protocol tuning (rtsp/rtp/udp/tcp/http/srt/...). FFmpeg ignores
+    // dict entries a protocol does not consume, so applying them is harmless
+    // for other sources.
+    if (!opts.rtspTransport.empty()) {
+        av_dict_set(dict, "rtsp_transport", opts.rtspTransport.c_str(), 0);
+    }
+    if (opts.bufferSize > 0) {
+        av_dict_set(dict, "buffer_size", std::to_string(opts.bufferSize).c_str(), 0);
+    }
+    if (opts.rwTimeoutMs > 0) {
+        // rw_timeout is consumed by ffurl in microseconds
+        av_dict_set(dict, "rw_timeout", std::to_string(opts.rwTimeoutMs * 1000).c_str(), 0);
     }
     if (fmt != nullptr && opts.analyzeMs > 0) {
         // AV_TIME_BASE is microseconds

@@ -1,4 +1,5 @@
 #include "demux_session.h"
+#include "stream_io.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -75,6 +76,11 @@ std::string DemuxSession::BuildKey(const std::string& src, const NetOptions& opt
     key += "|lat=" + std::to_string(opts.targetLatencyMs);
     key += "|arc=" + std::to_string(opts.autoReconnect);
     key += "|rcm=" + std::to_string(opts.reconnectMaxRetries);
+    // Protocol options change the connection itself (transport/buffer/timeout)
+    // and must not be shared across sessions with different values.
+    key += "|rtsp=" + opts.rtspTransport;
+    key += "|bufsz=" + std::to_string(opts.bufferSize);
+    key += "|rwto=" + std::to_string(opts.rwTimeoutMs);
     return key;
 }
 
@@ -188,6 +194,15 @@ bool DemuxSession::Init(const std::string& src, const NetOptions& opts, std::str
     fmt_->interrupt_callback.opaque = this;
     AVDictionary* dict = nullptr;
     ApplyOpenOptions(fmt_, &dict, effOpts);
+    std::string ioErr;
+    if (!AttachStreamIO(fmt_, res.url, ioErr)) {
+        if (!ioErr.empty()) {
+            err = ioErr;
+            avformat_free_context(fmt_);
+            fmt_ = nullptr;
+            return false;
+        }
+    }
     int ret = avformat_open_input(&fmt_, res.url.c_str(), nullptr, &dict);
     av_dict_free(&dict);
     if (ret < 0) {
@@ -199,14 +214,18 @@ bool DemuxSession::Init(const std::string& src, const NetOptions& opts, std::str
     ret = avformat_find_stream_info(fmt_, nullptr);
     if (ret < 0) {
         err = "avformat_find_stream_info failed";
+        AVIOContext* ioPb = fmt_->pb;
         avformat_close_input(&fmt_);
+        ReleaseStreamIO(ioPb);
         return false;
     }
     if (opts.program != INT32_MIN) {
         program_ = SelectProgram(fmt_, opts.program);
         if (program_ == nullptr) {
             err = "program not found: " + std::to_string(opts.program);
+            AVIOContext* ioPb = fmt_->pb;
             avformat_close_input(&fmt_);
+            ReleaseStreamIO(ioPb);
             return false;
         }
     }
@@ -335,7 +354,9 @@ void DemuxSession::SnapshotStreamLayout(std::vector<int>& out)
 bool DemuxSession::Rebuild(std::string& err)
 {
     // Demux-thread only (sole fmt_ owner).
+    AVIOContext* oldIoPb = fmt_->pb;
     avformat_close_input(&fmt_);
+    ReleaseStreamIO(oldIoPb);
     fmt_ = nullptr;
     program_ = nullptr;
     // Re-arm the watchdogs: the rebuild itself performs network I/O under
@@ -361,6 +382,15 @@ bool DemuxSession::Rebuild(std::string& err)
     fmt_->interrupt_callback.opaque = this;
     AVDictionary* dict = nullptr;
     ApplyOpenOptions(fmt_, &dict, effOpts);
+    std::string ioErr;
+    if (!AttachStreamIO(fmt_, res.url, ioErr)) {
+        if (!ioErr.empty()) {
+            err = ioErr;
+            avformat_free_context(fmt_);
+            fmt_ = nullptr;
+            return false;
+        }
+    }
     int ret = avformat_open_input(&fmt_, res.url.c_str(), nullptr, &dict);
     av_dict_free(&dict);
     if (ret < 0) {
@@ -372,14 +402,18 @@ bool DemuxSession::Rebuild(std::string& err)
     ret = avformat_find_stream_info(fmt_, nullptr);
     if (ret < 0) {
         err = "avformat_find_stream_info failed";
+        AVIOContext* ioPb = fmt_->pb;
         avformat_close_input(&fmt_);
+        ReleaseStreamIO(ioPb);
         return false;
     }
     if (opts_.program != INT32_MIN) {
         program_ = SelectProgram(fmt_, opts_.program);
         if (program_ == nullptr) {
             err = "program not found after rebuild: " + std::to_string(opts_.program);
+            AVIOContext* ioPb = fmt_->pb;
             avformat_close_input(&fmt_);
+            ReleaseStreamIO(ioPb);
             return false;
         }
     }
@@ -390,7 +424,9 @@ bool DemuxSession::Rebuild(std::string& err)
     SnapshotStreamLayout(codecs);
     if (codecs != streamCodecs_) {
         err = "stream layout changed after rebuild";
+        AVIOContext* ioPb = fmt_->pb;
         avformat_close_input(&fmt_);
+        ReleaseStreamIO(ioPb);
         return false;
     }
     return true;
@@ -628,7 +664,9 @@ void DemuxSession::Shutdown()
         demuxThread_.join();
     }
     if (fmt_ != nullptr) {
+        AVIOContext* ioPb = fmt_->pb;
         avformat_close_input(&fmt_);
+        ReleaseStreamIO(ioPb);
     }
     {
         std::lock_guard<std::mutex> lock(RegistryMutex());

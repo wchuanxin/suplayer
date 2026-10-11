@@ -19,6 +19,7 @@ napi_value FFAudioDecoderSetRate(napi_env env, napi_callback_info info);
 napi_value FFAudioDecoderDetach(napi_env env, napi_callback_info info);
 napi_value FFAudioDecoderGetBufferStats(napi_env env, napi_callback_info info);
 napi_value FFAudioDecoderGetStats(napi_env env, napi_callback_info info);
+napi_value FFAudioDecoderSeekTo(napi_env env, napi_callback_info info);
 
 } // namespace ffmpeg
 

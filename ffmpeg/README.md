@@ -154,6 +154,14 @@ multi-program transport streams: `programNum`, `pmtPid`, `pcrPid`,
 `-1` when the input carries no PSI. HLS exposes one synthetic program per
 variant (`programNum` 0, no SDT name, no PIDs) while MP4 reports none.
 
+`FFMediaInfo.chapters` lists container chapters (mp4/MKV chapter tracks) as
+`{ id, startMs, endMs, title }`, and `FFMediaInfo.tags` carries all container
+metadata tags (`Record<string, string>`: title, artist, encoder,
+service_name, ...). Each `FFStreamInfo` additionally reports
+`dispositionDefault` / `dispositionForced` (container disposition bits, for
+default track selection and forced narratives) and `rotation` (clockwise
+degrees from the display matrix, 0/90/180/270).
+
 ### `extractFrame(src: string, timeMs: number): Promise<FFFrame>`
 
 Decodes the nearest video frame at `timeMs` and returns RGBA pixels
@@ -172,6 +180,9 @@ One-shot transcode on a background worker. `FFTranscodeOptions`:
 | `audioBitrate` | 96000 | AAC target bitrate, bps; `0` disables the audio track |
 | `startTimeMs` | 0 | Seek into the source before encoding |
 | `durationMs` | 0 (to EOF) | Stop encoding after this span |
+| `vcodec` | `'h264'` | Video codec: `'h264'` (libopenh264), `'mpeg2'` (mpeg2video) or `'copy'` — remux the video track without re-encoding (h264/hevc inputs are converted to Annex-B when the output is mpegts) |
+| `acodec` | `'aac'` | Audio codec: `'aac'`, `'ac3'` or `'copy'` — remux the audio track without re-encoding |
+| `filter` | none | Extra libavfilter video chain inserted before scale/fps (e.g. `'hqdn3d=4:3:6:4.5'`, `'unsharp=5:5:1.0'`) |
 
 `FFTranscodeResult` reports `outputSize` (bytes), `durationMs` of the produced
 file and encoded video `frames`. Output timestamps are normalized to start at
@@ -202,6 +213,9 @@ Optional network/live options accepted by `probe` and both decoders' `open`:
 | `frameEventMs` | `0` | Minimum interval in ms between `FFVideoDecoder` `'frame'` events (`0` = every frame). The first frame is always emitted; larger values throttle the NAPI bridge traffic for apps that only need periodic PTS updates (A/V sync, progress) |
 | `startTimeMs` | `0` | VOD start position in ms: the decoder seeks to the keyframe at/before the target and drops pre-target frames (video: decode but no render/emit, audio: no resample/emit), so playback starts precisely at the requested position. `0` = from head. Ignored when the source is not seekable (live streams fall back to normal startup) |
 | `sharedDemux` | `false` | Shared demuxer: every decoder (video / audio / subtitle) opened for the same source with matching demux options (`userAgent`/`headers`/`allowedExtensions`/`liveStartIndex`/`analyzeMs`/`program`/`httpPersistent`/`reconnect`/`variantIndex`/`maxBandwidth`/`targetLatencyMs`/`autoReconnect`/`reconnectMaxRetries`) shares ONE network connection through a process-wide demux session, instead of one connection per decoder. A single demux thread routes packets to per-decoder bounded queues; queue high-water backpressure keeps the self-pacing semantics of private connections (a paused decoder stalls the shared read exactly like it used to stall its own). Concurrent first openers race; the loser attaches to the winner (startup stays parallel, steady state is one connection). Attachers compensate a different `startTimeMs` with their own pre-target drop. `probe()` reuses a live session's context for metadata reads without opening a new connection |
+| `rtspTransport` | FFmpeg default | RTSP transport for rtsp:// sources: `'tcp'` (interleaved in the control connection) or `'udp'` |
+| `bufferSize` | `0` | Low-level socket buffer size in bytes (FFmpeg `buffer_size`); raise it for high-bitrate RTSP/multicast feeds |
+| `rwTimeoutMs` | `0` | I/O read/write timeout in ms (FFmpeg `rw_timeout`); guards against a stalled socket on non-HLS protocols. `0` = no timeout |
 
 For live streams `durationMs` is `0` and the `'end'` event never fires; use
 `stop()` to end playback. `stop()` also aborts in-flight network reads
@@ -250,6 +264,7 @@ switchTrack(streamIndex: number): void  // instant hot switch, mid-playback
 flushBacklog(): void              // live A/V resync: drop queue backlog
 detach(): void                    // leak-path cleanup, no thread joins
 setRate(rate: number): void       // varispeed [0.98, 1.02] for A/V sync
+seekTo(targetMs: number): Promise<void>  // runtime VOD seek (private connections)
 getBufferStats(): FFBufferStats
 getStats(): FFPlaybackStats
 pause(): void; resume(): void
@@ -281,11 +296,25 @@ on(event: 'reconnected', cb: () => void): void
 start(surfaceId: string): void    // renders into XComponent surface
 flushToKeyframe(): void            // live A/V resync: drop backlog to newest keyframe
 detach(): void                     // leak-path cleanup, no thread joins
+seekTo(targetMs: number): Promise<void>   // runtime VOD seek (private connections)
+captureFrame(): Promise<FFCapturedFrame>  // next decoded frame as RGBA8888 (sw decode)
 getBufferStats(): FFBufferStats
 getStats(): FFPlaybackStats
 pause(): void; resume(): void
 stop(): void; close(): void
 ```
+
+#### Runtime seek & frame capture
+
+`seekTo(targetMs)` works on private connections (`sharedDemux: false`): it
+seeks to the keyframe at/before the target, flushes the decoder (the
+hardware path is flushed through `OH_VideoDecoder_Flush`), re-anchors the
+pacing clock and drops pre-target frames, so playback resumes precisely at
+the target. It rejects on live/shared connections, while another seek is in
+flight, or after a 15 s timeout. `captureFrame()` resolves the next decoded
+frame as `{ width, height, data: ArrayBuffer }` (RGBA8888, native size) —
+software decode only, so open with `hw: 'never'` when snapshots are needed;
+it is safe to call while playback is running or paused.
 
 #### Hardware decoding
 
@@ -376,6 +405,41 @@ live stream drops the terminating empty display set.
 
 Pause/resume is pacing-aware: the presentation clock freezes while paused and
 resumes where it left off, instead of bursting through the backlog.
+
+### Custom I/O — `registerStreamIO` / `pushStreamIO` / `closeStreamIO`
+
+Bridge arbitrary byte sources (SMB shares, custom caches, encrypted stores)
+into the whole pipeline without touching C++: register a JS-backed source
+and address it as `"streamio:<id>"` anywhere a URL is accepted (`probe`,
+`extractFrame`, `transcode`, all three decoders).
+
+```ts
+import { registerStreamIO, pushStreamIO, closeStreamIO } from '@suplayer/ffmpeg';
+
+registerStreamIO(1, {
+  read: (seq, offset, length) => {
+    mySource.read(offset, length).then((buf: ArrayBuffer) => {
+      pushStreamIO(1, seq, buf.byteLength, buf); // byteCount 0 = EOF, < 0 = error
+    });
+  },
+  seek: (seq, offset, whence) => {   // optional; omit = non-seekable
+    // whence 0 = absolute, 2 = report total size, 3 = relative to end
+    pushStreamIO(1, seq, whence === 2 ? mySource.size : mySource.seek(offset, whence));
+  },
+  close: () => mySource.close()
+});
+
+const info = await probe('streamio:1');           // metadata over the JS bridge
+await transcode('streamio:1', { dst: 'out.mp4', vcodec: 'copy', acodec: 'aac' });
+closeStreamIO(1);                                  // release the callbacks
+```
+
+Each read delivers up to 64 KiB and must complete within 15 s via
+`pushStreamIO`, otherwise the source fails permanently (subsequent reads
+return EOF immediately). Without a `seek` callback the source is
+non-seekable — moov-at-end mp4 files will not open. A seekable source lets
+`seekTo`, `startTimeMs` and the mp4 demuxer work exactly like on a real
+file.
 
 ## Supported ABIs
 
