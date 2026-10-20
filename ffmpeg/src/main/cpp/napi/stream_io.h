@@ -27,6 +27,17 @@ bool AttachStreamIO(AVFormatContext* fmt, const std::string& url, std::string& e
 // including AVIOContexts libavformat owns). Idempotent.
 void ReleaseStreamIO(AVIOContext* pb);
 
+// fd:// sources: an OHOS app passes "fd://<n>" where <n> is a POSIX file
+// descriptor opened in this process. The descriptor stays caller-owned: the
+// kernel reads/seeks it through a custom AVIOContext but never closes it.
+bool IsFdUrl(const std::string& url);
+
+// Umbrella custom-IO attach: handles "streamio:<id>" (JS-backed source) and
+// "fd://<n>" (POSIX descriptor) URLs. Returns false with `err` set on
+// failure; returns false without touching `err` when `url` is neither
+// scheme (the caller proceeds with a plain avformat_open_input).
+bool AttachCustomIO(AVFormatContext* fmt, const std::string& url, std::string& err);
+
 // RAII: captures fmt->pb at construction and releases it on scope exit.
 // Construct AFTER AttachStreamIO; the scope must enclose both
 // avformat_open_input and avformat_close_input so failure and success paths

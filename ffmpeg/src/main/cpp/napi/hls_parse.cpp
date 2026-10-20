@@ -148,6 +148,16 @@ std::string ResolveUrl(const std::string& base, const std::string& ref)
     return UrlDirectory(base) + ref; // relative path
 }
 
+bool IsHlsPlaylistText(const std::string& text)
+{
+    if (!HasPrefix(text, "#EXTM3U")) {
+        return false;
+    }
+    return text.find("#EXT-X-STREAM-INF:") != std::string::npos ||
+        text.find("#EXT-X-TARGETDURATION:") != std::string::npos ||
+        text.find("#EXT-X-MEDIA-SEQUENCE:") != std::string::npos;
+}
+
 void ParseHlsPlaylist(const std::string& text, const std::string& baseUrl, HlsPlaylistDoc& out)
 {
     out.isMaster = false;

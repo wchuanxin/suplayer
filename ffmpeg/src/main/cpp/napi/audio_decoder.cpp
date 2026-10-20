@@ -8,6 +8,9 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libswresample/swresample.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersrc.h>
+#include <libavfilter/buffersink.h>
 #include <libavutil/opt.h>
 }
 
@@ -16,6 +19,7 @@ extern "C" {
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -47,6 +51,7 @@ struct DecoderMsg {
     uint64_t count = 0; // MSG_OVERFLOW: packets dropped in the episode
     std::string err;    // MSG_ERROR: message; MSG_DISCONTINUITY: reason
     std::string codec;
+    int64_t num = INT64_MIN; // MSG_DISCONTINUITY: effective seek target (ms)
 };
 
 // Completion handshake for seekTo(): the NAPI async work arms the request and
@@ -179,8 +184,8 @@ public:
         stop_ = false;
         AVProgram* program = nullptr;
         if (netOpts.sharedDemux) {
-            // 共享 demux 会话：一条连接服务同源的全部解码器；open/流分析/
-            // program 锁定/startTimeMs seek 均由会话统一完成
+            // 鍏变韩 demux 浼氳瘽锛氫竴鏉¤繛鎺ユ湇鍔″悓婧愮殑鍏ㄩ儴瑙ｇ爜鍣紱open/娴佸垎鏋?
+            // program 閿佸畾/startTimeMs seek 鍧囩敱浼氳瘽缁熶竴瀹屾垚
             std::string err;
             session_ = DemuxSession::GetOrCreate(src, netOpts, err);
             if (session_ == nullptr) {
@@ -196,7 +201,7 @@ public:
             fmt_ = avformat_alloc_context();
             fmt_->interrupt_callback.callback = InterruptOnStop;
             fmt_->interrupt_callback.opaque = &stop_;
-            // A2/F1: variant/latency resolution (infallible — falls back to
+            // A2/F1: variant/latency resolution (infallible 鈥?falls back to
             // the original URL) before the private open.
             const SourceResolution res = ResolveSource(src, netOpts, &InterruptOnStop, &stop_);
             NetOptions effOpts = netOpts;
@@ -205,8 +210,11 @@ public:
             }
             AVDictionary* dict = nullptr;
             ApplyOpenOptions(fmt_, &dict, effOpts);
+            if (res.isHlsPlaylist) {
+                ForceHlsInputFormat(fmt_);
+            }
             std::string ioErr;
-            if (!AttachStreamIO(fmt_, res.url, ioErr)) {
+            if (!AttachCustomIO(fmt_, res.url, ioErr)) {
                 if (!ioErr.empty()) {
                     lastError_ = ioErr;
                     avformat_free_context(fmt_);
@@ -215,7 +223,7 @@ public:
                 }
             }
             // A failed open frees the context (and the default pb) but never
-            // a custom AVIOContext — keep the pointer to release it below.
+            // a custom AVIOContext 鈥?keep the pointer to release it below.
             AVIOContext* ioPb = fmt_->pb;
             int ret = avformat_open_input(&fmt_, res.url.c_str(), nullptr, &dict);
             av_dict_free(&dict);
@@ -238,8 +246,8 @@ public:
                     return false;
                 }
             }
-            // startTimeMs 定位起播（续播/seek）：跳到目标前最近可达位置，解码循环
-            // 丢弃目标前帧实现精确起点；不可 seek（直播等）时回退从头播放
+            // startTimeMs 瀹氫綅璧锋挱锛堢画鎾?seek锛夛細璺冲埌鐩爣鍓嶆渶杩戝彲杈句綅缃紝瑙ｇ爜寰幆
+            // 涓㈠純鐩爣鍓嶅抚瀹炵幇绮剧‘璧风偣锛涗笉鍙?seek锛堢洿鎾瓑锛夋椂鍥為€€浠庡ご鎾斁
             dropBeforeMs_ = 0.0;
             if (netOpts.startTimeMs > 0) {
                 int64_t targetUs = static_cast<int64_t>(netOpts.startTimeMs) * 1000;
@@ -275,7 +283,7 @@ public:
             CloseCodec();
             return false;
         }
-        // startTimeMs 的流级 seek 已在上方私有路径 / 会话创建时完成
+        // startTimeMs 鐨勬祦绾?seek 宸插湪涓婃柟绉佹湁璺緞 / 浼氳瘽鍒涘缓鏃跺畬鎴?
         AudioTrack* initial = OpenTrackDecoder(streamIndex);
         if (initial == nullptr) {
             CloseCodec();
@@ -294,7 +302,7 @@ public:
         tracks_.push_back(initial);
         streamIndex_ = streamIndex;
         // activate every other allowed audio track for parallel receive.
-        // audioTracks:'first' skips this — only the selected track decodes
+        // audioTracks:'first' skips this 鈥?only the selected track decodes
         // (lower CPU/power); switchTrack opens the target track lazily.
         if (audioAllTracks_) {
             for (unsigned int i = 0; i < fmt_->nb_streams; ++i) {
@@ -324,8 +332,8 @@ public:
             tracks_.size(), streamIndex_, audioAllTracks_ ? "all" : "first",
             outRate_, outChannels_, static_cast<unsigned long long>(outMask_));
         if (sharedFmt_ && session_ != nullptr) {
-            // 订阅 program 内全部音频流（未锁定 program 时为全部音频流）：
-            // 未开轨的包由 Run 循环丢弃，语义与私有路径一致
+            // 璁㈤槄 program 鍐呭叏閮ㄩ煶棰戞祦锛堟湭閿佸畾 program 鏃朵负鍏ㄩ儴闊抽娴侊級锛?
+            // 鏈紑杞ㄧ殑鍖呯敱 Run 寰幆涓㈠純锛岃涔変笌绉佹湁璺緞涓€鑷?
             std::vector<int> audioStreams;
             for (unsigned int i = 0; i < fmt_->nb_streams; ++i) {
                 int si = static_cast<int>(i);
@@ -340,7 +348,7 @@ public:
             if (!audioStreams.empty()) {
                 queue_ = session_->Subscribe(audioStreams);
                 // Stats stream: the initial track (first audio stream of the
-                // program) — the one actually decoded at startup.
+                // program) 鈥?the one actually decoded at startup.
                 queue_->SetStatsStream(audioStreams[0]);
                 // Live audio: same catch-up overflow policy as video, but
                 // resume at the next packet (audio frames are independently
@@ -431,7 +439,7 @@ public:
     }
 
     // Varispeed reconfig: build the new SwrContext FIRST and only swap it in
-    // on success — a failed in-place reconfig would free t->swr and leave the
+    // on success 鈥?a failed in-place reconfig would free t->swr and leave the
     // worker crashing on a null context mid-stream.
     void ApplyRateMilli(int rateMilli)
     {
@@ -468,6 +476,143 @@ public:
         OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFAudioSW",
             "audio rate %{public}d/1000 (swr out=%{public}dHz, renderer stays %{public}dHz)",
             rateMilli, effectiveRate, outRate_);
+    }
+
+    // ---- User-level speed (atempo) ------------------------------------
+    // Pipeline: decoded frame -> track swr (FLT @ outRate_) -> abuffer ->
+    // atempo -> abuffersink -> emit. Emitted chunk pts uses a sample-counter
+    // content anchor: N output samples at speed S cover N*S/outRate_ seconds
+    // of content, independent of atempo's internal buffering and its own
+    // pts bookkeeping (WSOLA window delays chunks but the anchor stays exact).
+    bool InitSpeedFilter(double speed)
+    {
+        ResetSpeedFilter();
+        speedGraph_ = avfilter_graph_alloc();
+        if (speedGraph_ == nullptr) {
+            lastError_ = "atempo graph alloc failed";
+            return false;
+        }
+        const AVFilter* src = avfilter_get_by_name("abuffer");
+        const AVFilter* tempo = avfilter_get_by_name("atempo");
+        const AVFilter* sink = avfilter_get_by_name("abuffersink");
+        if (src == nullptr || tempo == nullptr || sink == nullptr) {
+            ResetSpeedFilter();
+            lastError_ = "atempo filters unavailable";
+            return false;
+        }
+        char args[256];
+        snprintf(args, sizeof(args),
+            "time_base=1/%d:sample_rate=%d:sample_fmt=flt:channel_layout=0x%llx",
+            outRate_, outRate_, static_cast<unsigned long long>(outMask_));
+        if (avfilter_graph_create_filter(&speedSrc_, src, "speed_src", args, nullptr, speedGraph_) < 0 ||
+            avfilter_graph_create_filter(&speedSink_, sink, "speed_sink", nullptr, nullptr, speedGraph_) < 0) {
+            ResetSpeedFilter();
+            lastError_ = "atempo graph create failed";
+            return false;
+        }
+        char tempoArgs[32];
+        snprintf(tempoArgs, sizeof(tempoArgs), "tempo=%.6f", speed);
+        AVFilterContext* tempoCtx = nullptr;
+        if (avfilter_graph_create_filter(&tempoCtx, tempo, "atempo", tempoArgs, nullptr, speedGraph_) < 0 ||
+            avfilter_link(speedSrc_, 0, tempoCtx, 0) < 0 ||
+            avfilter_link(tempoCtx, 0, speedSink_, 0) < 0 ||
+            avfilter_graph_config(speedGraph_, nullptr) < 0) {
+            ResetSpeedFilter();
+            lastError_ = "atempo graph config failed";
+            return false;
+        }
+        speedInSamples_ = 0;
+        speedAnchored_ = false;
+        return true;
+    }
+
+    void ResetSpeedFilter()
+    {
+        if (speedGraph_ != nullptr) {
+            avfilter_graph_free(&speedGraph_); // frees src/sink contexts too
+        }
+        speedSrc_ = nullptr;
+        speedSink_ = nullptr;
+        speedInSamples_ = 0;
+        speedAnchored_ = false;
+    }
+
+    // Push one swr output chunk through atempo and emit every drained chunk.
+    // The content pts of the first output sample anchors to the fed chunk's
+    // pts; afterwards the anchor advances by the sample-count rule.
+    void FeedSpeedFilter(const uint8_t* data, int samples, double ptsMs, double speed)
+    {
+        if (speedGraph_ == nullptr && !InitSpeedFilter(speed)) {
+            // atempo unavailable: degrade to pass-through rather than
+            // dropping audio
+            EmitPcm(data, static_cast<size_t>(samples) * outChannels_ * sizeof(float), ptsMs);
+            return;
+        }
+        if (!speedAnchored_) {
+            speedPtsMs_ = ptsMs;
+            speedAnchored_ = true;
+        }
+        AVFrame* in = av_frame_alloc();
+        if (in == nullptr) {
+            return;
+        }
+        in->format = AV_SAMPLE_FMT_FLT;
+        av_channel_layout_from_mask(&in->ch_layout, outMask_);
+        in->sample_rate = outRate_;
+        in->nb_samples = samples;
+        if (av_frame_get_buffer(in, 0) < 0) {
+            av_frame_free(&in);
+            EmitError("atempo input buffer alloc failed");
+            return;
+        }
+        memcpy(in->data[0], data, static_cast<size_t>(samples) * outChannels_ * sizeof(float));
+        in->pts = speedInSamples_;
+        speedInSamples_ += samples;
+        if (av_buffersrc_add_frame_flags(speedSrc_, in, AV_BUFFERSRC_FLAG_KEEP_REF) < 0) {
+            EmitError("atempo feed failed");
+        }
+        av_frame_free(&in);
+        DrainSpeedFilter(speed);
+    }
+
+    void DrainSpeedFilter(double speed)
+    {
+        AVFrame* out = av_frame_alloc();
+        if (out == nullptr) {
+            return;
+        }
+        while (true) {
+            const int ret = av_buffersink_get_frame(speedSink_, out);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                break;
+            }
+            if (ret < 0) {
+                EmitError("atempo drain failed: " + ErrToStr(ret));
+                break;
+            }
+            const int n = out->nb_samples;
+            if (n > 0) {
+                EmitPcm(out->data[0], static_cast<size_t>(n) * outChannels_ * sizeof(float), speedPtsMs_);
+                speedPtsMs_ += static_cast<double>(n) * 1000.0 * speed / static_cast<double>(outRate_);
+            }
+            av_frame_unref(out);
+        }
+        av_frame_free(&out);
+    }
+
+    // EOF flush: signal end-of-stream to atempo and drain its internal
+    // window so the tail is not lost.
+    void FlushSpeedFilter(double speed)
+    {
+        if (speedGraph_ == nullptr) {
+            return;
+        }
+        if (speedSrc_ != nullptr) {
+            if (av_buffersrc_add_frame(speedSrc_, nullptr) < 0) {
+                OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFAudioSW", "atempo eof signal failed");
+            }
+        }
+        DrainSpeedFilter(speed);
     }
 
     void FreeTrack(AudioTrack* t)
@@ -606,10 +751,12 @@ public:
         pendingSwitch_ = streamIndex;
     }
 
-    // ---- Runtime VOD seek (private connections only) --------------------
+    // ---- Runtime VOD seek (private + shared 鏂规鈶? ----------------------
     // Arms a seek; the worker applies it at the top of the decode loop
     // (avformat_seek_file -> flush all track decoders -> pacing re-anchor ->
-    // pre-target drop filter) and completes `ack`.
+    // pre-target drop filter) and completes `ack`. Shared connection: the
+    // session's demux thread applies the seek and notifies the queue; the
+    // worker re-anchors on the epoch advance (鏂规鈶?.
     bool RequestSeek(int64_t targetMs, SeekAck* ack, std::string& err)
     {
         if (!opened_ || !running_.load()) {
@@ -617,8 +764,28 @@ public:
             return false;
         }
         if (sharedFmt_) {
-            err = "seekTo requires a private connection (open with sharedDemux: false)";
-            return false;
+            // 鏂规鈶?shared-session seek: arm the session (last-write-wins).
+            // A still-pending previous shared seek is superseded: its ack
+            // resolves immediately, the new target takes over.
+            if (session_ == nullptr || queue_ == nullptr) {
+                err = "shared session is not attached";
+                return false;
+            }
+            if (!session_->RequestSharedSeek(targetMs)) {
+                err = "shared demux session is not alive";
+                return false;
+            }
+            SeekAck* superseded = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(seekMtx_);
+                superseded = seekAck_;
+                seekAck_ = ack;
+                armedSeekEpoch_ = queue_->SeekEpoch();
+            }
+            if (superseded != nullptr) {
+                FinishSeek(superseded, true, "superseded by a newer seek");
+            }
+            return true;
         }
         std::lock_guard<std::mutex> lock(seekMtx_);
         if (seekAck_ != nullptr) {
@@ -656,6 +823,22 @@ public:
         pendingRateMilli_.store(static_cast<int>(llround(rate * 1000.0)), std::memory_order_relaxed);
     }
 
+    // User-level playback speed (atempo, 0.5x-2.0x, pitch preserved).
+    // Orthogonal to SetRate micro-varispeed: actual output rate is
+    // speed x rate. Only the request is stored here; the worker rebuilds
+    // its atempo graph on the change (draining buffered samples first).
+    void SetSpeed(double speed)
+    {
+        if (speed != speed) {
+            speed = 1.0; // NaN guard
+        } else if (speed < 0.5) {
+            speed = 0.5;
+        } else if (speed > 2.0) {
+            speed = 2.0;
+        }
+        pendingSpeed_.store(speed, std::memory_order_relaxed);
+    }
+
     // A/V resync: drop the shared-queue backlog and resume at the next routed
     // packet (audio frames are independently decodable). The still-running
     // worker re-anchors its pacing on the forward pts jump (waitMs >= 1000),
@@ -669,7 +852,7 @@ public:
         EmitDiscontinuity("resync");
     }
 
-    // Leak-path zombie cleanup — same rationale as the video decoder: never
+    // Leak-path zombie cleanup 鈥?same rationale as the video decoder: never
     // join anything on the JS thread; the worker exits on its own once the
     // queue is detached, and the possible last-reference session Shutdown
     // runs on a helper thread (Run holds its own session reference).
@@ -749,6 +932,34 @@ private:
             ack->err = err;
         }
         ack->cv.notify_all();
+    }
+
+    // 鏂规鈶?worker side of the shared-session seek: returns true when the
+    // queue's seek epoch advanced since the last pass (the demux thread
+    // applied a session-wide seek and dropped our backlog). Fills the
+    // notified target / success flag and claims the pending shared seek ack
+    // when this epoch advance is the one the ack was armed against
+    // (epoch > armedSeekEpoch_). The caller re-anchors (track decoder
+    // flush, pacing, pre-target drop filter) and completes the ack.
+    bool TakeSharedSeek(int64_t& outTargetMs, SeekAck** outAck, bool& outOk)
+    {
+        *outAck = nullptr;
+        if (queue_ == nullptr) {
+            return false;
+        }
+        const uint64_t epoch = queue_->SeekEpoch();
+        if (epoch == lastSeekEpochSeen_) {
+            return false;
+        }
+        lastSeekEpochSeen_ = epoch;
+        outTargetMs = queue_->SeekTargetMs();
+        outOk = queue_->SeekSucceeded();
+        std::lock_guard<std::mutex> lock(seekMtx_);
+        if (seekAck_ != nullptr && epoch > armedSeekEpoch_) {
+            *outAck = seekAck_;
+            seekAck_ = nullptr;
+        }
+        return true;
     }
 
     void CloseCodec()
@@ -873,12 +1084,13 @@ private:
         Emit(msg);
     }
 
-    void EmitDiscontinuity(const std::string& reason)
+    void EmitDiscontinuity(const std::string& reason, int64_t seekMs = INT64_MIN)
     {
         discontinuityCount_.fetch_add(1, std::memory_order_relaxed);
         auto* msg = new DecoderMsg();
         msg->type = MSG_DISCONTINUITY;
         msg->err = reason;
+        msg->num = seekMs;
         Emit(msg);
     }
 
@@ -892,7 +1104,7 @@ private:
     // Worker-side polling of the shared queue's overflow counter (F3): the
     // demux thread never calls back into a decoder; the worker notices a new
     // overflow episode on its next loop pass and emits. Also fires while
-    // paused — a paused live consumer is exactly when the backlog overflows.
+    // paused 鈥?a paused live consumer is exactly when the backlog overflows.
     // The reconnect counter (A3) is polled the same way: the session rebuilt
     // its connection in place (fresh CDN token) and dropped our backlog.
     void PollQueueEvents()
@@ -933,7 +1145,7 @@ private:
     }
 
     // Byte counter + measured bitrate over a 5s window (D4). Worker-thread
-    // only — unlike video there is no JS-thread peek on this path.
+    // only 鈥?unlike video there is no JS-thread peek on this path.
     void AccountReadBytes(uint64_t bytes)
     {
         readBytes_.fetch_add(bytes, std::memory_order_relaxed);
@@ -979,6 +1191,39 @@ private:
         while (!stop_) {
             PollQueueEvents();
 
+            // 鏂规鈶?shared-session seek: the demux thread moved the shared
+            // connection and dropped our backlog; re-anchor every track
+            // decoder, pacing and the pre-target drop filter to the notified
+            // target and complete the pending ack. The 'seek' discontinuity
+            // makes the JS side flush its PCM write queue.
+            {
+                int64_t sharedTargetMs = 0;
+                SeekAck* sharedAck = nullptr;
+                bool sharedOk = false;
+                if (TakeSharedSeek(sharedTargetMs, &sharedAck, sharedOk)) {
+                    if (sharedOk) {
+                        for (AudioTrack* t : tracks_) {
+                            avcodec_flush_buffers(t->dec);
+                            t->eof = false;
+                        }
+                        dropBeforeMs_ = static_cast<double>(sharedTargetMs);
+                        dropGuard = 0;
+                        firstPts = AV_NOPTS_VALUE;
+                        startWall = std::chrono::steady_clock::now();
+                        eofSent = false;
+                        ResetSpeedFilter(); // atempo window holds pre-seek audio
+                        EmitDiscontinuity("seek", sharedTargetMs);
+                        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFAudioSW",
+                            "seek applied (shared) target=%{public}lldms",
+                            static_cast<long long>(sharedTargetMs));
+                        FinishSeek(sharedAck, true, "");
+                    } else if (sharedAck != nullptr) {
+                        FinishSeek(sharedAck, false, "avformat_seek_file failed on shared session");
+                    }
+                    continue;
+                }
+            }
+
             // Runtime VOD seek (private connection): flush every track
             // decoder, seek the connection to the target keyframe, re-anchor
             // pacing and re-arm the pre-target drop filter.
@@ -997,6 +1242,7 @@ private:
                         firstPts = AV_NOPTS_VALUE;
                         startWall = std::chrono::steady_clock::now();
                         eofSent = false;
+                        ResetSpeedFilter(); // atempo window holds pre-seek audio
                         OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFAudioSW",
                             "seek applied target=%{public}lldms", static_cast<long long>(seekMs));
                         FinishSeek(seekAck, true, "");
@@ -1051,6 +1297,7 @@ private:
                     streamIndex_ = sw;
                     active = t;
                     firstPts = AV_NOPTS_VALUE; // re-anchor pacing to now
+                    speedAnchored_ = false;    // re-anchor atempo content pts to the new track
                     EmitSwitched(t);
                 }
             }
@@ -1060,6 +1307,23 @@ private:
             int rq = pendingRateMilli_.load(std::memory_order_relaxed);
             if (rq != activeRateMilli_) {
                 ApplyRateMilli(rq);
+            }
+
+            // user-level speed: drain the old atempo graph (buffered samples
+            // keep the old timeline), then rebuild for the new speed; 1.0x
+            // needs no graph at all (direct pass-through)
+            if (pendingSpeed_.load(std::memory_order_relaxed) != activeSpeed_) {
+                if (speedGraph_ != nullptr) {
+                    FlushSpeedFilter(activeSpeed_);
+                    ResetSpeedFilter();
+                }
+                activeSpeed_ = pendingSpeed_.load(std::memory_order_relaxed);
+                if (activeSpeed_ != 1.0 && !InitSpeedFilter(activeSpeed_)) {
+                    activeSpeed_ = 1.0;
+                    EmitError("atempo init failed: " + lastError_ + ", falling back to 1.0x");
+                }
+                OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFAudioSW",
+                    "audio speed set to %{public}.2fx (atempo)", activeSpeed_);
             }
 
             // drain every parallel decoder; only the active track is converted and emitted
@@ -1102,7 +1366,7 @@ private:
                         }
                         // startTimeMs precise start: skip resample/emit for
                         // pre-target frames. Guard cap protects streams with
-                        // broken timestamps (all NOPTS → ptsMs 0) from
+                        // broken timestamps (all NOPTS 鈫?ptsMs 0) from
                         // dropping forever.
                         if (dropBeforeMs_ > 0.0) {
                             if (pts == AV_NOPTS_VALUE || ptsMs < dropBeforeMs_) {
@@ -1130,8 +1394,11 @@ private:
                                 firstPts = pts;
                                 startWall = std::chrono::steady_clock::now();
                             } else if (pts != AV_NOPTS_VALUE) {
+                                // speed divides the wall target: content
+                                // delta D plays in D/speed wall seconds
                                 double targetMs =
-                                    static_cast<double>(pts - firstPts) * av_q2d(stream->time_base) * 1000.0;
+                                    static_cast<double>(pts - firstPts) * av_q2d(stream->time_base) * 1000.0 /
+                                    (activeSpeed_ > 0.0 ? activeSpeed_ : 1.0);
                                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::steady_clock::now() - startWall).count();
                                 int64_t waitMs = static_cast<int64_t>(targetMs) - static_cast<int64_t>(elapsed);
@@ -1141,7 +1408,7 @@ private:
                                     // The old anchor would drop the sleep cap and
                                     // decode at full speed, flooding the JS write
                                     // queue whose drop valve discards the excess
-                                    // anyway — an audible chunk would be lost.
+                                    // anyway 鈥?an audible chunk would be lost.
                                     firstPts = pts;
                                     startWall = std::chrono::steady_clock::now();
                                 } else if (waitMs > 0) {
@@ -1151,7 +1418,13 @@ private:
                         }
                         if (outSamples > 0) {
                             decodedFrames_.fetch_add(1, std::memory_order_relaxed);
-                            EmitPcm(outBuf, static_cast<size_t>(outSamples) * outChannels_ * sizeof(float), ptsMs);
+                            if (activeSpeed_ != 1.0) {
+                                // atempo path: pitch-preserved compression with
+                                // sample-counter content-pts anchoring
+                                FeedSpeedFilter(outBuf, outSamples, ptsMs, activeSpeed_);
+                            } else {
+                                EmitPcm(outBuf, static_cast<size_t>(outSamples) * outChannels_ * sizeof(float), ptsMs);
+                            }
                         }
                     }
                     av_frame_unref(frame);
@@ -1164,6 +1437,7 @@ private:
                 break;
             }
             if (activeEof) {
+                FlushSpeedFilter(activeSpeed_); // drain atempo's tail window
                 EmitEnd();
                 break;
             }
@@ -1188,6 +1462,7 @@ private:
         }
 
         free(outBuf);
+        ResetSpeedFilter();
         av_frame_free(&frame);
         av_packet_free(&pkt);
     }
@@ -1216,14 +1491,31 @@ private:
     std::atomic<bool> stop_{ false };
     std::atomic<bool> paused_{ false };
     std::atomic<int> pendingSwitch_{ -1 };
-    // ---- Runtime seek (private connections) ----
+    // ---- Runtime seek (private + shared 鏂规鈶? ----
     std::atomic<int64_t> pendingSeekMs_{ INT64_MIN }; // INT64_MIN = none armed
     SeekAck* seekAck_ = nullptr;                     // guarded by seekMtx_
     std::mutex seekMtx_;
+    // Shared seek: queue epoch snapshot taken when the ack was armed
+    // (seekMtx_); the worker completes the ack once the queue epoch passes it.
+    uint64_t armedSeekEpoch_ = 0;
+    // Worker-only mirror of queue_->SeekEpoch() (advances past it on a
+    // session seek); 0 matches a fresh queue before any seek.
+    uint64_t lastSeekEpochSeen_ = 0;
     // varispeed request (milli-rate, 1000 = 1.0x); worker applies it by
     // reconfiguring every track swr with out rate = outRate_ * rate
     std::atomic<int> pendingRateMilli_{ 1000 };
     int activeRateMilli_ = 1000; // worker-only mirror
+    // ---- User-level speed (atempo, 0.5x-2.0x, pitch preserved) ----
+    // NAPI stores the request; the worker owns the filter graph, the input
+    // sample counter and the content-pts anchor of the output chunks
+    std::atomic<double> pendingSpeed_{ 1.0 };
+    double activeSpeed_ = 1.0; // worker-only mirror
+    AVFilterGraph* speedGraph_ = nullptr;
+    AVFilterContext* speedSrc_ = nullptr;
+    AVFilterContext* speedSink_ = nullptr;
+    double speedPtsMs_ = 0.0;    // content pts of the next atempo output sample
+    bool speedAnchored_ = false; // false: anchor at the next fed chunk
+    int64_t speedInSamples_ = 0; // input sample counter (abuffer pts, 1/rate)
     bool paced_ = false;
     // audioTracks option: decode all tracks in parallel (true) or only the
     // selected one, opening others lazily on switchTrack (false)
@@ -1395,12 +1687,17 @@ void TsfnDispatcher(napi_env env, napi_value jsCallback, void* context, void* da
                 napi_value reason = nullptr;
                 napi_create_string_utf8(env, msg->err.c_str(), NAPI_AUTO_LENGTH, &reason);
                 napi_set_named_property(env, ev, "reason", reason);
+                if (msg->num != INT64_MIN) {
+                    napi_value seekMs = nullptr;
+                    napi_create_int64(env, msg->num, &seekMs);
+                    napi_set_named_property(env, ev, "seekMs", seekMs);
+                }
                 napi_call_function(env, undefined, cb, 1, &ev, &undefined);
             }
         }
     } else if (msg->type == MSG_RECONNECTED) {
         // A3: the shared session rebuilt its connection (fresh CDN token);
-        // no payload — poll getBufferStats() for counters.
+        // no payload 鈥?poll getBufferStats() for counters.
         if (core != nullptr && core->GetReconnectedCallback() != nullptr) {
             napi_value cb = nullptr;
             napi_get_reference_value(env, core->GetReconnectedCallback(), &cb);
@@ -1421,7 +1718,7 @@ void CoreFinalize(napi_env env, void* data, void* hint)
     (void)hint;
     auto* core = static_cast<AudioDecoderCore*>(data);
     // The JS object died without close(): unsubscribe the shared demux
-    // session BEFORE the delete — a zombie queue keeps receiving routed
+    // session BEFORE the delete 鈥?a zombie queue keeps receiving routed
     // packets until the destructor runs (endless high-water drop storm, and
     // the demux thread can sit blocked on the queue's full mark while the
     // queue object is being destroyed).
@@ -1586,7 +1883,7 @@ napi_value FFAudioDecoderStart(napi_env env, napi_callback_info info)
         napi_threadsafe_function tsfn = nullptr;
         // PCM queue cap 96 (~3 s at 32 ms/packet): sub-second JS-thread
         // stalls (system GC / vsync timeouts) must not hit the native drop
-        // path — the app-side write queue valve sheds the excess on recovery.
+        // path 鈥?the app-side write queue valve sheds the excess on recovery.
         napi_create_threadsafe_function(env, nullptr, nullptr, resourceName, 96, 2,
             nullptr, nullptr, core, TsfnDispatcher, &tsfn);
         core->SetTsfn(tsfn);
@@ -1658,7 +1955,7 @@ napi_value FFAudioDecoderClose(napi_env env, napi_callback_info info)
         // Detach the shared demux subscription synchronously (queue + claim
         // released; the session reference drops on a helper thread). Waiting
         // for the GC finalizer to run CloseCodec left the subscriber count
-        // growing +N per rebuild cycle — a wedged demux session was never
+        // growing +N per rebuild cycle 鈥?a wedged demux session was never
         // released. CloseCodec in the finalizer remains as the codec-free
         // safety net.
         core->DetachDemux();
@@ -1693,6 +1990,26 @@ napi_value FFAudioDecoderSetRate(napi_env env, napi_callback_info info)
     double rate = 1.0;
     napi_get_value_double(env, args[0], &rate);
     core->SetRate(rate);
+    return nullptr;
+}
+
+napi_value FFAudioDecoderSetSpeed(napi_env env, napi_callback_info info)
+{
+    AudioDecoderCore* core = GetCore(env, info);
+    if (core == nullptr) {
+        napi_throw_error(env, nullptr, "FFAudioDecoder is not constructed");
+        return nullptr;
+    }
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) {
+        napi_throw_type_error(env, nullptr, "setSpeed(speed: number) requires a speed argument");
+        return nullptr;
+    }
+    double speed = 1.0;
+    napi_get_value_double(env, args[0], &speed);
+    core->SetSpeed(speed);
     return nullptr;
 }
 

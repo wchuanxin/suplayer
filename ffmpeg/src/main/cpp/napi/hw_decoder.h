@@ -73,10 +73,28 @@ public:
     void Stop();
 
     // Flush in place (VOD seek): the codec reclaims all outstanding input/
-    // output buffers (re-issued through the callbacks), queued outputs are
-    // discarded and the render-thread pacing anchor re-arms at the next
+    // output buffers, queued outputs are discarded, the codec is restarted
+    // (Flush leaves it in the FLUSHED state where no input buffers are
+    // re-issued) and the render-thread pacing anchor re-arms at the next
     // frame. Call SetDropBeforeUs() right after to skip pre-target output.
     void Flush();
+
+    // User-level playback speed (0.5x-2.0x): the render-thread pacing divides
+    // the pts-delta wall target by the speed. A change re-arms the pacing
+    // anchor at the next output frame so the old anchor cannot burst or stall
+    // the new speed's timeline.
+    void SetSpeed(double speed)
+    {
+        if (speed != speed) {
+            speed = 1.0; // NaN guard
+        } else if (speed < 0.5) {
+            speed = 0.5;
+        } else if (speed > 2.0) {
+            speed = 2.0;
+        }
+        speed_.store(speed, std::memory_order_relaxed);
+        speedChanged_.store(true, std::memory_order_release);
+    }
 
     const std::string& GetLastError() const { return lastError_; }
 
@@ -118,6 +136,10 @@ private:
     // Set by Flush(): the render loop re-arms its pacing anchor (first pts)
     // at the next output frame instead of bursting post-seek frames.
     std::atomic<bool> resetPacing_{ false };
+    // User-level speed request; render loop divides its wall target by it.
+    std::atomic<double> speed_{ 1.0 };
+    // Set by SetSpeed(): re-arm the pacing anchor at the next output frame.
+    std::atomic<bool> speedChanged_{ false };
     int64_t dropBeforeUs_ = 0; // read-only after Start() (set via SetDropBeforeUs)
 };
 

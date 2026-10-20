@@ -21,6 +21,10 @@ extern "C" {
 #include <unordered_set>
 #include <vector>
 
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+
 namespace ffmpeg {
 namespace {
 
@@ -385,6 +389,132 @@ StreamIOGuard::~StreamIOGuard()
 {
     ReleaseStreamIO(pb_);
     pb_ = nullptr;
+}
+
+// ---- fd:// sources (POSIX descriptor custom AVIO) --------------------------
+
+namespace {
+
+constexpr char FD_PREFIX[] = "fd://";
+
+struct FdHandle {
+    int fd = -1;
+};
+
+bool ParseFdUrl(const std::string& url, int& fd)
+{
+    const size_t prefixLen = sizeof(FD_PREFIX) - 1;
+    if (url.size() <= prefixLen || url.compare(0, prefixLen, FD_PREFIX) != 0) {
+        return false;
+    }
+    int value = 0;
+    const size_t digits = url.size() - prefixLen;
+    if (digits == 0 || digits > 10) {
+        return false;
+    }
+    for (size_t i = prefixLen; i < url.size(); ++i) {
+        const char c = url[i];
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        value = value * 10 + (c - '0');
+    }
+    if (value < 0) {
+        return false;
+    }
+    fd = value;
+    return true;
+}
+
+int FdRead(void* opaque, uint8_t* buf, int bufSize)
+{
+    auto* handle = static_cast<FdHandle*>(opaque);
+    for (;;) {
+        const ssize_t n = read(handle->fd, buf, static_cast<size_t>(bufSize));
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return AVERROR(EIO);
+        }
+        if (n == 0) {
+            return AVERROR_EOF;
+        }
+        return static_cast<int>(n);
+    }
+}
+
+// FFmpeg hands SEEK_SET/SEEK_CUR/SEEK_END straight through (identical POSIX
+// values), so lseek() accepts the whence code as-is; AVSEEK_SIZE is resolved
+// into a save/end/restore triplet so the descriptor position is untouched.
+int64_t FdSeek(void* opaque, int64_t offset, int whence)
+{
+    auto* handle = static_cast<FdHandle*>(opaque);
+    if (whence == AVSEEK_SIZE) {
+        const int64_t cur = lseek(handle->fd, 0, SEEK_CUR);
+        if (cur < 0) {
+            return AVERROR(ESPIPE);
+        }
+        const int64_t size = lseek(handle->fd, 0, SEEK_END);
+        if (size < 0 || lseek(handle->fd, cur, SEEK_SET) < 0) {
+            return AVERROR(ESPIPE);
+        }
+        return size;
+    }
+    const int64_t pos = lseek(handle->fd, offset, whence);
+    if (pos < 0) {
+        return AVERROR(errno == EINVAL ? EINVAL : ESPIPE);
+    }
+    return pos;
+}
+
+} // namespace
+
+bool IsFdUrl(const std::string& url)
+{
+    int fd = -1;
+    return ParseFdUrl(url, fd);
+}
+
+bool AttachCustomIO(AVFormatContext* fmt, const std::string& url, std::string& err)
+{
+    if (AttachStreamIO(fmt, url, err)) {
+        return true;
+    }
+    if (!err.empty()) {
+        return false;
+    }
+    int fd = -1;
+    if (!ParseFdUrl(url, fd)) {
+        return false; // neither scheme: plain avformat_open_input path
+    }
+    if (fcntl(fd, F_GETFD) == -1) {
+        err = "fd://" + std::to_string(fd) + " is not an open descriptor";
+        return false;
+    }
+    uint8_t* buffer = static_cast<uint8_t*>(av_malloc(STREAM_IO_BUFFER_SIZE));
+    if (buffer == nullptr) {
+        err = "fd source: out of memory";
+        return false;
+    }
+    auto* handle = new FdHandle();
+    handle->fd = fd;
+    AVIOContext* pb = avio_alloc_context(buffer, STREAM_IO_BUFFER_SIZE, 0, handle, FdRead, nullptr, FdSeek);
+    if (pb == nullptr) {
+        av_free(buffer);
+        delete handle;
+        err = "fd source: avio_alloc_context failed";
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_streamIoMtx);
+        g_liveAvios.insert(pb);
+    }
+    fmt->pb = pb;
+    fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFStreamIO",
+        "attached fd source fd=%{public}d", fd);
+    return true;
 }
 
 // ---- NAPI surface -------------------------------------------------------

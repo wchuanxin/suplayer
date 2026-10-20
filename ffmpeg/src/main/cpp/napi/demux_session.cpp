@@ -14,7 +14,7 @@ namespace {
 
 // Live read-stall watchdog: a live connection that has not delivered a
 // single packet for this long is dead (server closed silently / network
-// black hole) — av_read_frame would block forever because the interrupt
+// black hole) 鈥?av_read_frame would block forever because the interrupt
 // callback only aborts on stopping_. Fire the interrupt so the read fails,
 // the demux thread exits (demuxAlive_ -> false) and the next open builds a
 // fresh session; the app's recovery machinery can then actually recover.
@@ -26,12 +26,22 @@ constexpr int64_t LIVE_READ_STALL_MS = 30000;
 // Live throughput (slow-starve) watchdog: a server-throttled connection
 // trickles packets (the 30s no-packet watchdog never fires) while playback
 // crawls at a fraction of realtime. Judge by the video stream's media-time
-// progress per wall-clock window — immune to prestart bursts (ratio >> 1) and
+// progress per wall-clock window 鈥?immune to prestart bursts (ratio >> 1) and
 // to pts jumps (per-packet duration, not pts deltas).
 constexpr int64_t LIVE_STARVE_WINDOW_MS = 10000;
 constexpr double LIVE_STARVE_RATIO = 0.15;   // < 15% of realtime = starving
 constexpr double LIVE_STARVE_HEALTHY = 0.5;  // >= 50% of realtime = healthy
 constexpr int64_t LIVE_STARVE_MS = 15000;    // sustained starve before abort
+
+// Fast-landing threshold for shared seeks (鏂规鈶?: the seek positions the
+// demuxer at the keyframe <= target. When that keyframe is further back than
+// this, decoding the whole pre-target intra-GOP span would stall the landing
+// for many seconds (hw decode is a few times realtime at best), so the
+// consumers re-anchor on the keyframe itself (MX-Player-style fast seek) 鈥?
+// the effective target is published through NotifySeek and carried in the
+// 'seek' discontinuity event. Smaller gaps keep exact landing: waiting out
+// the decode costs less than the position error of landing early.
+constexpr int64_t FAST_SEEK_GAP_MS = 12000;
 
 std::mutex& RegistryMutex()
 {
@@ -127,7 +137,7 @@ std::shared_ptr<DemuxSession> DemuxSession::GetOrCreate(const std::string& src, 
     // openers stay parallel (startup latency) and the loser simply attaches.
     auto fresh = std::shared_ptr<DemuxSession>(new DemuxSession());
     if (!fresh->Init(src, opts, err)) {
-        // The parallel fresh open failed — e.g. the server enforces a single
+        // The parallel fresh open failed 鈥?e.g. the server enforces a single
         // playlist connection per token/uid and closed ours while the
         // concurrent winner stayed connected. By now that winner is usually
         // already registered: attach to it instead of failing the whole
@@ -192,10 +202,13 @@ bool DemuxSession::Init(const std::string& src, const NetOptions& opts, std::str
     fmt_ = avformat_alloc_context();
     fmt_->interrupt_callback.callback = &DemuxSession::InterruptCb;
     fmt_->interrupt_callback.opaque = this;
+    if (res.isHlsPlaylist) {
+        ForceHlsInputFormat(fmt_);
+    }
     AVDictionary* dict = nullptr;
     ApplyOpenOptions(fmt_, &dict, effOpts);
     std::string ioErr;
-    if (!AttachStreamIO(fmt_, res.url, ioErr)) {
+    if (!AttachCustomIO(fmt_, res.url, ioErr)) {
         if (!ioErr.empty()) {
             err = ioErr;
             avformat_free_context(fmt_);
@@ -278,12 +291,91 @@ std::vector<std::shared_ptr<PacketQueue>> DemuxSession::SnapshotSubscribers()
     return subs;
 }
 
+bool DemuxSession::RequestSharedSeek(int64_t targetMs)
+{
+    if (stopping_.load(std::memory_order_relaxed) ||
+        !demuxAlive_.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    pendingSharedSeekMs_.store(targetMs, std::memory_order_release);
+    return true;
+}
+
+AVStream* DemuxSession::FindSeekVideoStream() const
+{
+    if (fmt_ == nullptr) {
+        return nullptr;
+    }
+    if (program_ != nullptr) {
+        for (unsigned i = 0; i < program_->nb_stream_indexes; ++i) {
+            const unsigned si = program_->stream_index[i];
+            if (si < fmt_->nb_streams &&
+                fmt_->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                return fmt_->streams[si];
+            }
+        }
+        return nullptr;
+    }
+    for (unsigned i = 0; i < fmt_->nb_streams; ++i) {
+        if (fmt_->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            return fmt_->streams[i];
+        }
+    }
+    return nullptr;
+}
+
 void DemuxSession::DemuxLoop()
 {
     OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFDemux", "demux thread started");
     AVPacket* pkt = av_packet_alloc();
     int reconnectAttempts = 0;
     while (!stopping_.load(std::memory_order_relaxed)) {
+        // 鏂规鈶?shared-session seek: apply at the loop top (this thread is
+        // the sole fmt_ owner). Last-write-wins; subscribers re-anchor via
+        // NotifySeek and complete their pending seek acks on the epoch
+        // advance. A failed seek leaves the demux position unchanged 鈥?
+        // queues are still notified (ok=false) so armed acks fail fast
+        // instead of timing out.
+        const int64_t sharedSeekMs =
+            pendingSharedSeekMs_.exchange(INT64_MIN, std::memory_order_acquire);
+        if (sharedSeekMs != INT64_MIN) {
+            const int sret = avformat_seek_file(fmt_, -1, INT64_MIN, sharedSeekMs * 1000, INT64_MAX, 0);
+            const bool ok = sret >= 0;
+            // Fast-landing: shrink the re-anchor target to the keyframe the
+            // seek actually landed on when the pre-target gap is huge (see
+            // FAST_SEEK_GAP_MS). Same index search the demuxer uses for the
+            // backward seek itself, so the entry always matches the real
+            // landing point; no match keeps the exact target.
+            int64_t effectiveMs = sharedSeekMs;
+            AVStream* vst = ok ? FindSeekVideoStream() : nullptr;
+            if (vst != nullptr) {
+                const int64_t targetTs =
+                    av_rescale_q(sharedSeekMs, av_make_q(1, 1000), vst->time_base);
+                const int keyIdx = av_index_search_timestamp(vst, targetTs, AVSEEK_FLAG_BACKWARD);
+                if (keyIdx >= 0) {
+                    const AVIndexEntry* entry = avformat_index_get_entry(vst, keyIdx);
+                    if (entry != nullptr) {
+                        const int64_t keyMs = av_rescale_q(entry->timestamp, vst->time_base, av_make_q(1, 1000));
+                        if (sharedSeekMs - keyMs > FAST_SEEK_GAP_MS) {
+                            effectiveMs = keyMs;
+                        }
+                    }
+                }
+            }
+            if (ok) {
+                OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFDemux",
+                    "shared seek applied: target=%{public}lldms effective=%{public}lldms",
+                    static_cast<long long>(sharedSeekMs), static_cast<long long>(effectiveMs));
+            } else {
+                OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFDemux",
+                    "shared seek to %{public}lldms failed (ret=%{public}d)",
+                    static_cast<long long>(sharedSeekMs), sret);
+            }
+            auto subs = SnapshotSubscribers();
+            for (auto& q : subs) {
+                q->NotifySeek(effectiveMs, ok);
+            }
+        }
         int ret = av_read_frame(fmt_, pkt);
         if (ret < 0) {
             // A3/A4: token expiry (401/403), sliding-window misses (404) and
@@ -306,7 +398,7 @@ void DemuxSession::DemuxLoop()
         reconnectAttempts = 0; // a delivered packet proves the link works
         auto subs = SnapshotSubscribers();
         // Media duration of this packet (ms) for subscriber buffer-depth
-        // stats (BufferedAheadMs); 0 when unknown (no duration) — the stat
+        // stats (BufferedAheadMs); 0 when unknown (no duration) 鈥?the stat
         // then undercounts but never overcounts.
         int64_t durationMs = 0;
         if (pkt->duration > 0 && pkt->stream_index >= 0 &&
@@ -334,6 +426,25 @@ void DemuxSession::DemuxLoop()
     }
     av_packet_free(&pkt);
     demuxAlive_.store(false, std::memory_order_relaxed);
+    // Bounded-join exit handoff (see DEMUX_JOIN_TIMEOUT_MS): publish the exit
+    // and, when Shutdown already gave up on the join (orphan), take over the
+    // fmt_ close it skipped. exitMtx_ serializes the decision with Shutdown:
+    // exactly one side closes fmt_.
+    {
+        bool selfClose = false;
+        {
+            std::lock_guard<std::mutex> lock(exitMtx_);
+            demuxExited_.store(true, std::memory_order_release);
+            selfClose = orphanClose_.load(std::memory_order_acquire);
+        }
+        if (selfClose && fmt_ != nullptr) {
+            AVIOContext* ioPb = fmt_->pb;
+            avformat_close_input(&fmt_);
+            ReleaseStreamIO(ioPb);
+            OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFDemux",
+                "orphaned demux thread closed the context after late exit");
+        }
+    }
     OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFDemux", "demux thread exited");
 }
 
@@ -380,10 +491,13 @@ bool DemuxSession::Rebuild(std::string& err)
     fmt_ = avformat_alloc_context();
     fmt_->interrupt_callback.callback = &DemuxSession::InterruptCb;
     fmt_->interrupt_callback.opaque = this;
+    if (res.isHlsPlaylist) {
+        ForceHlsInputFormat(fmt_);
+    }
     AVDictionary* dict = nullptr;
     ApplyOpenOptions(fmt_, &dict, effOpts);
     std::string ioErr;
-    if (!AttachStreamIO(fmt_, res.url, ioErr)) {
+    if (!AttachCustomIO(fmt_, res.url, ioErr)) {
         if (!ioErr.empty()) {
             err = ioErr;
             avformat_free_context(fmt_);
@@ -418,7 +532,7 @@ bool DemuxSession::Rebuild(std::string& err)
         }
     }
     // Subscribers subscribe by stream index: a layout change would silently
-    // mis-route packets into wrong decoders. Abort the recovery instead —
+    // mis-route packets into wrong decoders. Abort the recovery instead 鈥?
     // the EOF path lets the app rebuild its pipeline around the new layout.
     std::vector<int> codecs;
     SnapshotStreamLayout(codecs);
@@ -569,7 +683,7 @@ void DemuxSession::TrackStarveWatchdog(const AVPacket* pkt)
     starveWindowVideoPkts_ = 0;
     starveWindowStartMs_ = NowSteadyMs();
     // Progress unmeasurable (no duration, no usable pts deltas): judge by
-    // packet presence instead — packets flowed, so the demux is not starved.
+    // packet presence instead 鈥?packets flowed, so the demux is not starved.
     if (windowProgress <= 0.0 && windowPkts > 0) {
         starveLowSinceMs_ = 0;
         return;
@@ -661,9 +775,29 @@ void DemuxSession::Shutdown()
         claims_ = 0;
     }
     if (demuxThread_.joinable()) {
-        demuxThread_.join();
+        // Bounded join: a live read can legitimately sit in av_read_frame for
+        // up to LIVE_READ_STALL_MS (30 s) before the stall watchdog aborts
+        // it. Blocking the NAPI caller (JS main thread) that long recreates
+        // the teardown-interlock appfreeze (THREAD_BLOCK_6S). Wait a short
+        // bounded window; past it detach the thread and let its own
+        // watchdogs end it — the orphan exit path closes fmt_ itself.
+        const int64_t deadline = NowSteadyMs() + DEMUX_JOIN_TIMEOUT_MS;
+        while (!demuxExited_.load(std::memory_order_acquire) &&
+            NowSteadyMs() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::lock_guard<std::mutex> lock(exitMtx_);
+        if (demuxExited_.load(std::memory_order_acquire)) {
+            demuxThread_.join();
+        } else {
+            orphanClose_.store(true, std::memory_order_release);
+            demuxThread_.detach();
+            OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFDemux",
+                "demux thread stuck past %{public}dms join budget, detached (orphan close)",
+                DEMUX_JOIN_TIMEOUT_MS);
+        }
     }
-    if (fmt_ != nullptr) {
+    if (fmt_ != nullptr && !orphanClose_.load(std::memory_order_acquire)) {
         AVIOContext* ioPb = fmt_->pb;
         avformat_close_input(&fmt_);
         ReleaseStreamIO(ioPb);

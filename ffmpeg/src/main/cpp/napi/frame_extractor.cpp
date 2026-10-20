@@ -46,7 +46,7 @@ void ExtractExecute(napi_env env, void* data)
     int ret = 0;
 
     std::string ioErr;
-    if (!AttachStreamIO(fmt, ctx->src, ioErr)) {
+    if (!AttachCustomIO(fmt, ctx->src, ioErr)) {
         if (!ioErr.empty()) {
             ctx->error = ioErr;
             goto cleanup;

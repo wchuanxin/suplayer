@@ -12,3 +12,4 @@
 /.appanalyzer
 /.cache
 /build-profile.local.json5
+/*.har

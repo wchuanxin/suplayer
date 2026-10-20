@@ -273,9 +273,14 @@ export interface FFOverflowEvent {
 
 /** Stream discontinuity: 'resync' = explicit backlog resync
  *  (flushToKeyframe / flushBacklog), 'reconnect' = the shared demux session
- *  rebuilt its connection in place (see the 'reconnected' event). */
+ *  rebuilt its connection in place (see the 'reconnected' event),
+ *  'seek' = in-pipeline seek re-anchor (effective landing target in ms —
+ *  may precede the requested target when the pre-target keyframe gap is
+ *  too large to decode through, see the kernel fast-landing path). */
 export interface FFDiscontinuityEvent {
   reason: string;
+  /** reason === 'seek' only: effective re-anchor target (ms, stream pts domain) */
+  seekMs?: number;
 }
 
 /** Network/queue health of a decoder fed by the shared demux session.
@@ -386,14 +391,25 @@ export class FFAudioDecoder {
    *  consume each packet 2% faster with no discontinuity. Applied on the
    *  worker thread before the next decoded frame. */
   setRate(rate: number): void;
+  /** User-level playback speed (clamped to [0.5, 2.0], pitch preserved via
+   *  the FFmpeg atempo filter inserted after the resampler). Emitted PCM
+   *  chunk pts stays on the content timeline: N output samples at speed S
+   *  cover N*S/sampleRate seconds of content. Orthogonal to setRate — the
+   *  effective output rate is speed × rate. Applied on the worker thread;
+   *  a change drains and rebuilds the atempo graph (seek also resets it). */
+  setSpeed(speed: number): void;
   /** Network/queue health of the shared demux subscription (see FFBufferStats). */
   getBufferStats(): FFBufferStats;
   /** Decode-side playback statistics (see FFPlaybackStats). */
   getStats(): FFPlaybackStats;
-  /** Runtime VOD seek on a private connection (open with sharedDemux: false):
-   *  seeks to the keyframe at/before the target, flushes the decoder and
-   *  re-anchors pacing; frames before the target are dropped. Rejects on
-   *  live/shared connections, when another seek is in flight, or after a
+  /** Runtime VOD seek on any connection. Private connection: seeks the
+   *  connection to the keyframe at/before the target, flushes the decoder
+   *  and re-anchors pacing; frames before the target are dropped. Shared
+   *  connection (方案⑤): the shared demux session applies the seek
+   *  session-wide and notifies every subscriber; this decoder re-anchors
+   *  (decoder flush + pacing + pre-target drop) on the notify. A
+   *  still-pending shared seek is superseded by a newer one (last-write
+   *  wins). Rejects when the decoder/session is not running or after a
    *  15 s timeout. */
   seekTo(targetMs: number): Promise<void>;
 }
@@ -418,6 +434,12 @@ export class FFVideoDecoder {
   /** Live A/V resync: drop the shared-queue backlog and resume at the newest
    *  queued keyframe (≈ live edge). No-op on a private (non-shared) connection. */
   flushToKeyframe(): void;
+  /** User-level playback speed (clamped to [0.5, 2.0]): the render pacing
+   *  divides its pts-delta wall target by the speed, so content delta D is
+   *  displayed in D/speed wall seconds. Frame pts events stay on the content
+   *  timeline. A change re-anchors the pacing at the next frame (both the
+   *  hardware render thread and the software path). */
+  setSpeed(speed: number): void;
   /** Leak-path cleanup: unsubscribe from the shared demux session without
    *  stopping the decoder (no thread joins). The still-running worker exits
    *  on its own once the queue is detached. */
@@ -426,11 +448,15 @@ export class FFVideoDecoder {
   getBufferStats(): FFBufferStats;
   /** Decode-side playback statistics (see FFPlaybackStats). */
   getStats(): FFPlaybackStats;
-  /** Runtime VOD seek on a private connection (open with sharedDemux: false):
-   *  seeks to the keyframe at/before the target, flushes the decoder and
-   *  re-anchors pacing; frames before the target are dropped. Hardware
-   *  decoding is flushed the same way. Rejects on live/shared connections,
-   *  when another seek is in flight, or after a 15 s timeout. */
+  /** Runtime VOD seek on any connection. Private connection: seeks to the
+   *  keyframe at/before the target, flushes the decoder and re-anchors
+   *  pacing; frames before the target are dropped. Hardware decoding is
+   *  flushed the same way. Shared connection (方案⑤): the shared demux
+   *  session applies the seek session-wide; this decoder flushes the
+   *  hardware decoder, re-arms the pre-target drop filter and completes on
+   *  the session notify. A still-pending shared seek is superseded by a
+   *  newer one (last-write wins). Rejects when the decoder/session is not
+   *  running or after a 15 s timeout. */
   seekTo(targetMs: number): Promise<void>;
   /** Capture the next decoded frame as RGBA8888 at native resolution.
    *  Software decode only — rejects on a hardware-decode connection
@@ -458,6 +484,10 @@ export class FFSubtitleDecoder {
     /** Enables raw PES pump mode: skip avcodec decoding and forward subtitle
      *  packets as-is (see the 'pes' event). Call before start(). */
     setRawPump(enable: boolean): void;
+    /** User-level playback speed (clamped to [0.5, 2.0]): paced-mode pacing
+     *  divides its pts-delta wall target by the speed, keeping subtitles in
+     *  lockstep with the audio/video pacing. */
+    setSpeed(speed: number): void;
   /** paced = true (default) displays each display set at its presentation time */
   start(paced?: boolean): void;
   pause(): void;

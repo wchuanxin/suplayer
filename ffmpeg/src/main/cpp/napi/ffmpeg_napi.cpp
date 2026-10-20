@@ -54,6 +54,7 @@ static napi_value Init(napi_env env, napi_value exports)
         { "close", nullptr, ffmpeg::FFAudioDecoderClose, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "flushBacklog", nullptr, ffmpeg::FFAudioDecoderFlushBacklog, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setRate", nullptr, ffmpeg::FFAudioDecoderSetRate, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setSpeed", nullptr, ffmpeg::FFAudioDecoderSetSpeed, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "detach", nullptr, ffmpeg::FFAudioDecoderDetach, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getBufferStats", nullptr, ffmpeg::FFAudioDecoderGetBufferStats, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getStats", nullptr, ffmpeg::FFAudioDecoderGetStats, nullptr, nullptr, nullptr, napi_default, nullptr },
@@ -73,6 +74,7 @@ static napi_value Init(napi_env env, napi_value exports)
         { "stop", nullptr, ffmpeg::FFVideoDecoderStop, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "close", nullptr, ffmpeg::FFVideoDecoderClose, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "flushToKeyframe", nullptr, ffmpeg::FFVideoDecoderFlushToKeyframe, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setSpeed", nullptr, ffmpeg::FFVideoDecoderSetSpeed, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "detach", nullptr, ffmpeg::FFVideoDecoderDetach, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getBufferStats", nullptr, ffmpeg::FFVideoDecoderGetBufferStats, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getStats", nullptr, ffmpeg::FFVideoDecoderGetStats, nullptr, nullptr, nullptr, napi_default, nullptr },
@@ -94,6 +96,7 @@ static napi_value Init(napi_env env, napi_value exports)
         { "close", nullptr, ffmpeg::FFSubtitleDecoderClose, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "detach", nullptr, ffmpeg::FFSubtitleDecoderDetach, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setRawPump", nullptr, ffmpeg::FFSubtitleDecoderSetRawPump, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setSpeed", nullptr, ffmpeg::FFSubtitleDecoderSetSpeed, nullptr, nullptr, nullptr, napi_default, nullptr },
     };
     napi_value scls = nullptr;
     napi_define_class(env, "FFSubtitleDecoder", NAPI_AUTO_LENGTH, ffmpeg::FFSubtitleDecoderConstructor,

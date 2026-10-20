@@ -180,9 +180,9 @@ public:
         stop_ = false;
         AVProgram* program = nullptr;
         if (netOpts.sharedDemux) {
-            // 共享 demux 会话：一条连接服务同源的全部解码器；open/流分析/
-            // program 锁定均由会话统一完成（字幕不参与 startTimeMs seek，
-            // 应用层以当前播放位置起拉二级会话）
+            // 鍏变韩 demux 浼氳瘽锛氫竴鏉¤繛鎺ユ湇鍔″悓婧愮殑鍏ㄩ儴瑙ｇ爜鍣紱open/娴佸垎鏋?
+            // program 閿佸畾鍧囩敱浼氳瘽缁熶竴瀹屾垚锛堝瓧骞曚笉鍙備笌 startTimeMs seek锛?
+            // 搴旂敤灞備互褰撳墠鎾斁浣嶇疆璧锋媺浜岀骇浼氳瘽锛?
             std::string err;
             session_ = DemuxSession::GetOrCreate(src, netOpts, err);
             if (session_ == nullptr) {
@@ -197,7 +197,7 @@ public:
             fmt_ = avformat_alloc_context();
             fmt_->interrupt_callback.callback = InterruptOnStop;
             fmt_->interrupt_callback.opaque = &stop_;
-            // A2/F1: variant/latency resolution (infallible — falls back to
+            // A2/F1: variant/latency resolution (infallible 鈥?falls back to
             // the original URL) before the private open.
             const SourceResolution res = ResolveSource(src, netOpts, &InterruptOnStop, &stop_);
             NetOptions effOpts = netOpts;
@@ -206,8 +206,11 @@ public:
             }
             AVDictionary* dict = nullptr;
             ApplyOpenOptions(fmt_, &dict, effOpts);
+            if (res.isHlsPlaylist) {
+                ForceHlsInputFormat(fmt_);
+            }
             std::string ioErr;
-            if (!AttachStreamIO(fmt_, res.url, ioErr)) {
+            if (!AttachCustomIO(fmt_, res.url, ioErr)) {
                 if (!ioErr.empty()) {
                     lastError_ = ioErr;
                     avformat_free_context(fmt_);
@@ -216,7 +219,7 @@ public:
                 }
             }
             // A failed open frees the context (and the default pb) but never
-            // a custom AVIOContext — keep the pointer to release it below.
+            // a custom AVIOContext 鈥?keep the pointer to release it below.
             AVIOContext* ioPb = fmt_->pb;
             int ret = avformat_open_input(&fmt_, res.url.c_str(), nullptr, &dict);
             av_dict_free(&dict);
@@ -277,6 +280,11 @@ public:
         }
         dec_ = avcodec_alloc_context3(codec);
         avcodec_parameters_to_context(dec_, stream->codecpar);
+        // avcodec_decode_subtitle2 依赖 pkt_timebase 换算 sub.pts（容器 pts → AV_TIME_BASE）
+        // 并在 cue 文本缺时序头（SRT 无 "-->" 行，时序仅在容器 Block）时回填
+        // end_display_time = pkt->duration：缺失时 pts/duration 恒 0，上层无法按
+        // cue 到期清屏（无对白时旧字幕常驻）。
+        dec_->pkt_timebase = stream->time_base;
         int openRet = avcodec_open2(dec_, codec, nullptr);
         if (openRet < 0) {
             lastError_ = "avcodec_open2 failed: " + ErrToStr(openRet);
@@ -307,7 +315,7 @@ public:
             // Live catch-up overflow policy, same as audio: a subtitle queue
             // that never pops (no track selected by the app) must not
             // backpressure the shared demux read into a permanent wedge once
-            // the pre-start cap fills — the demux thread would block forever
+            // the pre-start cap fills 鈥?the demux thread would block forever
             // in Route() and starve every other subscriber of the session.
             BackpressurePolicy policy;
             policy.liveDrop = netOpts.live;
@@ -374,12 +382,27 @@ public:
     {
         paused_ = false;
     }
+
+    // User-level playback speed (0.5x-2.0x): the paced-mode subtitle pacing
+    // divides its pts-delta wall target by the speed, keeping subtitles in
+    // lockstep with the (equally scaled) audio/video pacing.
+    void SetSpeed(double speed)
+    {
+        if (speed != speed) {
+            speed = 1.0; // NaN guard
+        } else if (speed < 0.5) {
+            speed = 0.5;
+        } else if (speed > 2.0) {
+            speed = 2.0;
+        }
+        speed_.store(speed, std::memory_order_relaxed);
+    }
     void Stop()
     {
         StopInternal();
     }
 
-    // Leak-path zombie cleanup — same rationale as the video decoder: never
+    // Leak-path zombie cleanup 鈥?same rationale as the video decoder: never
     // join anything on the JS thread; the worker exits on its own once the
     // queue is detached, and the possible last-reference session Shutdown
     // runs on a helper thread (Run holds its own session reference).
@@ -527,7 +550,7 @@ private:
     }
 
     // Raw PES passthrough (DVB pump mode): forward the demuxed subtitle packet
-    // (PES payload from data_identifier) untouched — the JS DVB chain
+    // (PES payload from data_identifier) untouched 鈥?the JS DVB chain
     // assembles display sets itself. This lets the JS subtitle pipeline reuse
     // the bytes the shared demux already downloaded instead of issuing a
     // second concurrent segment download (which the server throttles).
@@ -778,7 +801,7 @@ private:
     // Worker-side polling of the shared queue's overflow counter (F3): the
     // demux thread never calls back into a decoder; the worker notices a new
     // overflow episode on its next loop pass and emits. Also fires while
-    // paused — a paused (or never-started) subtitle consumer is exactly when
+    // paused 鈥?a paused (or never-started) subtitle consumer is exactly when
     // the backlog overflows. A reconnect (A3) surfaces as a plain
     // discontinuity('reconnect'): the subtitle core carries no stats and no
     // dedicated reconnected event.
@@ -863,8 +886,12 @@ private:
                             firstPts = sub.pts;
                             startWall = std::chrono::steady_clock::now();
                         } else {
+                            // speed divides the wall target (content delta D
+                            // is due in D/speed wall seconds)
+                            const double spd = speed_.load(std::memory_order_relaxed);
                             double targetMs =
-                                static_cast<double>(sub.pts - firstPts) / (AV_TIME_BASE / 1000.0);
+                                static_cast<double>(sub.pts - firstPts) / (AV_TIME_BASE / 1000.0) /
+                                (spd > 0.0 ? spd : 1.0);
                             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - startWall).count();
                             int64_t waitMs = static_cast<int64_t>(targetMs) - static_cast<int64_t>(elapsed);
@@ -901,6 +928,8 @@ private:
     bool paced_ = true;
     // raw PES pump mode (see SetRawPump)
     bool raw_ = false;
+    // User-level speed (0.5x-2.0x): paced-mode subtitle pacing divides by it
+    std::atomic<double> speed_{ 1.0 };
     std::string lastError_;
 
     std::thread worker_;
@@ -1111,7 +1140,7 @@ void CoreFinalize(napi_env env, void* data, void* hint)
     (void)hint;
     auto* core = static_cast<SubtitleDecoderCore*>(data);
     // The JS object died without close(): unsubscribe the shared demux
-    // session BEFORE the delete — a zombie queue keeps receiving routed
+    // session BEFORE the delete 鈥?a zombie queue keeps receiving routed
     // packets until the destructor runs (endless high-water drop storm, and
     // the demux thread can sit blocked on the queue's full mark while the
     // queue object is being destroyed).
@@ -1310,7 +1339,7 @@ napi_value FFSubtitleDecoderClose(napi_env env, napi_callback_info info)
         // Detach the shared demux subscription synchronously (queue + claim
         // released; the session reference drops on a helper thread). Waiting
         // for the GC finalizer to run CloseCodec left the subscriber count
-        // growing +N per rebuild cycle — a wedged demux session was never
+        // growing +N per rebuild cycle 鈥?a wedged demux session was never
         // released. CloseCodec in the finalizer remains as the codec-free
         // safety net.
         core->DetachDemux();
@@ -1343,6 +1372,26 @@ napi_value FFSubtitleDecoderSetRawPump(napi_env env, napi_callback_info info)
         napi_get_value_bool(env, args[0], &raw);
     }
     core->SetRawPump(raw);
+    return nullptr;
+}
+
+napi_value FFSubtitleDecoderSetSpeed(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    SubtitleDecoderCore* core = GetCore(env, info);
+    if (core == nullptr) {
+        napi_throw_error(env, nullptr, "FFSubtitleDecoder is not constructed");
+        return nullptr;
+    }
+    if (argc < 1) {
+        napi_throw_type_error(env, nullptr, "setSpeed(speed: number) requires a speed argument");
+        return nullptr;
+    }
+    double speed = 1.0;
+    napi_get_value_double(env, args[0], &speed);
+    core->SetSpeed(speed);
     return nullptr;
 }
 

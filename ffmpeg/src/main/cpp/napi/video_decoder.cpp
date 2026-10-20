@@ -49,6 +49,7 @@ struct DecoderMsg {
     uint64_t count = 0; // MSG_OVERFLOW: packets dropped in the episode
     std::string err;    // MSG_ERROR: message; MSG_DISCONTINUITY: reason
     std::string backend;
+    int64_t num = INT64_MIN; // MSG_DISCONTINUITY: effective seek target (ms)
 };
 
 // Completion handshake for seekTo()/captureFrame(): the NAPI async work arms
@@ -214,6 +215,25 @@ int MapWindowGamut(int primaries, int trc)
     return NATIVEBUFFER_COLOR_GAMUT_BT2020;
 }
 
+// SDR YUV surface gamut (#2 NV12 direct-write): declares the YUV鈫扲GB matrix
+// the compositor must assume for semi-planar buffers. HD+ defaults to BT.709,
+// SD to BT.601 when the stream leaves the primaries unspecified.
+int MapSdrGamut(int primaries, int height)
+{
+    switch (primaries) {
+        case AVCOL_PRI_BT470BG:
+        case AVCOL_PRI_BT470M:
+        case AVCOL_PRI_SMPTE170M:
+        case AVCOL_PRI_SMPTE240M:
+            return NATIVEBUFFER_COLOR_GAMUT_STANDARD_BT601;
+        case AVCOL_PRI_BT709:
+            return NATIVEBUFFER_COLOR_GAMUT_STANDARD_BT709;
+        default:
+            return height > 0 && height <= 576 ? NATIVEBUFFER_COLOR_GAMUT_STANDARD_BT601
+                                               : NATIVEBUFFER_COLOR_GAMUT_STANDARD_BT709;
+    }
+}
+
 class VideoDecoderCore {
 public:
     VideoDecoderCore() = default;
@@ -325,9 +345,9 @@ public:
         stop_ = false;
         AVProgram* program = nullptr;
         if (netOpts.sharedDemux) {
-            // 共享 demux 会话：一条连接服务同源的视频/音频/字幕解码器。
-            // open/流分析/program 锁定/startTimeMs seek 均由会话统一完成，
-            // 本解码器仅附加订阅并保留自己的目标前丢帧过滤。
+            // 鍏变韩 demux 浼氳瘽锛氫竴鏉¤繛鎺ユ湇鍔″悓婧愮殑瑙嗛/闊抽/瀛楀箷瑙ｇ爜鍣ㄣ€?
+            // open/娴佸垎鏋?program 閿佸畾/startTimeMs seek 鍧囩敱浼氳瘽缁熶竴瀹屾垚锛?
+            // 鏈В鐮佸櫒浠呴檮鍔犺闃呭苟淇濈暀鑷繁鐨勭洰鏍囧墠涓㈠抚杩囨护銆?
             std::string err;
             session_ = DemuxSession::GetOrCreate(src, netOpts, err);
             if (session_ == nullptr) {
@@ -343,7 +363,7 @@ public:
             fmt_ = avformat_alloc_context();
             fmt_->interrupt_callback.callback = &VideoDecoderCore::InterruptGuard;
             fmt_->interrupt_callback.opaque = this;
-            // A2/F1: variant/latency resolution (infallible — falls back to
+            // A2/F1: variant/latency resolution (infallible 鈥?falls back to
             // the original URL) before the private open.
             const SourceResolution res = ResolveSource(src, netOpts,
                 &VideoDecoderCore::InterruptGuard, this);
@@ -353,8 +373,11 @@ public:
             }
             AVDictionary* dict = nullptr;
             ApplyOpenOptions(fmt_, &dict, effOpts);
+            if (res.isHlsPlaylist) {
+                ForceHlsInputFormat(fmt_);
+            }
             std::string ioErr;
-            if (!AttachStreamIO(fmt_, res.url, ioErr)) {
+            if (!AttachCustomIO(fmt_, res.url, ioErr)) {
                 if (!ioErr.empty()) {
                     lastError_ = ioErr;
                     avformat_free_context(fmt_);
@@ -363,7 +386,7 @@ public:
                 }
             }
             // A failed open frees the context (and the default pb) but never
-            // a custom AVIOContext — keep the pointer to release it below.
+            // a custom AVIOContext 鈥?keep the pointer to release it below.
             AVIOContext* ioPb = fmt_->pb;
             int ret = avformat_open_input(&fmt_, res.url.c_str(), nullptr, &dict);
             av_dict_free(&dict);
@@ -386,8 +409,8 @@ public:
                     return false;
                 }
             }
-            // startTimeMs 定位起播（续播/seek）：跳到目标前最近关键帧，解码后的
-            // 目标前帧在渲染循环丢弃，实现精确起点；不可 seek（直播等）时回退从头播放
+            // startTimeMs 瀹氫綅璧锋挱锛堢画鎾?seek锛夛細璺冲埌鐩爣鍓嶆渶杩戝叧閿抚锛岃В鐮佸悗鐨?
+            // 鐩爣鍓嶅抚鍦ㄦ覆鏌撳惊鐜涪寮冿紝瀹炵幇绮剧‘璧风偣锛涗笉鍙?seek锛堢洿鎾瓑锛夋椂鍥為€€浠庡ご鎾斁
             dropBeforeMs_ = 0.0;
             if (netOpts.startTimeMs > 0) {
                 int64_t targetUs = static_cast<int64_t>(netOpts.startTimeMs) * 1000;
@@ -423,7 +446,7 @@ public:
             CloseCodec();
             return false;
         }
-        // startTimeMs 的流级 seek 已在上方私有路径 / 会话创建时完成
+        // startTimeMs 鐨勬祦绾?seek 宸插湪涓婃柟绉佹湁璺緞 / 浼氳瘽鍒涘缓鏃跺畬鎴?
         streamIndex_ = streamIndex;
         AVStream* stream = fmt_->streams[streamIndex_];
         const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
@@ -449,7 +472,7 @@ public:
             queue_->SetStatsStream(streamIndex_);
             // Live video: catch-up overflow policy. A slow (e.g. software
             // decoded 1080p50) video consumer must never block the shared
-            // demux thread — that would starve the audio subscribers.
+            // demux thread 鈥?that would starve the audio subscribers.
             BackpressurePolicy policy;
             policy.liveDrop = netOpts.live;
             policy.skipToKeyframe = true;
@@ -543,11 +566,14 @@ public:
         return discontinuityCount_.load(std::memory_order_relaxed);
     }
 
-    // ---- Runtime VOD seek (private connections only) --------------------
+    // ---- Runtime VOD seek (private + shared 鏂规鈶? ----------------------
     // Arms a seek; the worker applies it at the top of the decode loop
     // (avformat_seek_file -> codec/ pacing reset -> pre-target drop filter)
-    // and completes `ack`. Returns false (with err) when unavailable: not
-    // started, shared demux session, or another seek still in flight.
+    // and completes `ack`. Private connection: the worker owns the whole
+    // seek. Shared connection: the session's demux thread applies the seek
+    // and notifies the queue; the worker re-anchors and completes the ack on
+    // the epoch advance. Returns false (with err) when unavailable: not
+    // started, dead session, or a private seek still in flight.
     bool RequestSeek(int64_t targetMs, SeekAck* ack, std::string& err)
     {
         if (!opened_ || !running_.load()) {
@@ -555,8 +581,28 @@ public:
             return false;
         }
         if (sharedFmt_) {
-            err = "seekTo requires a private connection (open with sharedDemux: false)";
-            return false;
+            // 鏂规鈶?shared-session seek: arm the session (last-write-wins).
+            // A still-pending previous shared seek is superseded: its ack
+            // resolves immediately, the new target takes over.
+            if (session_ == nullptr || queue_ == nullptr) {
+                err = "shared session is not attached";
+                return false;
+            }
+            if (!session_->RequestSharedSeek(targetMs)) {
+                err = "shared demux session is not alive";
+                return false;
+            }
+            SeekAck* superseded = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(seekMtx_);
+                superseded = seekAck_;
+                seekAck_ = ack;
+                armedSeekEpoch_ = queue_->SeekEpoch();
+            }
+            if (superseded != nullptr) {
+                FinishSeek(superseded, true, "superseded by a newer seek");
+            }
+            return true;
         }
         std::lock_guard<std::mutex> lock(seekMtx_);
         if (seekAck_ != nullptr) {
@@ -608,12 +654,79 @@ public:
         }
     }
 
+    // #2: NV12 direct-write needs even dimensions (h/2 chroma rows), SDR
+    // transfer and non-full-range YUV. Everything else keeps the RGBA path.
+    bool SwNv12Eligible() const
+    {
+        if (dec_ == nullptr || (width_ & 1) != 0 || (height_ & 1) != 0) {
+            return false;
+        }
+        if (dec_->color_range == AVCOL_RANGE_JPEG) {
+            return false;
+        }
+        if (dec_->color_trc == AVCOL_TRC_SMPTE2084 || dec_->color_trc == AVCOL_TRC_ARIB_STD_B67) {
+            return false;
+        }
+        switch (dec_->pix_fmt) {
+            case AV_PIX_FMT_NV12:
+            case AV_PIX_FMT_YUV420P:
+            case AV_PIX_FMT_YUV420P10LE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // Software-path window setup. Prefers NV12 (semi-planar YUV) so decoded
+    // frames are written without an RGB conversion pass; falls back to the
+    // classic RGBA_8888 when the format is rejected or the content is not
+    // NV12-eligible.
+    void SetupSwWindow()
+    {
+        int32_t g1 = OH_NativeWindow_NativeWindowHandleOpt(window_, SET_BUFFER_GEOMETRY, width_, height_);
+        swNv12_ = SwNv12Eligible();
+        int32_t g2 = -1;
+        if (swNv12_) {
+            g2 = OH_NativeWindow_NativeWindowHandleOpt(window_, SET_FORMAT, NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP);
+            if (g2 != 0) {
+                swNv12_ = false;
+            }
+        }
+        if (!swNv12_) {
+            g2 = OH_NativeWindow_NativeWindowHandleOpt(window_, SET_FORMAT, NATIVEBUFFER_PIXEL_FMT_RGBA_8888);
+        }
+        uint64_t usage = NATIVEBUFFER_USAGE_CPU_READ | NATIVEBUFFER_USAGE_CPU_WRITE;
+        int32_t g3 = OH_NativeWindow_NativeWindowHandleOpt(window_, SET_USAGE, usage);
+        if (swNv12_ && dec_ != nullptr) {
+            // The compositor must know the YUV matrix, not assume one.
+            int gamut = MapSdrGamut(dec_->color_primaries, height_);
+            int32_t gr = OH_NativeWindow_NativeWindowHandleOpt(window_, SET_COLOR_GAMUT, gamut);
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFVideo",
+                "sw window NV12 gamut=%{public}d ret=%{public}d (primaries=%{public}d)",
+                gamut, gr, dec_->color_primaries);
+        }
+        if (g1 != 0 || g2 != 0 || g3 != 0) {
+            // Geometry is asynchronously negotiated with the consumer; even a
+            // success here does not guarantee the first requested buffers match
+            // width_/height_. RenderFrame validates every buffer and falls back
+            // to a clamped copy, so a pending/failed geometry change can no
+            // longer cause out-of-bounds writes (was: heap corruption crash).
+            OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFVideo",
+                "window setup: geometry=%{public}d format=%{public}d usage=%{public}d", g1, g2, g3);
+        }
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFVideo", "sw window format=%{public}s",
+            swNv12_ ? "NV12" : "RGBA");
+    }
+
     bool Start(uint64_t surfaceId)
     {
         if (!opened_ || window_ != nullptr || running_.load()) {
             return false;
         }
         stop_ = false;
+        surfaceId_ = surfaceId;
+        hwFailed_.store(false, std::memory_order_release);
+        swFallbackArmed_.store(false, std::memory_order_release);
         if (OH_NativeWindow_CreateNativeWindowFromSurfaceId(surfaceId, &window_) != 0 || window_ == nullptr) {
             lastError_ = "create native window from surfaceId failed";
             OH_LOG_Print(LOG_APP, LOG_ERROR, 0xFF00, "FFVideo", "create window failed surfaceId=%{public}llu",
@@ -631,19 +744,7 @@ public:
         }
         if (!hwActive_) {
             // software path owns the window buffer format
-            int32_t g1 = OH_NativeWindow_NativeWindowHandleOpt(window_, SET_BUFFER_GEOMETRY, width_, height_);
-            int32_t g2 = OH_NativeWindow_NativeWindowHandleOpt(window_, SET_FORMAT, NATIVEBUFFER_PIXEL_FMT_RGBA_8888);
-            uint64_t usage = NATIVEBUFFER_USAGE_CPU_READ | NATIVEBUFFER_USAGE_CPU_WRITE;
-            int32_t g3 = OH_NativeWindow_NativeWindowHandleOpt(window_, SET_USAGE, usage);
-            if (g1 != 0 || g2 != 0 || g3 != 0) {
-                // Geometry is asynchronously negotiated with the consumer; even a
-                // success here does not guarantee the first requested buffers match
-                // width_/height_. RenderFrame validates every buffer and falls back
-                // to a clamped copy, so a pending/failed geometry change can no
-                // longer cause out-of-bounds writes (was: heap corruption crash).
-                OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFVideo",
-                    "window setup: geometry=%{public}d format=%{public}d usage=%{public}d", g1, g2, g3);
-            }
+            SetupSwWindow();
         } else if (dec_ != nullptr) {
             // HDR/WCG hardware decode: the codec service renders NV12 straight
             // into the window; declare the content color gamut so the system
@@ -681,6 +782,26 @@ public:
             hw_->Resume();
         }
     }
+
+    // User-level playback speed (0.5x-2.0x): the pacing loop (hw render
+    // thread or sw Run) divides its pts-delta wall target by the speed.
+    // Video frames carry no extra samples to compress, so unlike audio
+    // there is no filter pipeline - only the pacing changes; frame pts
+    // events stay on the content timeline (same rule as the audio anchor).
+    void SetSpeed(double speed)
+    {
+        if (speed != speed) {
+            speed = 1.0; // NaN guard
+        } else if (speed < 0.5) {
+            speed = 0.5;
+        } else if (speed > 2.0) {
+            speed = 2.0;
+        }
+        pendingSpeed_.store(speed, std::memory_order_relaxed);
+        if (hw_ != nullptr) {
+            hw_->SetSpeed(speed);
+        }
+    }
     void Stop()
     {
         StopInternal();
@@ -691,7 +812,7 @@ public:
     }
 
     // A/V resync: drop the shared-queue backlog and resume at the newest
-    // queued keyframe (≈ live edge). The still-running worker keeps decoding
+    // queued keyframe (鈮?live edge). The still-running worker keeps decoding
     // through the gap: the next fed packet is an IDR, so the codec restarts
     // cleanly, and the pacing loop re-anchors on the forward pts jump
     // (waitMs >= 1000), exactly like a native live-overflow skip.
@@ -702,7 +823,7 @@ public:
         }
         queue_->DropBacklogToKeyframe();
         // The drop shifts the timeline forward: the app's progress anchor is
-        // now wrong by the dropped span — surface it as a discontinuity.
+        // now wrong by the dropped span 鈥?surface it as a discontinuity.
         EmitDiscontinuity("resync");
     }
 
@@ -803,6 +924,34 @@ private:
         ack->cv.notify_all();
     }
 
+    // 鏂规鈶?worker side of the shared-session seek: returns true when the
+    // queue's seek epoch advanced since the last pass (the demux thread
+    // applied a session-wide seek and dropped our backlog). Fills the
+    // notified target / success flag and claims the pending shared seek ack
+    // when this epoch advance is the one the ack was armed against
+    // (epoch > armedSeekEpoch_). The caller re-anchors its path-specific
+    // state (codec/hw flush, drop filter, pacing) and completes the ack.
+    bool TakeSharedSeek(int64_t& outTargetMs, SeekAck** outAck, bool& outOk)
+    {
+        *outAck = nullptr;
+        if (queue_ == nullptr) {
+            return false;
+        }
+        const uint64_t epoch = queue_->SeekEpoch();
+        if (epoch == lastSeekEpochSeen_) {
+            return false;
+        }
+        lastSeekEpochSeen_ = epoch;
+        outTargetMs = queue_->SeekTargetMs();
+        outOk = queue_->SeekSucceeded();
+        std::lock_guard<std::mutex> lock(seekMtx_);
+        if (seekAck_ != nullptr && epoch > armedSeekEpoch_) {
+            *outAck = seekAck_;
+            seekAck_ = nullptr;
+        }
+        return true;
+    }
+
     // Worker side: fetch an armed capture ack (nullptr when canceled).
     CaptureAck* TakePendingCapture()
     {
@@ -843,13 +992,14 @@ private:
         // sws_ is normally already configured by RenderFrame; reconfigure
         // defensively (capture may run on the very first frame).
         if (sws_ == nullptr || swsW_ != frame->width || swsH_ != frame->height ||
-            swsFmt_ != static_cast<AVPixelFormat>(frame->format)) {
+            swsFmt_ != static_cast<AVPixelFormat>(frame->format) || swsDst_ != AV_PIX_FMT_RGBA) {
             if (sws_ != nullptr) {
                 sws_freeContext(sws_);
             }
             swsW_ = frame->width;
             swsH_ = frame->height;
             swsFmt_ = static_cast<AVPixelFormat>(frame->format);
+            swsDst_ = AV_PIX_FMT_RGBA;
             sws_ = sws_getContext(swsW_, swsH_, swsFmt_,
                 swsW_, swsH_, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
             if (sws_ == nullptr) {
@@ -1006,12 +1156,13 @@ private:
         Emit(msg);
     }
 
-    void EmitDiscontinuity(const std::string& reason)
+    void EmitDiscontinuity(const std::string& reason, int64_t seekMs = INT64_MIN)
     {
         discontinuityCount_.fetch_add(1, std::memory_order_relaxed);
         auto* msg = new DecoderMsg();
         msg->type = MSG_DISCONTINUITY;
         msg->err = reason;
+        msg->num = seekMs;
         Emit(msg);
     }
 
@@ -1025,7 +1176,7 @@ private:
     // Worker-side polling of the shared queue's overflow counter (F3): the
     // demux thread never calls back into a decoder (a dying decoder's queue
     // would dangle the callback); instead the worker notices a new overflow
-    // episode on its next loop pass and emits. Also fires while paused —
+    // episode on its next loop pass and emits. Also fires while paused 鈥?
     // a paused live consumer is exactly when the backlog overflows.
     // The reconnect counter (A3) is polled the same way: the session rebuilt
     // its connection in place (fresh CDN token) and dropped our backlog.
@@ -1052,7 +1203,7 @@ private:
     // Unified packet source: the shared demux queue when attached, the private
     // av_read_frame otherwise. Returns av_read_frame-compatible status
     // (0 = ok, <0 = EOF or aborted). `deadlineSteadyMs` (0 = none) bounds a
-    // shared-queue pop or arms the private interrupt deadline — used by the
+    // shared-queue pop or arms the private interrupt deadline 鈥?used by the
     // hw-eligibility peek so a stream declared but never carrying data cannot
     // block the open path forever.
     int ReadPacket(AVPacket* pkt, int64_t deadlineSteadyMs = 0)
@@ -1077,7 +1228,7 @@ private:
 
     // Byte counter + measured bitrate over a 5s window (D4). Called from the
     // worker thread and, during the hw-eligibility peek, from the JS thread
-    // — never concurrently (the worker is not running while the peek runs).
+    // 鈥?never concurrently (the worker is not running while the peek runs).
     void AccountReadBytes(uint64_t bytes)
     {
         readBytes_.fetch_add(bytes, std::memory_order_relaxed);
@@ -1150,7 +1301,7 @@ private:
         // was just opened and its probe buffer already holds the first
         // packets, 3s is only a network-stall guard. Shared path: the queue
         // is fed by the demux thread, which may still be downloading the
-        // first segment — cap at 500ms and fall back to software instead of
+        // first segment 鈥?cap at 500ms and fall back to software instead of
         // risking a main-thread freeze.
         const int64_t peekDeadline = queue_ != nullptr ? NowMs() + 500 : NowMs() + 3000;
         while (!stop_.load(std::memory_order_relaxed)) {
@@ -1217,10 +1368,27 @@ private:
             EmitFrame(ptsMs);
         };
         hw_->onEnd = [this]() { EmitEnd(); };
-        hw_->onError = [this](const std::string& err) { EmitError(err); };
+        // #1 mid-stream fallback: in AUTO mode a codec-service error or an
+        // input stall no longer bubbles to the app recovery loop 鈥?the hw
+        // failure flag reroutes the worker into the already-open software
+        // decoder (RunHw 鈫?Run 鈫?SwitchHwToSw). Non-AUTO keeps the old
+        // bubble-up behavior.
+        hw_->onError = [this](const std::string& err) {
+            if (hwMode_ == HwMode::AUTO) {
+                hwFailed_.store(true, std::memory_order_release);
+            } else {
+                EmitError(err);
+            }
+        };
         // startTimeMs precise start: the render loop releases pre-target
         // output buffers without rendering (codec renders to surface itself)
         hw_->SetDropBeforeUs(dropBeforeMs_ > 0.0 ? static_cast<int64_t>(dropBeforeMs_ * 1000.0) : 0);
+        // Replay a pre-start SetSpeed(): hw_ did not exist when the request
+        // was stored, and HwVideoDecoder defaults to 1.0x.
+        const double spd = pendingSpeed_.load(std::memory_order_relaxed);
+        if (spd != 1.0) {
+            hw_->SetSpeed(spd);
+        }
         if (!hw_->Start(window_, mime, width_, height_, fps_)) {
             lastError_ = hw_->GetLastError();
             if (hwMode_ == HwMode::AUTO) {
@@ -1230,6 +1398,169 @@ private:
             return false;
         }
         hwActive_ = true;
+        return true;
+    }
+
+    // #2: per-frame eligibility mirror of SwNv12Eligible (frame metadata can
+    // differ from the stream defaults reported at open time).
+    bool FrameNv12Eligible(const AVFrame* frame) const
+    {
+        if ((frame->width & 1) != 0 || (frame->height & 1) != 0) {
+            return false;
+        }
+        if (frame->color_range == AVCOL_RANGE_JPEG) {
+            return false;
+        }
+        if (frame->color_trc == AVCOL_TRC_SMPTE2084 || frame->color_trc == AVCOL_TRC_ARIB_STD_B67) {
+            return false;
+        }
+        switch (frame->format) {
+            case AV_PIX_FMT_NV12:
+            case AV_PIX_FMT_YUV420P:
+            case AV_PIX_FMT_YUV420P10LE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // #2: write the frame into an NV12 (semi-planar YUV) window buffer.
+    // Layout resolution: OH_NativeBuffer_MapPlanes is authoritative when it
+    // returns a sane semi-planar layout, but some device gralloc HDIs fill
+    // it with garbage (observed: planeCount=3, rowStride 1/2 on a 1920-wide
+    // NV12 buffer) 鈥?strictly validate it and fall back to the classic
+    // BufferHandle-derived layout (Y at 0, UV at stride*height, both planes
+    // strided by BufferHandle::stride, which this gralloc reports in bytes
+    // as proven by the RGBA path). NV12 frames are copied plane-wise; other
+    // eligible YUV formats are converted straight into the mapped planes
+    // via swscale (no intermediate buffer).
+    bool RenderFrameNv12(const AVFrame* frame, OH_NativeBuffer* nb, int fenceFd, const BufferHandle* handle)
+    {
+        void* virAddr = nullptr;
+        OH_NativeBuffer_Planes planes {};
+        bool planesValid = false;
+        bool unmapAtEnd = false;
+        if (fenceFd >= 0) {
+            // MapPlanes has no fence-waiting variant; wait the acquire fence
+            // with a throwaway mapping first (CPU-producer path normally has
+            // fenceFd < 0).
+            void* fenceAddr = nullptr;
+            OH_NativeBuffer_MapWaitFence(nb, fenceFd, &fenceAddr);
+            OH_NativeBuffer_Unmap(nb);
+        }
+        if (OH_NativeBuffer_MapPlanes(nb, &virAddr, &planes) == 0 && virAddr != nullptr) {
+            const uint64_t yRow = planes.planes[0].rowStride;
+            const uint64_t uvRow = planes.planes[1].rowStride;
+            const uint64_t uvOff = planes.planes[1].offset;
+            const uint64_t need = uvOff + uvRow * (static_cast<uint64_t>(frame->height) / 2);
+            planesValid = planes.planeCount == 2 && planes.planes[0].offset == 0 &&
+                yRow >= static_cast<uint64_t>(frame->width) &&
+                uvRow >= static_cast<uint64_t>(frame->width) &&
+                need <= static_cast<uint64_t>(handle->size);
+            unmapAtEnd = true;
+        }
+        size_t yOff = 0;
+        size_t uvOff = 0;
+        uint32_t yStride = 0;
+        uint32_t uvStride = 0;
+        if (planesValid) {
+            yOff = static_cast<size_t>(planes.planes[0].offset);
+            uvOff = static_cast<size_t>(planes.planes[1].offset);
+            yStride = planes.planes[0].rowStride;
+            uvStride = planes.planes[1].rowStride;
+        } else {
+            if (unmapAtEnd) {
+                OH_NativeBuffer_Unmap(nb);
+                unmapAtEnd = false;
+            }
+            virAddr = nullptr;
+            int32_t mapRet = OH_NativeBuffer_Map(nb, &virAddr);
+            if (mapRet != 0 || virAddr == nullptr) {
+                if (handle->virAddr != nullptr) {
+                    virAddr = handle->virAddr;
+                } else {
+                    OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFVideo",
+                        "nv12 map failed ret=%{public}d cnt=%{public}u yRow=%{public}u uvRow=%{public}u",
+                        mapRet, planes.planeCount, planes.planes[0].rowStride, planes.planes[1].rowStride);
+                    return false;
+                }
+            } else {
+                unmapAtEnd = true;
+            }
+            const size_t stride = static_cast<size_t>(handle->stride);
+            const size_t height = static_cast<size_t>(handle->height);
+            const size_t uvPlane = stride * ((height + 1) / 2);
+            if (stride < static_cast<size_t>(frame->width) || uvPlane == 0 ||
+                stride * height + uvPlane > static_cast<size_t>(handle->size)) {
+                OH_LOG_Print(LOG_APP, LOG_ERROR, 0xFF00, "FFVideo",
+                    "nv12 layout unknowable: stride=%{public}d size=%{public}d cnt=%{public}u",
+                    handle->stride, handle->size, planes.planeCount);
+                if (unmapAtEnd) {
+                    OH_NativeBuffer_Unmap(nb);
+                }
+                return false;
+            }
+            yOff = 0;
+            // The chroma plane may start at an aligned height (observed on
+            // this gralloc: stride * height rounded up to even, matching the
+            // MapPlanes-reported offset). Prefer the MapPlanes offset when
+            // plausible, then the aligned-height formula, then raw
+            // stride*height 鈥?all validated against the buffer size.
+            uvOff = stride * height;
+            if (planes.planeCount >= 2 && planes.planes[1].offset >= stride * height &&
+                planes.planes[1].offset + uvPlane <= static_cast<size_t>(handle->size)) {
+                uvOff = static_cast<size_t>(planes.planes[1].offset);
+            } else {
+                const size_t aligned = stride * ((height + 1) & ~(static_cast<size_t>(1)));
+                if (aligned != uvOff && aligned + uvPlane <= static_cast<size_t>(handle->size)) {
+                    uvOff = aligned;
+                }
+            }
+            yStride = static_cast<uint32_t>(stride);
+            uvStride = static_cast<uint32_t>(stride);
+        }
+        uint8_t* base = static_cast<uint8_t*>(virAddr);
+        uint8_t* yDst = base + yOff;
+        uint8_t* uvDst = base + uvOff;
+        if (frame->format == AV_PIX_FMT_NV12) {
+            for (int r = 0; r < frame->height; r++) {
+                memcpy(yDst + r * yStride, frame->data[0] + static_cast<size_t>(r) * frame->linesize[0],
+                    static_cast<size_t>(frame->width));
+            }
+            for (int r = 0; r < frame->height / 2; r++) {
+                memcpy(uvDst + r * uvStride, frame->data[1] + static_cast<size_t>(r) * frame->linesize[1],
+                    static_cast<size_t>(frame->width));
+            }
+            if (unmapAtEnd) {
+                OH_NativeBuffer_Unmap(nb);
+            }
+            return true;
+        }
+        // yuv420p / yuv420p10le 鈫?NV12 straight into the mapped planes
+        if (sws_ == nullptr || swsW_ != frame->width || swsH_ != frame->height ||
+            swsFmt_ != static_cast<AVPixelFormat>(frame->format) || swsDst_ != AV_PIX_FMT_NV12) {
+            if (sws_ != nullptr) {
+                sws_freeContext(sws_);
+            }
+            swsW_ = frame->width;
+            swsH_ = frame->height;
+            swsFmt_ = static_cast<AVPixelFormat>(frame->format);
+            swsDst_ = AV_PIX_FMT_NV12;
+            sws_ = sws_getContext(swsW_, swsH_, swsFmt_,
+                swsW_, swsH_, AV_PIX_FMT_NV12, SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (sws_ == nullptr) {
+                if (unmapAtEnd) {
+                    OH_NativeBuffer_Unmap(nb);
+                }
+                return false;
+            }
+        }
+        uint8_t* dst[4] = { yDst, uvDst, nullptr, nullptr };
+        int dstStride[4] = { static_cast<int>(yStride), static_cast<int>(uvStride), 0, 0 };
+        sws_scale(sws_, frame->data, frame->linesize, 0, frame->height, dst, dstStride);
+        if (unmapAtEnd) {
+            OH_NativeBuffer_Unmap(nb);
+        }
         return true;
     }
 
@@ -1243,8 +1574,11 @@ private:
                 close(fenceFd);
             }
             OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFVideo", "request buffer failed ret=%{public}d", ret);
+            consecutiveRequestFailures_++;
+            lastRequestBufferError_ = ret;
             return false;
         }
+        consecutiveRequestFailures_ = 0;
 
         OH_NativeBuffer* nb = nullptr;
         if (OH_NativeBuffer_FromNativeWindowBuffer(buffer, &nb) != 0 || nb == nullptr) {
@@ -1253,6 +1587,34 @@ private:
             }
             OH_NativeWindow_NativeWindowAbortBuffer(window_, buffer);
             OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFVideo", "from native window buffer failed");
+            return false;
+        }
+
+        BufferHandle* handle = OH_NativeWindow_GetBufferHandleFromNative(buffer);
+        if (handle == nullptr || handle->width <= 0 || handle->height <= 0 || handle->stride <= 0) {
+            if (fenceFd >= 0) {
+                close(fenceFd);
+            }
+            OH_NativeWindow_NativeWindowAbortBuffer(window_, buffer);
+            OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFVideo", "invalid buffer handle");
+            return false;
+        }
+
+        // #2 NV12 fast path: the window was negotiated as semi-planar YUV 鈥?
+        // write through the plane layout without an RGB conversion pass.
+        if (swNv12_ && handle->format == NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP &&
+            handle->width >= frame->width && handle->height >= frame->height &&
+            FrameNv12Eligible(frame)) {
+            if (RenderFrameNv12(frame, nb, fenceFd, handle)) {
+                Region region = { nullptr, 0 };
+                ret = OH_NativeWindow_NativeWindowFlushBuffer(window_, buffer, -1, region);
+                if (ret != 0) {
+                    OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFVideo", "flush failed ret=%{public}d", ret);
+                    return false;
+                }
+                return true;
+            }
+            OH_NativeWindow_NativeWindowAbortBuffer(window_, buffer);
             return false;
         }
 
@@ -1282,28 +1644,20 @@ private:
             }
         }
 
-        BufferHandle* handle = OH_NativeWindow_GetBufferHandleFromNative(buffer);
-        if (handle == nullptr || handle->width <= 0 || handle->height <= 0 || handle->stride <= 0) {
-            if (mapped) {
-                OH_NativeBuffer_Unmap(nb);
-            }
-            OH_NativeWindow_NativeWindowAbortBuffer(window_, buffer);
-            OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFVideo", "invalid buffer handle");
-            return false;
-        }
         // OHOS reports BufferHandle::stride in bytes for RGBA_8888; tolerate
         // devices that report it in pixels (stride < width*4) by re-deriving
         // the byte pitch.
         const int dstPitch = handle->stride >= handle->width * 4 ? handle->stride : handle->width * 4;
 
         if (sws_ == nullptr || swsW_ != frame->width || swsH_ != frame->height ||
-            swsFmt_ != static_cast<AVPixelFormat>(frame->format)) {
+            swsFmt_ != static_cast<AVPixelFormat>(frame->format) || swsDst_ != AV_PIX_FMT_RGBA) {
             if (sws_ != nullptr) {
                 sws_freeContext(sws_);
             }
             swsW_ = frame->width;
             swsH_ = frame->height;
             swsFmt_ = static_cast<AVPixelFormat>(frame->format);
+            swsDst_ = AV_PIX_FMT_RGBA;
             sws_ = sws_getContext(swsW_, swsH_, swsFmt_,
                 swsW_, swsH_, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
             if (sws_ == nullptr) {
@@ -1316,7 +1670,7 @@ private:
         }
 
         if (handle->width >= frame->width && handle->height >= frame->height) {
-            // Fast path: the window buffer covers the frame — convert in place.
+            // Fast path: the window buffer covers the frame 鈥?convert in place.
             uint8_t* dst[4] = { static_cast<uint8_t*>(virAddr), nullptr, nullptr, nullptr };
             int dstStride[4] = { dstPitch, 0, 0, 0 };
             sws_scale(sws_, frame->data, frame->linesize, 0, frame->height, dst, dstStride);
@@ -1439,6 +1793,31 @@ private:
         }
         while (!stop_) {
             PollQueueEvents();
+            // 鏂规鈶?shared-session seek: the demux thread moved the shared
+            // connection and dropped our backlog; re-anchor the hardware
+            // path to the notified target and complete the pending ack.
+            {
+                int64_t sharedTargetMs = 0;
+                SeekAck* sharedAck = nullptr;
+                bool sharedOk = false;
+                if (TakeSharedSeek(sharedTargetMs, &sharedAck, sharedOk)) {
+                    if (sharedOk) {
+                        hw_->Flush();
+                        if (hwPendingPkt_ != nullptr) {
+                            av_packet_free(&hwPendingPkt_);
+                        }
+                        hw_->SetDropBeforeUs(sharedTargetMs * 1000);
+                        EmitDiscontinuity("seek", sharedTargetMs);
+                        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFVideo",
+                            "seek applied (hw, shared) target=%{public}lldms",
+                            static_cast<long long>(sharedTargetMs));
+                        FinishSeek(sharedAck, true, "");
+                    } else if (sharedAck != nullptr) {
+                        FinishSeek(sharedAck, false, "avformat_seek_file failed on shared session");
+                    }
+                    continue;
+                }
+            }
             // Runtime VOD seek (private connection): flush the codec, drop
             // the connection to the target keyframe and re-arm the output
             // pre-target filter.
@@ -1489,6 +1868,9 @@ private:
                     ptsUs = av_rescale_q(pkt->dts, stream->time_base, usTimeBase);
                 }
                 if (!FeedHw(pkt, ptsUs)) {
+                    // #1: feed failure = codec error or stalled input. AUTO
+                    // mode reroutes this worker into the software path (Run).
+                    hwFailed_.store(true, std::memory_order_release);
                     break;
                 }
             }
@@ -1497,13 +1879,68 @@ private:
         av_packet_free(&pkt);
     }
 
+    // #1: hand the worker over from the failed hardware pipeline to the
+    // always-open software decoder: stop/destroy the codec, recreate the
+    // window (the old surface was consumed by the codec service), flush the
+    // decoder and arm the drop-to-keyframe filter so the sw loop resumes at
+    // a decodable point. HDR content is excluded 鈥?the sw path cannot
+    // tone-map PQ/HLG, so the error surfaces to the app recovery instead.
+    bool SwitchHwToSw()
+    {
+        std::string hwErr = hw_ != nullptr ? hw_->GetLastError() : "";
+        if (hw_ != nullptr) {
+            hw_->Stop();
+            hw_.reset();
+        }
+        if (dec_ != nullptr && (dec_->color_trc == AVCOL_TRC_SMPTE2084 ||
+            dec_->color_trc == AVCOL_TRC_ARIB_STD_B67)) {
+            OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFVideo",
+                "hw failed mid-stream on HDR content, not falling back to sw: %{public}s", hwErr.c_str());
+            EmitError(hwErr.empty() ? "hw decoder failed" : hwErr);
+            return false;
+        }
+        // Live streams: jump the shared backlog to its newest keyframe (live
+        // edge) so the switch gap stays one keyframe interval. VOD keeps its
+        // backlog 鈥?the sw loop skips only the undecodable mid-GOP packets.
+        if (queue_ != nullptr && fmt_ != nullptr &&
+            (fmt_->duration == AV_NOPTS_VALUE || fmt_->duration <= 0)) {
+            queue_->DropBacklogToKeyframe();
+        }
+        ReleaseWindow();
+        if (surfaceId_ == 0 ||
+            OH_NativeWindow_CreateNativeWindowFromSurfaceId(surfaceId_, &window_) != 0 ||
+            window_ == nullptr) {
+            lastError_ = "recreate window for sw fallback failed";
+            OH_LOG_Print(LOG_APP, LOG_ERROR, 0xFF00, "FFVideo", "%{public}s", lastError_.c_str());
+            EmitError(lastError_);
+            return false;
+        }
+        SetupSwWindow();
+        avcodec_flush_buffers(dec_);
+        swFallbackArmed_.store(true, std::memory_order_release);
+        hwActive_.store(false);
+        OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFVideo",
+            "hw decoder failed mid-stream, switched to software decode: %{public}s", hwErr.c_str());
+        EmitInfo("sw");
+        EmitDiscontinuity("hw2sw");
+        return true;
+    }
+
     void Run()
     {
         // Hold the shared session for the whole worker lifetime (see RunHw).
         std::shared_ptr<DemuxSession> session = session_;
         if (hwActive_.load()) {
             RunHw();
-            return;
+            // #1: AUTO-only mid-stream hardware failure 鈥?hand the worker
+            // over to the software pipeline instead of ending playback.
+            if (hwFailed_.load(std::memory_order_acquire) && !stop_.load() &&
+                hwMode_ == HwMode::AUTO && SwitchHwToSw()) {
+                hwFailed_.store(false, std::memory_order_release);
+                // fall through into the software loop below
+            } else {
+                return;
+            }
         }
         AVPacket* pkt = av_packet_alloc();
         AVFrame* frame = av_frame_alloc();
@@ -1523,6 +1960,34 @@ private:
 
         while (!stop_) {
             PollQueueEvents();
+            // 鏂规鈶?shared-session seek: the demux thread moved the shared
+            // connection and dropped our backlog; re-anchor the software
+            // path (decoder flush, pacing, pre-target drop filter) to the
+            // notified target and complete the pending ack.
+            {
+                int64_t sharedTargetMs = 0;
+                SeekAck* sharedAck = nullptr;
+                bool sharedOk = false;
+                if (TakeSharedSeek(sharedTargetMs, &sharedAck, sharedOk)) {
+                    if (sharedOk) {
+                        avcodec_flush_buffers(dec_);
+                        av_frame_unref(frame);
+                        dropBeforeMs_ = static_cast<double>(sharedTargetMs);
+                        dropGuard = 0;
+                        firstPts = AV_NOPTS_VALUE;
+                        startWall = std::chrono::steady_clock::now();
+                        eofSent = false;
+                        EmitDiscontinuity("seek", sharedTargetMs);
+                        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFVideo",
+                            "seek applied (sw, shared) target=%{public}lldms",
+                            static_cast<long long>(sharedTargetMs));
+                        FinishSeek(sharedAck, true, "");
+                    } else if (sharedAck != nullptr) {
+                        FinishSeek(sharedAck, false, "avformat_seek_file failed on shared session");
+                    }
+                    continue;
+                }
+            }
             // Runtime VOD seek (private connection): flush the decoder, seek
             // the connection to the target keyframe, re-anchor pacing and
             // re-arm the pre-target drop filter so playback resumes exactly
@@ -1576,6 +2041,15 @@ private:
                     continue;
                 }
                 if (pkt->stream_index == streamIndex_) {
+                    // #1 hw2sw switch: the flushed decoder cannot resume
+                    // mid-GOP 鈥?drop packets until the next keyframe.
+                    if (swFallbackArmed_.load(std::memory_order_acquire)) {
+                        if ((pkt->flags & AV_PKT_FLAG_KEY) == 0) {
+                            av_packet_unref(pkt);
+                            continue;
+                        }
+                        swFallbackArmed_.store(false, std::memory_order_release);
+                    }
                     avcodec_send_packet(dec_, pkt);
                 }
                 av_packet_unref(pkt);
@@ -1601,7 +2075,7 @@ private:
             }
 
             // startTimeMs precise start: decode but drop pre-target frames.
-            // Guard cap protects streams with broken timestamps (all NOPTS →
+            // Guard cap protects streams with broken timestamps (all NOPTS 鈫?
             // ptsMs 0) from dropping forever.
             if (dropBeforeMs_ > 0.0) {
                 if (pts == AV_NOPTS_VALUE || ptsMs < dropBeforeMs_) {
@@ -1626,17 +2100,26 @@ private:
             }
 
             // real-time pacing based on pts delta
+            if (pendingSpeed_.load(std::memory_order_relaxed) != activeSpeed_) {
+                // Speed change: re-anchor the pacing at this frame so the old
+                // anchor cannot burst or stall the new speed's timeline.
+                activeSpeed_ = pendingSpeed_.load(std::memory_order_relaxed);
+                firstPts = AV_NOPTS_VALUE;
+            }
             if (firstPts == AV_NOPTS_VALUE) {
                 firstPts = pts;
                 startWall = std::chrono::steady_clock::now();
             } else if (pts != AV_NOPTS_VALUE) {
-                double targetMs = static_cast<double>(pts - firstPts) * av_q2d(stream->time_base) * 1000.0;
+                // speed divides the wall target: content delta D renders in
+                // D/speed wall seconds
+                double targetMs = static_cast<double>(pts - firstPts) * av_q2d(stream->time_base) * 1000.0 /
+                    (activeSpeed_ > 0.0 ? activeSpeed_ : 1.0);
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - startWall).count();
                 int64_t waitMs = static_cast<int64_t>(targetMs) - static_cast<int64_t>(elapsed);
                 if (waitMs >= 1000) {
                     // Forward pts jump (live skip / edge reconnect): re-anchor
-                    // the pacing instead of bursting frames at full speed —
+                    // the pacing instead of bursting frames at full speed 鈥?
                     // a burst desyncs from the (re-anchored) audio pacing.
                     firstPts = pts;
                     startWall = std::chrono::steady_clock::now();
@@ -1651,6 +2134,22 @@ private:
             } else {
                 failed++;
                 droppedFrames_.fetch_add(1, std::memory_order_relaxed);
+                // Surface wedge fail-fast: a poisoned BufferQueue (lingering
+                // codec-service producer after hw teardown) fails every
+                // NativeWindowRequestBuffer with 41206000 forever — spinning
+                // the decode loop at full speed only floods the log (observed
+                // 28 min / 34k lines / 85% CPU) and never recovers. Bail out
+                // after ~1s of consecutive request failures and hand recovery
+                // to the app's reload/surface-rebuild chain.
+                if (consecutiveRequestFailures_ >= RENDER_REQUEST_FAIL_BAILOUT) {
+                    const int err = lastRequestBufferError_;
+                    OH_LOG_Print(LOG_APP, LOG_ERROR, 0xFF00, "FFVideo",
+                        "surface wedged: %{public}d consecutive request buffer failures (ret=%{public}d), bailing out",
+                        consecutiveRequestFailures_, err);
+                    EmitError("video surface wedged: request buffer failed (ret=" +
+                        std::to_string(err) + "), needs surface rebuild");
+                    break;
+                }
             }
             EmitFrame(ptsMs);
             av_frame_unref(frame);
@@ -1671,6 +2170,11 @@ private:
     bool sharedFmt_ = false;
     AVCodecContext* dec_ = nullptr;
     SwsContext* sws_ = nullptr;
+    // Surface-wedge fail-fast (see Run): consecutive NativeWindowRequestBuffer
+    // failures and the last error code; reset on any successful request.
+    static constexpr int RENDER_REQUEST_FAIL_BAILOUT = 30;
+    int consecutiveRequestFailures_ = 0;
+    int lastRequestBufferError_ = 0;
     OHNativeWindow* window_ = nullptr;
     std::unique_ptr<HwVideoDecoder> hw_;
     int streamIndex_ = -1;
@@ -1679,6 +2183,9 @@ private:
     int swsW_ = 0;
     int swsH_ = 0;
     AVPixelFormat swsFmt_ = AV_PIX_FMT_NONE;
+    // Destination of the cached sws_ context (RGBA render / NV12 direct-write /
+    // RGBA capture) 鈥?part of the cache key so routes never share a context.
+    AVPixelFormat swsDst_ = AV_PIX_FMT_NONE;
     // Scratch RGBA buffer for the clamped-copy render fallback (window buffer
     // smaller than the decoded frame, e.g. pending/rejected geometry change).
     uint8_t* rgbaScratch_ = nullptr;
@@ -1694,6 +2201,17 @@ private:
     double fps_ = 0.0;
     HwMode hwMode_ = HwMode::AUTO;
     std::atomic<bool> hwActive_{ false };
+    // #1 mid-stream hw鈫抯w fallback: set by hw onError/FeedHw failure in AUTO
+    // mode; Run() switches the worker to the software pipeline once.
+    std::atomic<bool> hwFailed_{ false };
+    // Drop packets until the next keyframe after a hw2sw switch (flushed
+    // decoder cannot resume mid-GOP).
+    std::atomic<bool> swFallbackArmed_{ false };
+    // SurfaceId captured in Start() 鈥?the fallback recreates the window from
+    // it after the codec consumed the old surface.
+    uint64_t surfaceId_ = 0;
+    // #2: window negotiated as NV12 (semi-planar YUV) for the software path.
+    bool swNv12_ = false;
     AVPacket* hwPendingPkt_ = nullptr;
     // mp4toannexb filter for length-prefixed (hvcC/avcC) sources on the
     // hardware path; nullptr for native Annex-B streams.
@@ -1707,10 +2225,22 @@ private:
     std::atomic<bool> stop_{ false };
     std::atomic<bool> paused_{ false };
 
-    // ---- Runtime seek (private connections) ----
+    // ---- Runtime seek (private + shared 鏂规鈶? ----
     std::atomic<int64_t> pendingSeekMs_{ INT64_MIN }; // INT64_MIN = none armed
     SeekAck* seekAck_ = nullptr;                     // guarded by seekMtx_
     std::mutex seekMtx_;
+    // Shared seek: queue epoch snapshot taken when the ack was armed
+    // (seekMtx_); the worker completes the ack once the queue epoch passes it.
+    uint64_t armedSeekEpoch_ = 0;
+    // Worker-only mirror of queue_->SeekEpoch() (advances past it on a
+    // session seek); 0 matches a fresh queue before any seek.
+    uint64_t lastSeekEpochSeen_ = 0;
+    // ---- User-level speed (0.5x-2.0x) ----
+    // NAPI stores the request; the hw render thread (HwVideoDecoder) or the
+    // sw Run pacing applies it by dividing the wall target.
+    std::atomic<double> pendingSpeed_{ 1.0 };
+    double activeSpeed_ = 1.0; // sw Run worker-only mirror
+
     // ---- Frame capture (software path) ----
     std::atomic<bool> captureRequested_{ false };
     CaptureAck* captureAck_ = nullptr;               // guarded by captureMtx_
@@ -1865,12 +2395,17 @@ void TsfnDispatcher(napi_env env, napi_value jsCallback, void* context, void* da
                 napi_value reason = nullptr;
                 napi_create_string_utf8(env, msg->err.c_str(), NAPI_AUTO_LENGTH, &reason);
                 napi_set_named_property(env, ev, "reason", reason);
+                if (msg->num != INT64_MIN) {
+                    napi_value seekMs = nullptr;
+                    napi_create_int64(env, msg->num, &seekMs);
+                    napi_set_named_property(env, ev, "seekMs", seekMs);
+                }
                 napi_call_function(env, undefined, cb, 1, &ev, &undefined);
             }
         }
     } else if (msg->type == MSG_RECONNECTED) {
         // A3: the shared session rebuilt its connection (fresh CDN token);
-        // no payload — poll getBufferStats() for counters.
+        // no payload 鈥?poll getBufferStats() for counters.
         if (core != nullptr && core->GetReconnectedCallback() != nullptr) {
             napi_value cb = nullptr;
             napi_get_reference_value(env, core->GetReconnectedCallback(), &cb);
@@ -1897,7 +2432,7 @@ void CoreFinalize(napi_env env, void* data, void* hint)
     (void)hint;
     auto* core = static_cast<VideoDecoderCore*>(data);
     // The JS object died without close(): unsubscribe the shared demux
-    // session BEFORE the delete — a zombie queue keeps receiving routed
+    // session BEFORE the delete 鈥?a zombie queue keeps receiving routed
     // packets until the destructor runs (endless high-water drop storm, and
     // the demux thread can sit blocked on the queue's full mark while the
     // queue object is being destroyed).
@@ -2119,7 +2654,7 @@ napi_value FFVideoDecoderClose(napi_env env, napi_callback_info info)
         // Detach the shared demux subscription synchronously (queue + claim
         // released; the session reference drops on a helper thread). Waiting
         // for the GC finalizer to run CloseCodec left the subscriber count
-        // growing +N per rebuild cycle — a wedged demux session was never
+        // growing +N per rebuild cycle 鈥?a wedged demux session was never
         // released. CloseCodec in the finalizer remains as the codec-free
         // safety net.
         core->DetachDemux();
@@ -2134,6 +2669,26 @@ napi_value FFVideoDecoderFlushToKeyframe(napi_env env, napi_callback_info info)
     if (core != nullptr) {
         core->FlushToKeyframe();
     }
+    return nullptr;
+}
+
+napi_value FFVideoDecoderSetSpeed(napi_env env, napi_callback_info info)
+{
+    VideoDecoderCore* core = GetCore(env, info);
+    if (core == nullptr) {
+        napi_throw_error(env, nullptr, "FFVideoDecoder is not constructed");
+        return nullptr;
+    }
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) {
+        napi_throw_type_error(env, nullptr, "setSpeed(speed: number) requires a speed argument");
+        return nullptr;
+    }
+    double speed = 1.0;
+    napi_get_value_double(env, args[0], &speed);
+    core->SetSpeed(speed);
     return nullptr;
 }
 

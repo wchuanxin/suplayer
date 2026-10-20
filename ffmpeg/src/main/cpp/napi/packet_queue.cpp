@@ -330,4 +330,32 @@ void PacketQueue::DropBacklogToKeyframe()
         dropped, packets_.empty() ? "next keyframe" : "queued keyframe");
 }
 
+void PacketQueue::NotifySeek(int64_t targetMs, bool ok)
+{
+    size_t dropped = 0;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (ok) {
+            dropped = packets_.size();
+            for (QueuedPacket& q : packets_) {
+                av_packet_free(&q.pkt);
+            }
+            packets_.clear();
+            bytes_ = 0;
+            skipUntilKey_ = false; // post-seek demux output starts at a keyframe
+            droppedPackets_.fetch_add(dropped, std::memory_order_relaxed);
+            PublishBufferedMsLocked();
+            // Re-arm the backpressure grace so the post-seek fill burst is
+            // not mistaken for a dead consumer and dropped.
+            lastPopWallMs_ = NowSteadyMs();
+        }
+        seekTargetMs_.store(targetMs, std::memory_order_relaxed);
+        seekSucceeded_.store(ok, std::memory_order_relaxed);
+        seekEpoch_.fetch_add(1, std::memory_order_relaxed);
+    }
+    notEmpty_.notify_all();
+    PQ_LOG(LOG_INFO, "session seek notify: target=%{public}lldms ok=%{public}d dropped %{public}zu backlog",
+        static_cast<long long>(targetMs), ok ? 1 : 0, dropped);
+}
+
 } // namespace ffmpeg

@@ -98,6 +98,35 @@ public:
         return droppedPackets_.load(std::memory_order_relaxed);
     }
 
+    // ---- Shared-session seek (方案⑤) -----------------------------------
+    // The shared demux session applied (ok) or failed (ok == false) a
+    // session-wide in-pipeline seek. On success the whole backlog (old
+    // timeline) is dropped and the seek epoch advances; subscribers detect
+    // the change by polling SeekEpoch() in their decode loop and re-anchor
+    // their decoder/pacing state to SeekTargetMs(). On failure nothing is
+    // dropped — the demux position is unchanged and the epoch advance only
+    // serves to fail the decoders' pending seek acks.
+    void NotifySeek(int64_t targetMs, bool ok);
+
+    // Monotonic counter advanced once per applied/failed session seek.
+    uint64_t SeekEpoch() const
+    {
+        return seekEpoch_.load(std::memory_order_relaxed);
+    }
+
+    // Target of the LAST notified session seek (valid once SeekEpoch()
+    // advanced past the value observed before the seek was armed).
+    int64_t SeekTargetMs() const
+    {
+        return seekTargetMs_.load(std::memory_order_relaxed);
+    }
+
+    // Whether the last notified session seek succeeded.
+    bool SeekSucceeded() const
+    {
+        return seekSucceeded_.load(std::memory_order_relaxed);
+    }
+
     // ---- Session recovery (A3) ----------------------------------------
     // The shared demux session rebuilt its connection in place (token
     // refresh). Bumps the counter the subscriber's worker polls to emit
@@ -164,6 +193,10 @@ private:
     std::atomic<uint64_t> overflowEvents_{ 0 };
     std::atomic<uint64_t> droppedPackets_{ 0 };
     std::atomic<uint64_t> reconnectEvents_{ 0 };
+    // ---- Shared-session seek (方案⑤) ----
+    std::atomic<uint64_t> seekEpoch_{ 0 };
+    std::atomic<int64_t> seekTargetMs_{ 0 };
+    std::atomic<bool> seekSucceeded_{ true };
 };
 
 } // namespace ffmpeg

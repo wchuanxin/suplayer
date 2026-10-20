@@ -20,6 +20,13 @@ void HwVideoDecoder::Fail(const std::string& msg)
     lastError_ = msg;
     OH_LOG_Print(LOG_APP, LOG_ERROR, 0xFF00, "FFVideoHW", "%{public}s", msg.c_str());
     if (codec_ != nullptr) {
+        // Orderly teardown: Stop before Destroy even from the
+        // configured/error states Fail() runs in (Start() failures after
+        // SetSurface already attached the codec service's producer to the
+        // surface BufferQueue). Destroy alone left the producer connection
+        // behind on some devices, permanently wedging any later software
+        // producer on that surface (NativeWindowRequestBuffer 41206000).
+        OH_VideoDecoder_Stop(codec_);
         OH_VideoDecoder_Destroy(codec_);
         codec_ = nullptr;
     }
@@ -145,8 +152,11 @@ bool HwVideoDecoder::FeedPacket(const uint8_t* data, int size, int64_t ptsUs, bo
         bool ok = inputCv_.wait_for(lock, std::chrono::seconds(10),
             [this] { return stop_.load() || !freeInputs_.empty(); });
         if (stop_.load() || freeInputs_.empty()) {
-            if (!stop_.load() && onError) {
-                onError("hw decoder input stalled (no free buffer in 10s)");
+            if (!stop_.load()) {
+                lastError_ = "hw decoder input stalled (no free buffer in 10s)";
+                if (onError) {
+                    onError(lastError_);
+                }
             }
             return false;
         }
@@ -187,6 +197,7 @@ void HwVideoDecoder::Flush()
     OH_AVErrCode ret = OH_VideoDecoder_Flush(codec_);
     if (ret != AV_ERR_OK) {
         OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFVideoHW", "flush failed ret=%{public}d", ret);
+        return;
     }
     {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -194,6 +205,15 @@ void HwVideoDecoder::Flush()
         // re-issue free inputs / fresh outputs through the callbacks.
         freeInputs_.clear();
         pendingOutputs_.clear();
+    }
+    // After OH_VideoDecoder_Flush the codec sits in the FLUSHED state: it
+    // stops firing OnNeedInput/OnNewOutput until Start() moves it back to
+    // RUNNING. Without this restart the feed loop deadlocks waiting for a
+    // free input buffer ("hw decoder input stalled (no free buffer in 10s)")
+    // and output release fails with ret=8 "Not in running state".
+    ret = OH_VideoDecoder_Start(codec_);
+    if (ret != AV_ERR_OK) {
+        OH_LOG_Print(LOG_APP, LOG_ERROR, 0xFF00, "FFVideoHW", "restart after flush failed ret=%{public}d", ret);
     }
     resetPacing_.store(true, std::memory_order_release);
     inputCv_.notify_all();
@@ -231,6 +251,7 @@ void HwVideoDecoder::OnErrorCb(OH_AVCodec* codec, int32_t code, void* userData)
     auto* self = static_cast<HwVideoDecoder*>(userData);
     std::string msg = "hw decoder error code=" + std::to_string(code);
     OH_LOG_Print(LOG_APP, LOG_ERROR, 0xFF00, "FFVideoHW", "%{public}s", msg.c_str());
+    self->lastError_ = msg;
     if (self->onError != nullptr) {
         self->onError(msg);
     }
@@ -309,11 +330,6 @@ void HwVideoDecoder::RenderLoop()
             pendingOutputs_.pop_front();
         }
 
-        if (resetPacing_.exchange(false, std::memory_order_acquire)) {
-            // Post-flush (VOD seek): re-arm the pacing anchor at this frame.
-            firstPtsUs = INT64_MIN;
-        }
-
         if ((item.flags & AVCODEC_BUFFER_FLAGS_EOS) != 0) {
             OH_VideoDecoder_FreeOutputBuffer(codec_, item.index);
             if (onEnd != nullptr) {
@@ -360,11 +376,22 @@ void HwVideoDecoder::RenderLoop()
         }
 
         // real-time pacing based on pts delta (same semantics as the software path)
+        if (resetPacing_.exchange(false, std::memory_order_acquire) ||
+            speedChanged_.exchange(false, std::memory_order_acquire)) {
+            // Post-flush (VOD seek) or a speed change: re-arm the pacing
+            // anchor at this frame so the old anchor cannot burst or stall
+            // the new timeline.
+            firstPtsUs = INT64_MIN;
+        }
+        const double spd = speed_.load(std::memory_order_relaxed);
         if (firstPtsUs == INT64_MIN) {
             firstPtsUs = item.ptsUs;
             startWall = std::chrono::steady_clock::now();
         } else if (item.ptsUs > firstPtsUs) {
-            double targetMs = static_cast<double>(item.ptsUs - firstPtsUs) / 1000.0;
+            // speed divides the wall target: content delta D renders in
+            // D/speed wall seconds
+            double targetMs = static_cast<double>(item.ptsUs - firstPtsUs) / 1000.0 /
+                (spd > 0.0 ? spd : 1.0);
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - startWall).count();
             int64_t waitMs = static_cast<int64_t>(targetMs) - static_cast<int64_t>(elapsed);

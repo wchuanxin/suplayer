@@ -86,8 +86,22 @@ public:
     // drops the session's routing reference and unblocks the demux thread.
     void DetachQueue(PacketQueue* queue);
 
+    // 方案⑤ shared-session in-pipeline seek: arm a session-wide seek
+    // (last-write-wins). The demux thread applies it at the top of its loop
+    // — avformat_seek_file on the shared context (demux thread is the sole
+    // fmt_ owner), then NotifySeek on every subscriber queue (backlog drop +
+    // epoch advance) so each decode worker re-anchors locally and completes
+    // its pending seek ack. Returns false when the demux thread is gone
+    // (EOF/stopped) and the seek can never be applied.
+    bool RequestSharedSeek(int64_t targetMs);
+
     AVFormatContext* fmt() { return fmt_; }
     AVProgram* program() { return program_; }
+
+    // 方案⑤ fast-landing: the video stream the shared seek positions on
+    // (first routed video stream — program member when a program is locked).
+    // Demux-thread only. nullptr when the source has no video stream.
+    AVStream* FindSeekVideoStream() const;
 
 private:
     DemuxSession() = default;
@@ -165,7 +179,22 @@ private:
     // F1 runtime catch-up: wall ms of the last BufferedAheadMs check
     // (0 = none yet); only armed when targetLatencyMs > 0.
     int64_t lastCatchupCheckMs_ = 0;
+    // 方案⑤ armed shared seek target (INT64_MIN = none); exchanged by the
+    // demux thread at the top of each loop pass (last-write-wins).
+    std::atomic<int64_t> pendingSharedSeekMs_{ INT64_MIN };
     std::thread demuxThread_;
+
+    // Bounded-join teardown: Shutdown waits for the demux thread at most
+    // DEMUX_JOIN_TIMEOUT_MS. A read stuck past that (live stall watchdog
+    // alone allows up to LIVE_READ_STALL_MS) must not hold the NAPI caller
+    // thread — a main-thread join interlock with the demux burst traffic is
+    // the THREAD_BLOCK_6S appfreeze trigger. Past the deadline the thread is
+    // detached (orphan) and closes fmt_ itself on exit; exitMtx_ makes the
+    // exited/orphan handoff race-free (no double close, no leak).
+    static constexpr int DEMUX_JOIN_TIMEOUT_MS = 2000;
+    std::mutex exitMtx_;
+    std::atomic<bool> demuxExited_{ false };
+    std::atomic<bool> orphanClose_{ false };
 };
 
 } // namespace ffmpeg

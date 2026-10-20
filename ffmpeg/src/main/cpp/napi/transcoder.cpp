@@ -312,7 +312,7 @@ static void RunTranscode(TranscodeWork* w)
     };
 
     std::string ioErr;
-    if (!AttachStreamIO(ifmt, w->src, ioErr)) {
+    if (!AttachCustomIO(ifmt, w->src, ioErr)) {
         if (!ioErr.empty()) {
             fail(ioErr);
             return;

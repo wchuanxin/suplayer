@@ -110,6 +110,16 @@ SourceResolution ResolveSource(const std::string& src, const NetOptions& opts,
 
     HlsPlaylistDoc doc;
     ParseHlsPlaylist(text, src, doc);
+    res.isHlsPlaylist = IsHlsPlaylistText(text);
+    if (!res.isHlsPlaylist) {
+        // Fetched body is not HLS: server error page / empty 200 during a
+        // disruption window. Log head bytes so the next occurrence of a
+        // probe-rejected open is diagnosable from hilog alone.
+        std::string head = text.substr(0, 32);
+        OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFDemux",
+            "playlist resolve: fetched %{public}zu bytes, not an HLS playlist (head='%{public}.32s')",
+            text.size(), head.c_str());
+    }
 
     if (doc.isMaster) {
         if (wantVariant) {
@@ -148,6 +158,17 @@ SourceResolution ResolveSource(const std::string& src, const NetOptions& opts,
         res.liveStartIndex = LatencyToLiveStartIndex(opts.targetLatencyMs, text);
     }
     return res;
+}
+
+void ForceHlsInputFormat(AVFormatContext* fmt)
+{
+    if (fmt == nullptr || fmt->iformat != nullptr) {
+        return;
+    }
+    const AVInputFormat* hls = av_find_input_format("hls");
+    if (hls != nullptr) {
+        fmt->iformat = hls;
+    }
 }
 
 } // namespace ffmpeg

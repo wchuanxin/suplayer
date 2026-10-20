@@ -40,6 +40,11 @@ void ParseHlsPlaylist(const std::string& text, const std::string& baseUrl, HlsPl
 // the tag, but be liberal in what we accept).
 int32_t ParseTargetDurationSec(const std::string& text);
 
+// True when the text is an HLS playlist (master or media): mirrors FFmpeg's
+// hls_probe acceptance (#EXTM3U header + a structural tag) WITHOUT its
+// extension/mime gating, which 7.1 applies to non-.m3u8 playlist URLs.
+bool IsHlsPlaylistText(const std::string& text);
+
 // Variant selection (A2):
 //  - explicit variantIndex in [0, n) selects that variant;
 //  - else maxBandwidth > 0 selects the highest-bandwidth variant whose

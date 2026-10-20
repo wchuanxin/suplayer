@@ -48,7 +48,7 @@ struct ProgramResult {
     int32_t pcrPid = -1;
     int32_t pmtVersion = -1;
     int32_t flags = 0; // AV_PROGRAM_RUNNING = 1
-    // HLS variant bandwidth (BANDWIDTH attribute, bits/s) — the FFmpeg hls
+    // HLS variant bandwidth (BANDWIDTH attribute, bits/s) 鈥?the FFmpeg hls
     // demuxer publishes it as the program's "variant_bitrate" metadata; 0
     // when absent (plain mpegts etc.).
     int64_t bandwidth = 0;
@@ -147,7 +147,7 @@ void ProbeExecute(napi_env env, void* data)
 {
     auto* ctx = static_cast<ProbeContext*>(data);
     // B1 shared demux: when a live session exists for this source + matching
-    // demux options, reuse its already-open context for the metadata read —
+    // demux options, reuse its already-open context for the metadata read 鈥?
     // no extra connection, no packet consumption. The shared_ptr keeps the
     // session alive until the metadata is copied.
     std::shared_ptr<DemuxSession> reuse = DemuxSession::Find(ctx->src, ctx->netOpts);
@@ -159,7 +159,7 @@ void ProbeExecute(napi_env env, void* data)
         ApplyOpenOptions(nullptr, &dict, ctx->netOpts);
         fmt = avformat_alloc_context();
         std::string ioErr;
-        if (!AttachStreamIO(fmt, ctx->src, ioErr)) {
+        if (!AttachCustomIO(fmt, ctx->src, ioErr)) {
             if (!ioErr.empty()) {
                 avformat_free_context(fmt);
                 fmt = nullptr;

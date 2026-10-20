@@ -284,9 +284,14 @@ export interface FFOverflowEvent {
 
 /** Stream discontinuity: 'resync' = explicit backlog resync
  *  (flushToKeyframe / flushBacklog), 'reconnect' = the shared demux session
- *  rebuilt its connection in place (see the 'reconnected' event). */
+ *  rebuilt its connection in place (see the 'reconnected' event),
+ *  'seek' = in-pipeline seek re-anchor (effective landing target in ms —
+ *  may precede the requested target when the pre-target keyframe gap is
+ *  too large to decode through, see the kernel fast-landing path). */
 export interface FFDiscontinuityEvent {
   reason: string;
+  /** reason === 'seek' only: effective re-anchor target (ms, stream pts domain) */
+  seekMs?: number;
 }
 
 /** Network/queue health of a decoder fed by the shared demux session.
