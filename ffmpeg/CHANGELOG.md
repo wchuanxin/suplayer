@@ -1,5 +1,146 @@
 # Changelog
 
+English | [中文](CHANGELOG_zh.md)
+
+## 1.12.0
+
+### User-level playback speed — `setSpeed` on all three decoders
+
+- New `FFAudioDecoder.setSpeed(speed)` / `FFVideoDecoder.setSpeed(speed)` /
+  `FFSubtitleDecoder.setSpeed(speed)`: user-level playback speed, clamped to
+  [0.5, 2.0] (NaN falls back to 1.0), callable before or during playback.
+- Audio is pitch-preserved: an FFmpeg `atempo` filter graph
+  (abuffer → atempo → abuffersink) is inserted after the per-track
+  resampler. Emitted PCM chunk pts stays on the content timeline — N output
+  samples at speed S cover `N*S/sampleRate` seconds of content — so the
+  app's `AudioRenderer` configuration and content-clock progress math are
+  unchanged. 1.0x bypasses the graph entirely (direct pass-through); a
+  change drains and rebuilds the atempo graph at a chunk boundary; a seek
+  resets it (the atempo window holds pre-seek audio). Orthogonal to
+  `setRate` micro-varispeed: the effective output rate is `speed × rate`.
+- Video render pacing (hardware render thread and software path alike) and
+  paced subtitle pacing divide their pts-delta wall target by the speed —
+  content delta D displays in `D/speed` wall seconds — re-anchoring at the
+  next frame on a change; frame/subtitle pts events stay on the content
+  timeline. A pre-start `setSpeed()` is replayed when the decoder starts
+  (the hardware decoder also re-applies it across a mid-stream flush).
+
+### `fd://` descriptor sources
+
+- New `fd://<n>` source scheme, accepted everywhere a file path/URL is
+  (`probe`, `extractFrame`, `transcode`, all three decoders): `<n>` is a
+  POSIX file descriptor opened in this process (e.g. from `@ohos.file.fs`).
+  The descriptor stays caller-owned — the kernel reads/seeks it through a
+  custom AVIOContext but never closes it; `AVSEEK_SIZE` is resolved with a
+  save/end/restore triplet so the descriptor position is untouched. An
+  invalid (closed) descriptor fails the open with a clear error.
+
+### Teardown & fail-fast hardening
+
+- Bounded-join demux teardown: a live read can legitimately sit inside
+  `av_read_frame` for up to the 30 s read-stall watchdog; joining that
+  thread from `stop()`/`close()` blocked the JS caller just as long
+  (appfreeze risk). `DemuxSession::Shutdown` now waits a 2 s join budget,
+  then detaches the demux thread — the orphaned thread closes the format
+  context itself on exit (race-free exited/orphan handoff under a mutex:
+  exactly one side closes, no double close, no leak).
+- Software-render surface-wedge fail-fast: a poisoned BufferQueue (every
+  `NativeWindowRequestBuffer` failing, e.g. 41206000 after a lingering
+  codec-service producer wedged the surface) spun the decode loop at full
+  speed forever — observed 28 minutes / 34k log lines / 85% CPU. After ~1 s
+  of consecutive request-buffer failures the decoder now emits an `error`
+  ("video surface wedged: ..., needs surface rebuild") and stops instead of
+  spinning, handing recovery to the app's reload/surface-rebuild chain.
+- Orderly hardware teardown: `HwVideoDecoder::Fail()` now calls
+  `OH_VideoDecoder_Stop` before `OH_VideoDecoder_Destroy` even from the
+  configured/error states — Destroy alone left the codec service's
+  BufferQueue producer attached to the surface on some devices, permanently
+  wedging any later software producer on that surface
+  (`NativeWindowRequestBuffer` 41206000). Codec error callbacks and input
+  stalls now also record `GetLastError()`, so a teardown/fallback reports
+  the underlying hardware error instead of a generic message.
+- Subtitle decoder sets `pkt_timebase` before `avcodec_open2`: text cues
+  whose timing lives only in the container (SRT without `-->` lines)
+  previously decoded with pts/duration 0, so apps could never clear them
+  on expiry — a dialog stayed on screen until the next cue replaced it.
+
+## 1.11.0
+
+### NV12 direct-write software rendering
+
+- The software video path skips the RGB conversion pass: for
+  NV12/YUV420P/YUV420P10LE frames with even dimensions, SDR transfer and
+  non-full-range YUV, the window is negotiated as NV12
+  (`NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP`) and decoded frames are written
+  directly into the semi-planar buffer — NV12 frames plane-wise memcpy,
+  other eligible formats converted straight into the mapped planes by
+  swscale (no intermediate buffer).
+- The SDR YUV→RGB matrix is declared to the compositor (`SET_COLOR_GAMUT`):
+  BT.601 for SD/legacy primaries, BT.709 for HD+ and unspecified.
+- Plane-layout resolution is defensive: `OH_NativeBuffer_MapPlanes` is
+  strictly validated (some gralloc HDIs report garbage layouts — observed
+  planeCount=3, rowStride 1/2) with a `BufferHandle`-derived fallback, and
+  every candidate layout is bounds-checked against the buffer size.
+- Ineligible content (odd dimensions, full-range/JPEG, HDR transfer, other
+  pixel formats) keeps the classic RGBA_8888 path.
+
+### Mid-stream hardware → software fallback
+
+- With `hw: 'auto'` a mid-stream hardware failure (codec-service error,
+  input stall, feed failure) no longer ends playback: the worker reroutes
+  into the always-open software decoder — stops/destroys the codec,
+  recreates the window from the captured surfaceId (the codec service
+  consumed the old surface), flushes the decoder and drops to the next
+  keyframe; live sources jump the shared backlog to its newest keyframe
+  (one keyframe-interval gap), VOD keeps its backlog and skips only the
+  undecodable mid-GOP packets.
+- The switch surfaces as a fresh `'info'` event (`{ backend: 'sw' }`) plus
+  `discontinuity('hw2sw')`, so the app can update its UI and statistics.
+- HDR content is excluded (the software path cannot tone-map PQ/HLG) — the
+  error surfaces to the app as before. `hw: 'force'` keeps bubbling
+  hardware errors up.
+
+## 1.10.1
+
+### Shared-connection `seekTo`
+
+- `seekTo(targetMs)` now works on shared-demux connections as well: the
+  shared demux session applies the seek session-wide on its demux thread
+  (`avformat_seek_file` — the sole `fmt_` owner) and notifies every
+  subscriber queue (backlog drop + seek-epoch advance); each decoder
+  re-anchors locally (decoder/hardware flush, pacing, pre-target drop
+  filter) and completes its pending seek ack on the notify. A still-pending
+  shared seek is superseded by a newer one (last-write-wins — the
+  superseded ack resolves immediately). A failed seek still notifies the
+  queues (`ok=false`) so armed acks fail fast instead of timing out.
+  Private-connection seeks behave exactly as before.
+- Fast-landing: when the keyframe at/before the target is further back
+  than 12 s, decoding through the whole pre-target intra-GOP span would
+  stall the landing for many seconds; consumers re-anchor on that keyframe
+  instead (MX-Player-style fast seek) and the effective landing target is
+  published through the new `discontinuity('seek')` event —
+  `FFDiscontinuityEvent.seekMs` (ms, stream pts domain). Smaller gaps keep
+  exact landing.
+
+### HLS open & hardware flush fixes
+
+- Disguised-playlist open fix: FFmpeg 7.1's `hls_probe` rejects playlist
+  URLs whose path lacks `.m3u8` when the response MIME is not `mpegurl`
+  (e.g. `.php` live playlists served as `text/plain`); the
+  `allowedExtensions` hints only relax SEGMENT checks after the demuxer is
+  chosen. When the source resolver already fetched and validated the
+  playlist text (`#EXTM3U` + a structural tag — during variant/latency
+  resolution), the HLS input format is now preset on the context so
+  `avformat_open_input` skips probing entirely; a non-playlist body (server
+  error page / empty 200) is logged with head bytes for diagnosis.
+- Hardware decoder flush fix: `OH_VideoDecoder_Flush` leaves the codec in
+  the FLUSHED state, where no input buffers are re-issued — after a VOD
+  seek the feed loop deadlocked waiting for a free input buffer ("hw
+  decoder input stalled (no free buffer in 10s)") and buffer release
+  failed with "Not in running state". The codec is restarted
+  (`OH_VideoDecoder_Start`) right after the flush, and a failed flush
+  aborts the buffer-reclaim step instead of proceeding half-flushed.
+
 ## 1.10.0
 
 ### Hardware decode for length-prefixed containers (MP4/MKV HDR)

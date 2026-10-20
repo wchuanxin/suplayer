@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-基于 [`@suplayer/ffmpeg`](../ffmpeg/README.md) 媒体内核的播放器 UI 组件库：
+基于 [`@suplayer/ffmpeg`](../ffmpeg/README_zh.md) 媒体内核的播放器 UI 组件库：
 提供音视频同步播放组件（`SupPlayer`）及其控制器（`SupPlayerController`），
 可直接嵌入任意页面。
 
@@ -31,7 +31,7 @@
 ```
 
 `cmplayer` 自身依赖 `@suplayer/ffmpeg`（工作区内为 `file:../ffmpeg` —
-外部使用时请改为已发布版本号，如 `^1.7.0`）。
+外部使用时请改为已发布版本号，如 `^1.12.0`）。
 
 ## 快速开始
 
@@ -102,10 +102,10 @@ release(): void                                      // 停止并释放渲染器
 ## 权限
 
 网络源需要在宿主 HAP 的 `module.json5` 中声明 `ohos.permission.INTERNET`
-（见 [ffmpeg/README.md](../ffmpeg/README.md#permissions)）。
+（见 [ffmpeg/README_zh.md](../ffmpeg/README_zh.md#权限)）。
 
 ## 许可证
 
 LGPL-2.1-or-later（项目代码，见 [../LICENSE](../LICENSE)）。其依赖
 `@suplayer/ffmpeg` 携带的原生 `libffmpeg.so` 以 GPL-3.0-or-later 分发 — 见
-[../ffmpeg/README.md#license](../ffmpeg/README.md#license)。
+[../ffmpeg/README_zh.md#许可证](../ffmpeg/README_zh.md#许可证)。

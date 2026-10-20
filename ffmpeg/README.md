@@ -1,5 +1,7 @@
 # @suplayer/ffmpeg
 
+English | [中文](README_zh.md)
+
 FFmpeg-powered media kernel for HarmonyOS (compatible with API 24+,
 HarmonyOS 6.1.1 and later). Ships as a HAR with prebuilt native libraries for
 `arm64-v8a` and `x86_64`.
@@ -18,11 +20,20 @@ HarmonyOS 6.1.1 and later). Ships as a HAR with prebuilt native libraries for
   switching (all audio tracks decoded in parallel, switching re-routes the
   output with zero re-buffering), pause/resume.
 - **Video decoding** — software decoding with direct `XComponent`/`OH_NativeWindow`
-  Surface rendering. Chinese AVS standards are supported in software: AVS2
+  Surface rendering: eligible SDR YUV frames are written straight to the
+  surface as NV12 (no RGB conversion pass), other content renders through
+  RGBA. H.264/HEVC hardware decoding (AVCodec Kit) runs side by side with a
+  always-ready software decoder, and with `hw: 'auto'` a mid-stream hardware
+  failure reroutes playback into software instead of ending it. Chinese AVS
+  standards are supported in software: AVS2
   (GB/T 33475.2, via libdavs2) and AVS3 (AVS3-P2/IEEE.1857.10, via libuavs3d),
   as found in CCTV 4K/UHD broadcast TS streams (stream types 0xd2/0xd4). AVS1
   (CAVS, stream type 0x42) decodes only in its Jizhun baseline profile; the
   AVS+ broadcast profile (AVS-P16) is not supported by upstream FFmpeg/davs2.
+- **Playback speed** — user-level 0.5x–2.0x on all three decoders
+  (`setSpeed`): pitch-preserved audio via the FFmpeg `atempo` filter, video /
+  subtitle pacing scaled on the content timeline, A/V sync preserved by
+  construction (both tracks stay on the content clock).
 - **Subtitles** — DVB/broadcast subtitle decoding to composited RGBA bitmaps
   (or UTF-8 text), enabled from the container's declaration (a PMT entry is
   enough, even when the subtitle PID never delivers data).
@@ -31,6 +42,9 @@ HarmonyOS 6.1.1 and later). Ships as a HAR with prebuilt native libraries for
 - **Transcoding / muxing** — full pipeline: decode → filter (`setpts`, `scale`,
   `fps`) → encode (OpenH264 for H.264, native AAC for audio) → MP4/MPEG-TS mux
   with `+faststart`.
+- **Custom & descriptor I/O** — JS-backed byte sources
+  (`registerStreamIO`, `"streamio:<id>"` URLs) and POSIX descriptor sources
+  (`"fd://<n>"` URLs) are accepted everywhere a file path is.
 - **Network & live streaming** — HTTPS (OpenSSL), HTTP, HLS (live and VOD),
   plain TS over HTTP. `src` accepts URLs anywhere a file path is accepted.
 
@@ -53,7 +67,7 @@ Or declare the dependency in `oh-package.json5`:
 ```json5
 // oh-package.json5
 "dependencies": {
-  "@suplayer/ffmpeg": "^1.7.0"
+  "@suplayer/ffmpeg": "^1.12.0"
 }
 ```
 
@@ -196,7 +210,7 @@ Optional network/live options accepted by `probe` and both decoders' `open`:
 |---|---|---|
 | `userAgent` | `Lavf/7.1.1` | HTTP `User-Agent`; also applied to all HLS segment/key downloads |
 | `headers` | none | Extra HTTP headers, CRLF-separated (e.g. `"Referer: https://x\r\nCookie: y=z"`) |
-| `allowedExtensions` | FFmpeg whitelist | HLS segment extension whitelist, comma-separated. Pass `'ALL'` (and setting this at all) disables strict extension/format matching for streams whose playlist/segment URLs use disguised extensions (e.g. `.php` playlists, `.jpg`-named TS segments) |
+| `allowedExtensions` | FFmpeg whitelist | HLS segment extension whitelist, comma-separated. Pass `'ALL'` (and setting this at all) disables strict extension/format matching for streams whose playlist/segment URLs use disguised extensions (e.g. `.php` playlists, `.jpg`-named TS segments). Note: FFmpeg 7.1's `hls_probe` also rejects playlist URLs whose path lacks `.m3u8` while the response MIME is not `mpegurl` — a rejection `allowedExtensions` cannot rescue because it only relaxes segment checks after demuxer selection. When the source resolver fetches the playlist for variant/latency selection (`variantIndex` / `maxBandwidth` / `targetLatencyMs`) and validates the text (`#EXTM3U` + a structural tag), the HLS input format is preset on the context so the open skips probing entirely |
 | `liveStartIndex` | `-3` | HLS live: segment index to start at; negative counts back from the live edge. `-1` starts at the newest segment (lowest latency, may join mid-GOP) |
 | `analyzeMs` | FFmpeg default | Cap `avformat_find_stream_info` analysis duration in ms — lower values speed up live startup |
 | `hw` | `'auto'` | Video decode backend: `'auto'` prefers the hardware decoder and falls back to software on failure, `'force'` requires hardware, `'never'` always uses software (FFVideoDecoder only) |
@@ -230,9 +244,16 @@ subscription:
   backlog episode — packets dropped in this episode. Also fires while
   paused (worker-side counter polling), which is exactly when a live
   backlog overflows.
-- `'discontinuity'` (`{ reason }`): stream discontinuity. `'resync'` after
-  an explicit `flushToKeyframe()` / `flushBacklog()` or a queue backlog
-  drop; `'reconnect'` after the session rebuilt its connection in place.
+- `'discontinuity'` (`{ reason, seekMs? }`): stream discontinuity. `'resync'`
+  after an explicit `flushToKeyframe()` / `flushBacklog()` or a queue backlog
+  drop; `'reconnect'` after the session rebuilt its connection in place;
+  `'seek'` after a shared-connection `seekTo` re-anchor — the payload
+  carries `seekMs`, the effective landing target (ms, stream pts domain),
+  which may precede the requested target when the pre-target keyframe gap
+  is too large to decode through (fast-landing, see
+  [Runtime seek](#runtime-seek--frame-capture)); `'hw2sw'` (video only)
+  after a mid-stream hardware → software decode switch (see
+  [Hardware decoding](#hardware-decoding)).
 - `'reconnected'` (video/audio only, no payload): the shared session
   recovered from a 401/403/404/429 by re-resolving the source and
   reopening; stream indexes stay valid. Followed by
@@ -264,7 +285,8 @@ switchTrack(streamIndex: number): void  // instant hot switch, mid-playback
 flushBacklog(): void              // live A/V resync: drop queue backlog
 detach(): void                    // leak-path cleanup, no thread joins
 setRate(rate: number): void       // varispeed [0.98, 1.02] for A/V sync
-seekTo(targetMs: number): Promise<void>  // runtime VOD seek (private connections)
+setSpeed(speed: number): void     // user speed [0.5, 2.0], pitch preserved (atempo)
+seekTo(targetMs: number): Promise<void>  // runtime VOD seek (any connection)
 getBufferStats(): FFBufferStats
 getStats(): FFPlaybackStats
 pause(): void; resume(): void
@@ -295,8 +317,9 @@ on(event: 'discontinuity', cb: (ev: FFDiscontinuityEvent) => void): void
 on(event: 'reconnected', cb: () => void): void
 start(surfaceId: string): void    // renders into XComponent surface
 flushToKeyframe(): void            // live A/V resync: drop backlog to newest keyframe
+setSpeed(speed: number): void      // user speed [0.5, 2.0]: pacing /speed, content pts unchanged
 detach(): void                     // leak-path cleanup, no thread joins
-seekTo(targetMs: number): Promise<void>   // runtime VOD seek (private connections)
+seekTo(targetMs: number): Promise<void>   // runtime VOD seek (any connection)
 captureFrame(): Promise<FFCapturedFrame>  // next decoded frame as RGBA8888 (sw decode)
 getBufferStats(): FFBufferStats
 getStats(): FFPlaybackStats
@@ -306,15 +329,54 @@ stop(): void; close(): void
 
 #### Runtime seek & frame capture
 
-`seekTo(targetMs)` works on private connections (`sharedDemux: false`): it
-seeks to the keyframe at/before the target, flushes the decoder (the
-hardware path is flushed through `OH_VideoDecoder_Flush`), re-anchors the
-pacing clock and drops pre-target frames, so playback resumes precisely at
-the target. It rejects on live/shared connections, while another seek is in
-flight, or after a 15 s timeout. `captureFrame()` resolves the next decoded
+`seekTo(targetMs)` works on any connection:
+
+- **Private connection**: seeks to the keyframe at/before the target,
+  flushes the decoder (the hardware path is flushed through
+  `OH_VideoDecoder_Flush`), re-anchors the pacing clock and drops
+  pre-target frames, so playback resumes precisely at the target. A seek
+  in flight rejects a concurrent one.
+- **Shared connection** (`sharedDemux: true`): the shared demux session
+  applies the seek session-wide on its demux thread and notifies every
+  subscriber; this decoder re-anchors (decoder/hardware flush, pacing,
+  pre-target drop filter) on the notify. A still-pending shared seek is
+  superseded by a newer one (last-write wins — the superseded promise
+  resolves immediately).
+
+**Fast-landing**: when the keyframe at/before the target is further back
+than 12 s, decoding through the whole pre-target intra-GOP span would
+stall the landing for many seconds — consumers re-anchor on that keyframe
+instead (MX-Player-style fast seek) and the effective landing target is
+published through `discontinuity('seek')` (`seekMs` payload, ms). Smaller
+gaps keep exact landing.
+
+Both paths reject when the decoder/session is not running or after a 15 s
+timeout. `captureFrame()` resolves the next decoded
 frame as `{ width, height, data: ArrayBuffer }` (RGBA8888, native size) —
 software decode only, so open with `hw: 'never'` when snapshots are needed;
 it is safe to call while playback is running or paused.
+
+#### Playback speed
+
+`setSpeed(speed)` on any decoder clamps the user-level playback speed to
+[0.5, 2.0] (callable before or during playback):
+
+- **Audio**: pitch-preserved via an `atempo` filter inserted after the
+  resampler. Emitted PCM chunk pts stays on the content timeline — N
+  output samples at speed S cover `N*S/sampleRate` seconds of content —
+  so `AudioRenderer` configuration and content-clock progress math are
+  unchanged. Orthogonal to `setRate` micro-varispeed (effective output
+  rate = speed × rate); a change rebuilds the filter at a chunk boundary;
+  a seek resets it.
+- **Video**: the render pacing (hardware render thread and software path
+  alike) divides its pts-delta wall target by the speed — content delta D
+  displays in D/speed wall seconds. Frame pts events stay on the content
+  timeline; a change re-anchors the pacing at the next frame.
+- **Subtitles**: paced-mode pacing divides its pts-delta wall target by
+  the speed, keeping subtitles in lockstep with the audio/video pacing.
+
+Keep all three decoders at the same speed: audio and video both stay on
+the content timeline, so A/V sync is preserved by construction.
 
 #### Hardware decoding
 
@@ -334,6 +396,31 @@ dimensions never block decode, and the container's frame-rate metadata is
 advisory only (a mismatch logs a warning). On failure, `hw: 'force'` reports
 the reason through the `'error'` event, while `hw: 'auto'` silently falls back
 to software.
+
+**Mid-stream fallback**: with `hw: 'auto'`, a hardware failure *during*
+playback (codec-service error, input stall) no longer ends playback — the
+worker reroutes into the always-open software decoder: the codec is stopped
+and destroyed, the window is recreated from the captured surfaceId (the codec
+service consumed the old surface), the decoder is flushed and playback drops
+to the next keyframe (live sources jump the shared backlog to its newest
+keyframe; VOD keeps its backlog and skips only the undecodable mid-GOP
+packets). The switch surfaces as a fresh `'info'` event (`{ backend: 'sw' }`)
+plus `discontinuity('hw2sw')`. HDR content (PQ/HLG) is excluded — the
+software path cannot tone-map it — so its hardware errors surface as before;
+`hw: 'force'` also keeps bubbling errors up.
+
+#### Software rendering (NV12 direct-write)
+
+The software video path renders decoded frames straight into the surface
+without an RGB conversion pass whenever the content allows it: NV12 /
+YUV420P / YUV420P10LE frames with even dimensions, SDR transfer and
+non-full-range YUV negotiate the window as NV12
+(`NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP`) — NV12 frames are copied plane-wise,
+other eligible formats are converted directly into the mapped planes by
+swscale. The SDR YUV→RGB matrix is declared to the compositor
+(`SET_COLOR_GAMUT`, BT.601 for SD/legacy primaries, BT.709 for HD+).
+Ineligible content (odd dimensions, full-range/JPEG, HDR transfer, other
+pixel formats) keeps the classic RGBA_8888 path.
 
 #### HDR (HDR10 / HLG)
 
@@ -356,6 +443,7 @@ on(event: 'error', cb: (msg: string) => void): void
 on(event: 'overflow', cb: (ev: FFOverflowEvent) => void): void
 on(event: 'discontinuity', cb: (ev: FFDiscontinuityEvent) => void): void
 setRawPump(enable: boolean): void  // before start(): forward PES as-is
+setSpeed(speed: number): void      // user speed [0.5, 2.0]: paced mode pacing /speed
 start(paced?: boolean): void      // default true = presentation-time pacing
 detach(): void                    // leak-path cleanup, no thread joins
 pause(): void; resume(): void
@@ -440,6 +528,16 @@ return EOF immediately). Without a `seek` callback the source is
 non-seekable — moov-at-end mp4 files will not open. A seekable source lets
 `seekTo`, `startTimeMs` and the mp4 demuxer work exactly like on a real
 file.
+
+### Descriptor sources — `fd://`
+
+`src` also accepts `"fd://<n>"`, where `<n>` is a POSIX file descriptor
+opened in this process (e.g. from `@ohos.file.fs`), everywhere a file
+path/URL is accepted (`probe`, `extractFrame`, `transcode`, all three
+decoders). The descriptor stays caller-owned: the kernel reads and seeks it
+through a custom AVIOContext but never closes it, and size queries
+(`AVSEEK_SIZE`) are resolved without moving the descriptor position. An
+already-closed descriptor fails the open with a clear error.
 
 ## Supported ABIs
 

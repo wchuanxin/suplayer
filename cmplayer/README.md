@@ -37,7 +37,7 @@ The package is not yet published; reference it locally:
 ```
 
 `cmplayer` itself depends on `@suplayer/ffmpeg` (`file:../ffmpeg` inside the
-workspace — change it to a published version, e.g. `^1.7.0`, when consuming
+workspace — change it to a published version, e.g. `^1.12.0`, when consuming
 from outside).
 
 ## Quick start

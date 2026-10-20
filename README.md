@@ -9,9 +9,15 @@ HarmonyOS media playback stack built on FFmpeg.
 - **Chinese broadcast codecs** — software decoding for AVS2 (GB/T 33475.2,
   via davs2) and AVS3 (AVS3-P2/IEEE.1857.10, via uavs3d) alongside the full
   FFmpeg decoder set; H.264/HEVC hardware decoding (AVCodec Kit) with
-  automatic software fallback — Annex-B (TS/HLS) and length-prefixed
-  (MP4/MKV, hvcC/avcC via bitstream filters) framing alike, with HDR10/HLG
-  hardware streams routed to the display for tone-mapping.
+  automatic software fallback at open time *and* mid-stream — Annex-B
+  (TS/HLS) and length-prefixed (MP4/MKV, hvcC/avcC via bitstream filters)
+  framing alike, with HDR10/HLG hardware streams routed to the display for
+  tone-mapping. The software path renders eligible SDR YUV straight to the
+  surface as NV12 (no RGB conversion pass).
+- **Playback speed** — user-level 0.5x–2.0x (`setSpeed` on the audio,
+  video and subtitle decoders): pitch-preserved audio through the FFmpeg
+  `atempo` filter, video/subtitle pacing scaled on the content timeline,
+  A/V sync preserved by construction.
 - **Live streaming** — HLS live/VOD with live-edge joining, master-playlist
   variant selection (`variantIndex` / `maxBandwidth`) and target-latency
   control (`targetLatencyMs`); HTTP/HTTPS (OpenSSL) and RTSP (TCP/UDP);
@@ -24,11 +30,14 @@ HarmonyOS media playback stack built on FFmpeg.
   the PMT declaration alone) and multi-track audio with zero-gap hot
   switching.
 - **VOD control** — runtime seek (`seekTo`, keyframe-anchored, hardware
-  flush aware), precise `startTimeMs` start offsets and frame capture
+  flush aware, private and shared-demux connections alike with
+  fast-landing), precise `startTimeMs` start offsets and frame capture
   (`captureFrame`, RGBA8888) for snapshots.
 - **Custom I/O** — JS-backed byte sources (`registerStreamIO` +
   `"streamio:<id>"` URLs) bridge SMB shares, custom caches and encrypted
-  stores into probe / decode / transcode without touching C++.
+  stores into probe / decode / transcode without touching C++; POSIX
+  descriptor sources (`"fd://<n>"` URLs) feed already-open file
+  descriptors into the same pipeline.
 - **Transcoding & remuxing** — decode → filter → encode (OpenH264 + AAC) →
   MP4/MPEG-TS muxing, plus stream-copy remux (`vcodec` / `acodec: 'copy'`)
   and extra filter chains (`hqdn3d`, `unsharp`, ...).
@@ -40,7 +49,7 @@ HarmonyOS media playback stack built on FFmpeg.
 
 | Module | Type | Description |
 |---|---|---|
-| [`ffmpeg`](ffmpeg) | HAR (`@suplayer/ffmpeg`) | FFmpeg-powered native media kernel: probe (PSI program table, chapters/tags), frame extraction, audio/video/subtitle decoding with hardware fallback, VOD seek & frame capture, multi-program TS, DVB subtitles, shared-demux live streaming, custom I/O (streamio), transcoding/remux. [Docs](ffmpeg/README.md) |
+| [`ffmpeg`](ffmpeg) | HAR (`@suplayer/ffmpeg`) | FFmpeg-powered native media kernel: probe (PSI program table, chapters/tags), frame extraction, audio/video/subtitle decoding with hardware fallback, VOD seek & frame capture, multi-program TS, DVB subtitles, shared-demux live streaming, custom I/O (streamio), transcoding/remux. [Docs](ffmpeg/README.md) ([中文](ffmpeg/README_zh.md)) |
 | [`sup`](sup) | HAP (demo) | Demo app exercising every feature of the kernel: probe with stream cards and program table, MPTS program playback, frame extraction, audio decode with hot track switching, unified video+audio playback (pause/resume, hw selector, subtitle track selection), DVB subtitle decoding, transcoding |
 | [`cmplayer`](cmplayer) | HAR | Player UI component library on top of the kernel: `SupPlayer` component + `SupPlayerController` (audio master clock, drift correction, audio track switching). [Docs](cmplayer/README.md) |
 | [`tools/ffmpeg-build`](tools/ffmpeg-build) | build scripts | Cross-compilation of FFmpeg 7.1.1 / OpenH264 2.5.0 / davs2 (AVS2) / uavs3d (AVS3) / OpenSSL 3.4.1 for HarmonyOS (`arm64-v8a`, `x86_64`) |
@@ -50,13 +59,14 @@ HarmonyOS media playback stack built on FFmpeg.
 ```json5
 // oh-package.json5
 "dependencies": {
-  "@suplayer/ffmpeg": "^1.10.0"
+  "@suplayer/ffmpeg": "^1.12.0"
 }
 ```
 
 Published on [OHPM](https://ohpm.openharmony.cn). Full API documentation:
-[`ffmpeg/README.md`](ffmpeg/README.md), release notes in
-[`ffmpeg/CHANGELOG.md`](ffmpeg/CHANGELOG.md). Since **1.7.0** the prebuilt
+[`ffmpeg/README.md`](ffmpeg/README.md) ([中文](ffmpeg/README_zh.md)), release
+notes in
+[`ffmpeg/CHANGELOG.md`](ffmpeg/CHANGELOG.md) ([中文](ffmpeg/CHANGELOG_zh.md)). Since **1.7.0** the prebuilt
 `libffmpeg.so` is GPL-3.0-or-later (adds AVS2/AVS3 decoding); 1.6.x is the
 last LGPL build (see [License](#license)).
 
@@ -80,6 +90,10 @@ await vod.open(vodUrl, -1, { hw: 'never' }); // sw decode for snapshots
 vod.start(surfaceId);
 await vod.seekTo(90000);              // runtime seek to 90 s
 const snap = await vod.captureFrame(); // RGBA8888 frame
+
+// 3. Playback speed: pitch-preserved audio, content-timeline video
+audioDec.setSpeed(1.5);               // atempo-filtered PCM
+vod.setSpeed(1.5);                    // pacing /speed, pts unchanged
 ```
 
 ## Building the native libraries
