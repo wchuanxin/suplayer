@@ -115,6 +115,18 @@ export interface FFNetOptions {
    *  every variant exceeds the cap). 0 (default) = no cap. Ignored when
    *  variantIndex is set. */
   maxBandwidth?: number;
+  /** Adaptive bitrate on live HLS master playlists (1.16): when the demux
+   *  starves (throughput under 15% of realtime for ~8s) the session
+   *  downgrades one variant rung via an in-pipeline rebuild; sustained
+   *  health (>= 90% of realtime) probes one rung back up with an
+   *  exponentially growing dwell (30s → 300s) after failed probes. Without
+   *  an explicit variantIndex the open starts at the highest-bandwidth rung
+   *  (maxBandwidth caps the ladder). Subscribers see 'reconnected' +
+   *  discontinuity('reconnect'); getBufferStats() exposes the active
+   *  variant. Requires live + a master playlist with >= 2 known-bandwidth
+   *  variants; an explicit variantIndex pins the variant and disables
+   *  switching. Default false. */
+  abr?: boolean;
   /** Live target latency (F1): derive the HLS live start index from the
    *  playlist's TARGETDURATION so playback enters ~this far behind the live
    *  edge; a runtime catch-up drops backlog that exceeds the target by more
@@ -271,14 +283,39 @@ export interface FFOverflowEvent {
   dropped: number;
 }
 
-/** Stream discontinuity: 'resync' = explicit backlog resync
+/** Machine-readable runtime error category, derived from the error message
+ *  by an ordered keyword match (first hit wins, root-cause substrings take
+ *  precedence over wrappers like "shared demux open failed: ..."):
+ *  'surface' — native window / BufferQueue failures (wedge, geometry, request buffer)
+ *  'hw'      — OH_AVCodec hardware decoder failures / missing capability
+ *  'seek'    — seek failures
+ *  'network' — HTTP/TLS/socket errors embedded in the message
+ *  'open'    — container/codec open and stream-selection failures
+ *  'demux'   — demux/read failures
+ *  'decode'  — decode/filter/resample failures
+ *  'internal'— anything else */
+export type FFErrorCode = 'surface' | 'hw' | 'seek' | 'network' | 'open' | 'demux' | 'decode' | 'internal';
+
+/** Structured error payload passed as the second 'error' event argument.
+ *  The first argument stays the raw message string (pre-1.15 callers only
+ *  reading it keep working); `code` is a best-effort classification, not a
+ *  contract — treat unknown codes as 'internal'. */
+export interface FFError {
+  code: FFErrorCode;
+  message: string;
+}
+
+/** Stream discontinuity reason: 'resync' = explicit backlog resync
  *  (flushToKeyframe / flushBacklog), 'reconnect' = the shared demux session
  *  rebuilt its connection in place (see the 'reconnected' event),
  *  'seek' = in-pipeline seek re-anchor (effective landing target in ms —
  *  may precede the requested target when the pre-target keyframe gap is
  *  too large to decode through, see the kernel fast-landing path). */
+export type FFDiscontinuityReason = 'resync' | 'reconnect' | 'seek' | 'hw2sw';
+
+/** Stream discontinuity event (see FFDiscontinuityReason). */
 export interface FFDiscontinuityEvent {
-  reason: string;
+  reason: FFDiscontinuityReason;
   /** reason === 'seek' only: effective re-anchor target (ms, stream pts domain) */
   seekMs?: number;
 }
@@ -298,6 +335,15 @@ export interface FFBufferStats {
   overflowCount: number;
   /** In-place session rebuilds after token/window/rate-limit errors (A3) */
   reconnectCount: number;
+  /** Active HLS master-playlist variant, 0-based doc index (1.16 ABR);
+   *  -1 when no variant was selected or on a private connection */
+  variantIndex: number;
+  /** BANDWIDTH of the active variant in bits per second (1.16 ABR);
+   *  0 when unknown / not selected */
+  variantBandwidthBps: number;
+  /** Variant switches applied by the session ABR (downgrades + upgrades,
+   *  1.16); 0 when ABR is off */
+  variantSwitchCount: number;
 }
 
 /** Decode-side playback statistics of a decoder. */
@@ -360,7 +406,9 @@ export class FFAudioDecoder {
   open(src: string, streamIndex?: number, options?: FFNetOptions): Promise<FFAudioOpenInfo>;
   on(event: 'pcm', callback: (packet: FFAudioPacket) => void): void;
   on(event: 'end', callback: () => void): void;
-  on(event: 'error', callback: (msg: string) => void): void;
+  /** Second argument (structured payload) added in 1.15.0; pre-1.15
+   *  callbacks reading only the message string keep working. */
+  on(event: 'error', callback: (msg: string, err: FFError) => void): void;
   on(event: 'switched', callback: (info: FFAudioOpenInfo) => void): void;
   on(event: 'overflow', callback: (ev: FFOverflowEvent) => void): void;
   on(event: 'discontinuity', callback: (ev: FFDiscontinuityEvent) => void): void;
@@ -368,6 +416,9 @@ export class FFAudioDecoder {
    *  CDN token). No payload; poll getBufferStats() for counters. Always
    *  followed by discontinuity('reconnect'). */
   on(event: 'reconnected', callback: () => void): void;
+  /** Remove one listener (latest on(event) registration). No argument =
+   *  remove every listener of this decoder (removeAllListeners semantics). */
+  off(event?: 'pcm' | 'end' | 'error' | 'switched' | 'overflow' | 'discontinuity' | 'reconnected'): void;
   start(paced?: boolean): void;
   /** Instant hot switch: all audio tracks of the source (within the locked
    *  program) are decoded in parallel, so switching just re-routes the output —
@@ -419,13 +470,18 @@ export class FFVideoDecoder {
   on(event: 'frame', callback: (info: FFVideoFrameEvent) => void): void;
   on(event: 'info', callback: (info: FFVideoInfoEvent) => void): void;
   on(event: 'end', callback: () => void): void;
-  on(event: 'error', callback: (msg: string) => void): void;
+  /** Second argument (structured payload) added in 1.15.0; pre-1.15
+   *  callbacks reading only the message string keep working. */
+  on(event: 'error', callback: (msg: string, err: FFError) => void): void;
   on(event: 'overflow', callback: (ev: FFOverflowEvent) => void): void;
   on(event: 'discontinuity', callback: (ev: FFDiscontinuityEvent) => void): void;
   /** A3: the shared demux session rebuilt its connection in place (fresh
    *  CDN token). No payload; poll getBufferStats() for counters. Always
    *  followed by discontinuity('reconnect'). */
   on(event: 'reconnected', callback: () => void): void;
+  /** Remove one listener (latest on(event) registration). No argument =
+   *  remove every listener of this decoder (removeAllListeners semantics). */
+  off(event?: 'frame' | 'end' | 'error' | 'info' | 'overflow' | 'discontinuity' | 'reconnected'): void;
   start(surfaceId: string): void;
   pause(): void;
   resume(): void;
@@ -473,7 +529,9 @@ export class FFSubtitleDecoder {
   open(src: string, streamIndex?: number, options?: FFNetOptions): Promise<FFSubtitleOpenInfo>;
     on(event: 'subtitle', callback: (ev: FFSubtitleEvent) => void): void;
     on(event: 'end', callback: () => void): void;
-    on(event: 'error', callback: (msg: string) => void): void;
+    /** Second argument (structured payload) added in 1.15.0; pre-1.15
+     *  callbacks reading only the message string keep working. */
+    on(event: 'error', callback: (msg: string, err: FFError) => void): void;
     /** Raw PES pump mode: emits each demuxed subtitle packet as
      *  (payload: ArrayBuffer, pts: number) — payload is the PES payload from
      *  data_identifier; pts is in stream time_base units (90kHz for MPEG-TS),
@@ -481,6 +539,9 @@ export class FFSubtitleDecoder {
     on(event: 'pes', callback: (payload: ArrayBuffer, pts: number) => void): void;
     on(event: 'overflow', callback: (ev: FFOverflowEvent) => void): void;
     on(event: 'discontinuity', callback: (ev: FFDiscontinuityEvent) => void): void;
+    /** Remove one listener (latest on(event) registration). No argument =
+     *  remove every listener of this decoder (removeAllListeners semantics). */
+    off(event?: 'subtitle' | 'end' | 'error' | 'pes' | 'overflow' | 'discontinuity'): void;
     /** Enables raw PES pump mode: skip avcodec decoding and forward subtitle
      *  packets as-is (see the 'pes' event). Call before start(). */
     setRawPump(enable: boolean): void;
@@ -488,6 +549,11 @@ export class FFSubtitleDecoder {
      *  divides its pts-delta wall target by the speed, keeping subtitles in
      *  lockstep with the audio/video pacing. */
     setSpeed(speed: number): void;
+    /** Embedded text subtitle sync offset in ms (positive = later, negative =
+     *  earlier, clamped to ±60000): shifts the paced wall target — and thus
+     *  the synthesized text-cue end clear — while the emitted event timeline
+     *  (ptsMs/durationMs) stays on the content clock. */
+    setDelayMs(delayMs: number): void;
   /** paced = true (default) displays each display set at its presentation time */
   start(paced?: boolean): void;
   pause(): void;

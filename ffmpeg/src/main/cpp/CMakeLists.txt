@@ -30,6 +30,7 @@ add_library(ffmpeg SHARED
     napi/hls_playlist.cpp
     napi/stream_io.cpp
     napi/transcoder.cpp
+    napi/error_classify.cpp
 )
 
 target_link_libraries(ffmpeg PUBLIC

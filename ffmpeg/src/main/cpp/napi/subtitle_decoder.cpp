@@ -3,6 +3,7 @@
 #include "demux_session.h"
 #include "hls_playlist.h"
 #include "stream_io.h"
+#include "error_classify.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -90,6 +91,23 @@ int InterruptOnStop(void* opaque)
     return flag->load(std::memory_order_relaxed) ? 1 : 0;
 }
 
+// Steady-clock ms since epoch (wall-deadline bookkeeping only: never
+// compared against content pts).
+int64_t NowSteadyMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// #14: text cue without usable timing (cue text lacks a "-->" header and the
+// container block carries no duration) gets a synthesized end, capped by
+// this default; a bounded single-packet lookahead refines it towards the
+// next cue's real start.
+constexpr int64_t TEXT_CUE_LOOKAHEAD_MS = 500;
+constexpr double TEXT_CUE_DEFAULT_MS = 3000.0;
+// #15: embedded text subtitle delay clamp (matches the app's DVB delay limit)
+constexpr int64_t SUBTITLE_DELAY_LIMIT_MS = 60000;
+
 class SubtitleDecoderCore {
 public:
     SubtitleDecoderCore() = default;
@@ -122,6 +140,19 @@ public:
     napi_ref* DiscontinuitySlot()
     {
         return &discontinuityRef_;
+    }
+    // off()/off(event): delete + null every callback reference. JS-thread
+    // only (same thread as TsfnDispatcher reads), so no extra locking.
+    void ClearAllCallbacks(napi_env env)
+    {
+        napi_ref* slots[] = { SubtitleSlot(), EndSlot(), ErrorSlot(), PesSlot(), OverflowSlot(),
+            DiscontinuitySlot() };
+        for (napi_ref* slot : slots) {
+            if (*slot != nullptr) {
+                napi_delete_reference(env, *slot);
+                *slot = nullptr;
+            }
+        }
     }
     napi_ref GetSubtitleCallback() const
     {
@@ -397,6 +428,20 @@ public:
         }
         speed_.store(speed, std::memory_order_relaxed);
     }
+
+    // #15: embedded text subtitle sync offset in ms (positive = later, negative
+    // = earlier). Applied to the paced wall target (and therefore also to the
+    // synthesized text-cue end clear), keeping the subtitle on the content
+    // timeline: only its display instant shifts. Clamp ±60s.
+    void SetDelayMs(int64_t delayMs)
+    {
+        if (delayMs > SUBTITLE_DELAY_LIMIT_MS) {
+            delayMs = SUBTITLE_DELAY_LIMIT_MS;
+        } else if (delayMs < -SUBTITLE_DELAY_LIMIT_MS) {
+            delayMs = -SUBTITLE_DELAY_LIMIT_MS;
+        }
+        delayMs_.store(delayMs, std::memory_order_relaxed);
+    }
     void Stop()
     {
         StopInternal();
@@ -549,6 +594,39 @@ private:
         Emit(msg);
     }
 
+    // #13: synthesized text-cue end. Text streams never produce an empty
+    // display set (every SRT/ASS cue decodes with rects), so the native layer
+    // otherwise emits no clear for them and the JS side must guess cue
+    // expiry from durations. Arm a wall-clock deadline per text cue and emit
+    // a clear at its end, aligning text with the DVB bitmap clear semantics.
+    // Worker-thread only.
+    void ArmPendingClear(double contentEndMs, double durationMs)
+    {
+        if (durationMs <= 0.0) {
+            return;
+        }
+        const double spd = speed_.load(std::memory_order_relaxed);
+        pendingClearContentMs_ = contentEndMs;
+        pendingClearSteadyMs_ =
+            NowSteadyMs() + static_cast<int64_t>(durationMs / (spd > 0.0 ? spd : 1.0));
+    }
+
+    // Fire the pending clear once its wall deadline has passed; true when the
+    // clear was emitted. Worker-thread only.
+    bool FirePendingClearIfDue()
+    {
+        if (pendingClearSteadyMs_ <= 0) {
+            return false;
+        }
+        if (NowSteadyMs() < pendingClearSteadyMs_) {
+            return false;
+        }
+        EmitClear(pendingClearContentMs_);
+        pendingClearSteadyMs_ = 0;
+        pendingClearContentMs_ = 0.0;
+        return true;
+    }
+
     // Raw PES passthrough (DVB pump mode): forward the demuxed subtitle packet
     // (PES payload from data_identifier) untouched 鈥?the JS DVB chain
     // assembles display sets itself. This lets the JS subtitle pipeline reuse
@@ -685,6 +763,8 @@ private:
                 OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFSub", "subtitle text len=%{public}zu",
                     text.size());
                 EmitText(ptsMs, durationMs, text);
+                // #13: schedule the synthesized cue-end clear for text cues
+                ArmPendingClear(endMs, durationMs);
             } else {
                 EmitClear(ptsMs);
             }
@@ -826,11 +906,13 @@ private:
 
     // Unified packet source: the shared demux queue when attached, the private
     // av_read_frame otherwise. Returns av_read_frame-compatible status
-    // (0 = ok, <0 = EOF or aborted).
-    int ReadPacket(AVPacket* pkt)
+    // (0 = ok, <0 = EOF or aborted). `deadlineSteadyMs` (0 = none) bounds the
+    // shared-queue wait; a deadline hit also returns <0 — the caller tells it
+    // from a real end via PacketQueue::IsEnded(). The private read ignores it.
+    int ReadPacket(AVPacket* pkt, int64_t deadlineSteadyMs)
     {
         if (queue_ != nullptr) {
-            return queue_->Pop(pkt, stop_);
+            return queue_->Pop(pkt, stop_, deadlineSteadyMs);
         }
         return av_read_frame(fmt_, pkt);
     }
@@ -843,13 +925,47 @@ private:
         // this local is destroyed.
         std::shared_ptr<DemuxSession> session = session_;
         AVPacket* pkt = av_packet_alloc();
+        // #14 lookahead hand-off: a packet pre-read while probing the next
+        // cue's start is processed on the next loop pass instead of re-read.
+        AVPacket* held = av_packet_alloc();
+        bool haveHeld = false;
         int64_t firstPts = AV_NOPTS_VALUE;
         auto startWall = std::chrono::steady_clock::now();
         bool pausing = false;
         auto pauseStart = std::chrono::steady_clock::now();
+        // #12: shared-seek epoch bookkeeping (primed on the first pass so a
+        // seek armed before start is not mistaken for a re-anchor)
+        uint64_t seekEpochSeen = 0;
+        bool seekEpochPrimed = false;
 
         while (!stop_) {
             PollQueueEvents();
+
+            // #12: shared-session in-pipeline seek re-anchor. The queue drops
+            // the old-timeline backlog and bumps its epoch on every session
+            // seek (PacketQueue::NotifySeek); poll it like the audio/video
+            // workers do and reset the paced anchor + codec. Without this a
+            // stale firstPts makes every post-seek waitMs either negative or
+            // >= 2000 — pacing permanently disabled, cues burst out at decode
+            // speed and flood the JS layer.
+            if (queue_ != nullptr) {
+                const uint64_t epoch = queue_->SeekEpoch();
+                if (!seekEpochPrimed) {
+                    seekEpochPrimed = true;
+                    seekEpochSeen = epoch;
+                } else if (epoch != seekEpochSeen) {
+                    seekEpochSeen = epoch;
+                    const bool seekOk = queue_->SeekSucceeded();
+                    OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFSub",
+                        "session seek re-anchor ok=%{public}d", seekOk ? 1 : 0);
+                    firstPts = AV_NOPTS_VALUE;
+                    pendingClearSteadyMs_ = 0;
+                    pendingClearContentMs_ = 0.0;
+                    if (seekOk && dec_ != nullptr) {
+                        avcodec_flush_buffers(dec_);
+                    }
+                }
+            }
 
             if (paused_) {
                 if (!pausing) {
@@ -862,13 +978,55 @@ private:
             if (pausing) {
                 // Shift the pacing anchor by the paused span so subtitles do
                 // not burst out to catch up with the wall clock after resume.
-                startWall += std::chrono::steady_clock::now() - pauseStart;
+                const auto pausedFor = std::chrono::steady_clock::now() - pauseStart;
+                startWall += pausedFor;
+                // #13: the pending text-cue clear deadline is wall-clock and
+                // must freeze with the content: shift it by the same span.
+                if (pendingClearSteadyMs_ > 0) {
+                    pendingClearSteadyMs_ +=
+                        std::chrono::duration_cast<std::chrono::milliseconds>(pausedFor).count();
+                }
                 pausing = false;
             }
-            int ret = ReadPacket(pkt);
-            if (ret < 0) {
-                EmitEnd();
-                break;
+
+            // #13: a pending text-cue clear that came due while the worker
+            // was decoding/pacing fires before the next read.
+            FirePendingClearIfDue();
+
+            int ret = 0;
+            if (haveHeld) {
+                av_packet_move_ref(pkt, held);
+                haveHeld = false;
+            } else {
+                // #13: bound the blocking read by the pending clear deadline
+                // so a sparse stream (long gap to the next cue) still hides
+                // the expired text on time.
+                const int64_t popDeadline = pendingClearSteadyMs_ > 0 ? pendingClearSteadyMs_ : 0;
+                ret = ReadPacket(pkt, popDeadline);
+                if (ret < 0) {
+                    if (stop_) {
+                        break;
+                    }
+                    // Deadline hit only exists on the shared queue (the
+                    // private av_read_frame ignores the deadline, so its <0
+                    // is always a real end — treating it as a deadline hit
+                    // would spin forever on EOF).
+                    if (popDeadline > 0 && queue_ != nullptr && !queue_->IsEnded()) {
+                        // deadline hit (pending clear due), not a real end
+                        FirePendingClearIfDue();
+                        continue;
+                    }
+                    if (pendingClearSteadyMs_ > 0) {
+                        // stream ended with a text cue on screen: clear it
+                        // before the end event (the JS side would otherwise
+                        // keep the last line displayed forever)
+                        EmitClear(pendingClearContentMs_);
+                        pendingClearSteadyMs_ = 0;
+                        pendingClearContentMs_ = 0.0;
+                    }
+                    EmitEnd();
+                    break;
+                }
             }
             if (pkt->stream_index == streamIndex_) {
                 if (raw_) {
@@ -881,22 +1039,87 @@ private:
                 int got = 0;
                 int used = avcodec_decode_subtitle2(dec_, &sub, &got, pkt);
                 if (used >= 0 && got) {
+                    // #14: text cue without usable timing (cue text lacks a
+                    // "-->" header and the container block carries no
+                    // duration): ffmpeg leaves end_display_time <=
+                    // start_display_time and the JS side could never expire
+                    // the cue (stale line stuck on screen). Bound it with a
+                    // single-packet lookahead (next subtitle packet's start,
+                    // wall-bounded so a sparse network stream does not delay
+                    // the display), capped by TEXT_CUE_DEFAULT_MS.
+                    if (sub.num_rects > 0 && sub.end_display_time <= sub.start_display_time) {
+                        double patchedMs = TEXT_CUE_DEFAULT_MS;
+                        if (!haveHeld && queue_ != nullptr) {
+                            const int64_t nowMs = NowSteadyMs();
+                            int64_t peekDeadline = nowMs + TEXT_CUE_LOOKAHEAD_MS;
+                            if (pendingClearSteadyMs_ > 0 && pendingClearSteadyMs_ < peekDeadline) {
+                                // never let the peek overshoot a due clear
+                                peekDeadline = pendingClearSteadyMs_;
+                            }
+                            const int pret = ReadPacket(held, peekDeadline);
+                            if (pret == 0) {
+                                haveHeld = true;
+                                if (held->stream_index == streamIndex_ &&
+                                    held->pts != AV_NOPTS_VALUE && dec_ != nullptr) {
+                                    const int64_t nextStartMs = av_rescale_q(held->pts,
+                                        dec_->pkt_timebase, AV_TIME_BASE_Q) / 1000;
+                                    const double cueStartMs =
+                                        (sub.pts == AV_NOPTS_VALUE
+                                            ? 0.0
+                                            : static_cast<double>(sub.pts) / (AV_TIME_BASE / 1000.0)) +
+                                        static_cast<double>(sub.start_display_time);
+                                    if (static_cast<double>(nextStartMs) > cueStartMs) {
+                                        const double gap =
+                                            static_cast<double>(nextStartMs) - cueStartMs;
+                                        patchedMs = gap < TEXT_CUE_DEFAULT_MS ? gap : TEXT_CUE_DEFAULT_MS;
+                                    }
+                                }
+                            }
+                        }
+                        sub.end_display_time = sub.start_display_time +
+                            static_cast<unsigned int>(patchedMs > 0.0 ? patchedMs : 0.0);
+                    }
                     if (paced_ && sub.pts != AV_NOPTS_VALUE) {
                         if (firstPts == AV_NOPTS_VALUE) {
                             firstPts = sub.pts;
                             startWall = std::chrono::steady_clock::now();
                         } else {
                             // speed divides the wall target (content delta D
-                            // is due in D/speed wall seconds)
+                            // is due in D/speed wall seconds); #15: the user
+                            // sync offset shifts the display instant only,
+                            // keeping the event timeline untouched.
                             const double spd = speed_.load(std::memory_order_relaxed);
-                            double targetMs =
+                            const double targetMs =
                                 static_cast<double>(sub.pts - firstPts) / (AV_TIME_BASE / 1000.0) /
-                                (spd > 0.0 ? spd : 1.0);
-                            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::steady_clock::now() - startWall).count();
-                            int64_t waitMs = static_cast<int64_t>(targetMs) - static_cast<int64_t>(elapsed);
-                            if (waitMs > 0 && waitMs < 2000) {
-                                std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
+                                    (spd > 0.0 ? spd : 1.0) +
+                                static_cast<double>(delayMs_.load(std::memory_order_relaxed));
+                            // #13: service a pending text-cue clear that comes
+                            // due inside the pacing wait, then keep waiting to
+                            // the wall target — a due clear must not hide
+                            // behind the next cue's display, and the next cue
+                            // must not display early because its wait split.
+                            while (!stop_) {
+                                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - startWall).count();
+                                const int64_t waitMs =
+                                    static_cast<int64_t>(targetMs) - static_cast<int64_t>(elapsed);
+                                if (waitMs <= 0 || waitMs >= 2000) {
+                                    break;
+                                }
+                                int64_t sleepMs = waitMs;
+                                if (pendingClearSteadyMs_ > 0) {
+                                    const int64_t clearRemainMs =
+                                        pendingClearSteadyMs_ - NowSteadyMs();
+                                    if (clearRemainMs <= 0) {
+                                        FirePendingClearIfDue();
+                                        continue;
+                                    }
+                                    if (clearRemainMs < sleepMs) {
+                                        sleepMs = clearRemainMs;
+                                    }
+                                }
+                                std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
+                                FirePendingClearIfDue();
                             }
                         }
                     }
@@ -907,6 +1130,7 @@ private:
             av_packet_unref(pkt);
         }
         av_packet_free(&pkt);
+        av_packet_free(&held);
     }
 
     AVFormatContext* fmt_ = nullptr;
@@ -930,6 +1154,14 @@ private:
     bool raw_ = false;
     // User-level speed (0.5x-2.0x): paced-mode subtitle pacing divides by it
     std::atomic<double> speed_{ 1.0 };
+    // #15: embedded text subtitle sync offset (ms, clamped ±60s): shifts the
+    // paced wall target only; the event content timeline is untouched
+    std::atomic<int64_t> delayMs_{ 0 };
+    // #13: pending synthesized text-cue clear (worker-thread only):
+    // wall deadline (steady ms, 0 = none) + cue-end content position for the
+    // clear event's pts
+    int64_t pendingClearSteadyMs_ = 0;
+    double pendingClearContentMs_ = 0.0;
     std::string lastError_;
 
     std::thread worker_;
@@ -1076,9 +1308,7 @@ void TsfnDispatcher(napi_env env, napi_value jsCallback, void* context, void* da
               napi_value cb = nullptr;
               napi_get_reference_value(env, core->GetErrorCallback(), &cb);
               if (cb != nullptr) {
-                  napi_value msgVal = nullptr;
-                  napi_create_string_utf8(env, msg->err.c_str(), NAPI_AUTO_LENGTH, &msgVal);
-                  napi_call_function(env, undefined, cb, 1, &msgVal, &undefined);
+                  CallErrorCallback(env, undefined, cb, msg->err);
               }
           }
       } else if (msg->type == SUBMSG_PES) {
@@ -1146,30 +1376,7 @@ void CoreFinalize(napi_env env, void* data, void* hint)
     // queue object is being destroyed).
     core->DetachDemux();
     core->ReleaseTsfn();
-    napi_ref sub = core->GetSubtitleCallback();
-    napi_ref end = core->GetEndCallback();
-    napi_ref err = core->GetErrorCallback();
-    napi_ref pes = core->GetPesCallback();
-    napi_ref overflow = core->GetOverflowCallback();
-    napi_ref discont = core->GetDiscontinuityCallback();
-    if (sub != nullptr) {
-        napi_delete_reference(env, sub);
-    }
-    if (end != nullptr) {
-        napi_delete_reference(env, end);
-    }
-    if (err != nullptr) {
-        napi_delete_reference(env, err);
-    }
-    if (pes != nullptr) {
-        napi_delete_reference(env, pes);
-    }
-    if (overflow != nullptr) {
-        napi_delete_reference(env, overflow);
-    }
-    if (discont != nullptr) {
-        napi_delete_reference(env, discont);
-    }
+    core->ClearAllCallbacks(env);
     delete core;
 }
 
@@ -1220,7 +1427,7 @@ napi_value FFSubtitleDecoderOpen(napi_env env, napi_callback_info info)
     if (argc >= 3 && !ParseNetOptions(env, args[2], ctx->netOpts)) {
         delete ctx;
         napi_throw_type_error(env, nullptr,
-            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, program?, httpPersistent?, reconnect?, variantIndex?, maxBandwidth?, targetLatencyMs?, autoReconnect?, reconnectMaxRetries?, dvrSeek? }");
+            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, program?, httpPersistent?, reconnect?, variantIndex?, maxBandwidth?, abr?, targetLatencyMs?, autoReconnect?, reconnectMaxRetries?, dvrSeek? }");
         return nullptr;
     }
 
@@ -1271,6 +1478,61 @@ napi_value FFSubtitleDecoderOn(napi_env env, napi_callback_info info)
         napi_delete_reference(env, *slot);
     }
     napi_create_reference(env, args[1], 1, slot);
+    return nullptr;
+}
+
+napi_value FFSubtitleDecoderOff(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    SubtitleDecoderCore* core = GetCore(env, info);
+    if (core == nullptr) {
+        napi_throw_error(env, nullptr, "FFSubtitleDecoder is not constructed");
+        return nullptr;
+    }
+    // off() with no event: remove all listeners (removeAllListeners).
+    if (argc == 0 || args[0] == nullptr) {
+        core->ClearAllCallbacks(env);
+        return nullptr;
+    }
+    napi_valuetype type = napi_undefined;
+    napi_typeof(env, args[0], &type);
+    if (type == napi_undefined || type == napi_null) {
+        core->ClearAllCallbacks(env);
+        return nullptr;
+    }
+    size_t len = 0;
+    if (napi_get_value_string_utf8(env, args[0], nullptr, 0, &len) != napi_ok) {
+        napi_throw_type_error(env, nullptr, "off(event?: string) expects an event name or no argument");
+        return nullptr;
+    }
+    std::vector<char> ev(len + 1, '\0');
+    napi_get_value_string_utf8(env, args[0], ev.data(), ev.size(), &len);
+    std::string event(ev.data(), len);
+
+    napi_ref* slot = nullptr;
+    if (event == "subtitle") {
+        slot = core->SubtitleSlot();
+    } else if (event == "end") {
+        slot = core->EndSlot();
+    } else if (event == "error") {
+        slot = core->ErrorSlot();
+    } else if (event == "pes") {
+        slot = core->PesSlot();
+    } else if (event == "overflow") {
+        slot = core->OverflowSlot();
+    } else if (event == "discontinuity") {
+        slot = core->DiscontinuitySlot();
+    } else {
+        napi_throw_type_error(env, nullptr,
+            "unsupported event, expect 'subtitle' | 'end' | 'error' | 'pes' | 'overflow' | 'discontinuity'");
+        return nullptr;
+    }
+    if (*slot != nullptr) {
+        napi_delete_reference(env, *slot);
+        *slot = nullptr;
+    }
     return nullptr;
 }
 
@@ -1392,6 +1654,26 @@ napi_value FFSubtitleDecoderSetSpeed(napi_env env, napi_callback_info info)
     double speed = 1.0;
     napi_get_value_double(env, args[0], &speed);
     core->SetSpeed(speed);
+    return nullptr;
+}
+
+napi_value FFSubtitleDecoderSetDelayMs(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    SubtitleDecoderCore* core = GetCore(env, info);
+    if (core == nullptr) {
+        napi_throw_error(env, nullptr, "FFSubtitleDecoder is not constructed");
+        return nullptr;
+    }
+    if (argc < 1) {
+        napi_throw_type_error(env, nullptr, "setDelayMs(delayMs: number) requires a delay argument");
+        return nullptr;
+    }
+    double delayMs = 0.0;
+    napi_get_value_double(env, args[0], &delayMs);
+    core->SetDelayMs(static_cast<int64_t>(delayMs));
     return nullptr;
 }
 

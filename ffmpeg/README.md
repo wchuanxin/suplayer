@@ -217,8 +217,9 @@ Optional network/live options accepted by `probe` and both decoders' `open`:
 | `program` | unset | MPEG-TS program number to lock playback to. When set, only streams of that program are demuxed; automatic stream selection stays inside the program and explicit `streamIndex` values are validated against it. Unknown program numbers fail the `open` |
 | `httpPersistent` | `true` | Keep one HTTP/TCP connection alive across HLS playlist refreshes and segment downloads (`http_persistent=1`) instead of reconnecting for every request — cuts live-edge latency and TLS handshakes |
 | `reconnect` | `true` | Auto-retry failed network requests: `reconnect=1`, `reconnect_streamed=1`, `reconnect_on_network_error=1`, `reconnect_on_http_error=4xx,5xx`, `reconnect_delay_max=5` — survives CDN edge-misses (momentary 404/410 on freshly announced segments) and brief network drops |
-| `variantIndex` | unset | HLS master-playlist variant selection: pick the variant at this 0-based index. Takes precedence over `maxBandwidth` |
-| `maxBandwidth` | `0` | HLS variant bandwidth cap: pick the highest-bandwidth variant whose `BANDWIDTH <= maxBandwidth` (all exceeding → the lowest). `0` = no cap. The master playlist is fetched once before the open and the chosen variant URL replaces the source; any fetch/parse failure falls back to the original URL |
+| `variantIndex` | unset | HLS master-playlist variant selection: pick the variant at this 0-based index. Takes precedence over `maxBandwidth`. With `abr` set it pins the variant (stats still work, switching disabled) |
+| `maxBandwidth` | `0` | HLS variant bandwidth cap: pick the highest-bandwidth variant whose `BANDWIDTH <= maxBandwidth` (all exceeding → the lowest). `0` = no cap. The master playlist is fetched once before the open and the chosen variant URL replaces the source; any fetch/parse failure falls back to the original URL. With `abr` set it caps the switch ladder |
+| `abr` | `false` | Adaptive bitrate on live HLS master playlists: the shared session measures the video stream's media-time progress per 10s window; sustained starvation (< 15% of realtime for ~8s) downgrades one variant rung via an in-place rebuild (ahead of the 15s starve abort), sustained health (≥ 90% of realtime) probes one rung back up with an exponentially growing dwell (30s → 300s after failed probes; 60s of health resets it). Without an explicit `variantIndex` the open starts at the highest-bandwidth rung. Subscribers see `'reconnected'` + `discontinuity('reconnect')`; `getBufferStats()` exposes the active variant (`variantIndex` / `variantBandwidthBps` / `variantSwitchCount`). Armed only for `live` sources with ≥ 2 known-bandwidth master variants |
 | `targetLatencyMs` | `0` | Live target latency: derive `liveStartIndex` from the media playlist's `TARGETDURATION` (`-ceil(target/segDur)`, clamped 1..30) when no explicit `liveStartIndex` is set, and keep converging on it — the shared session drops subscriber backlogs exceeding `target + max(2s, target/2)` every ~5s. `0` = off |
 | `autoReconnect` | auto | In-place session rebuild after 401/403/404/429 read errors (token expiry, sliding-window miss, rate limit): the shared session re-resolves the source (fresh CDN token) and reopens, verifying the stream layout; subscribers get `'reconnected'` + `discontinuity('reconnect')`. `true` = always on, `false` = always off, unset = auto (live on, VOD off) |
 | `reconnectMaxRetries` | `3` | Rebuild attempts before the session gives up (EOF); exponential backoff 1s..8s (2s..16s for HTTP 429) |
@@ -226,7 +227,7 @@ Optional network/live options accepted by `probe` and both decoders' `open`:
 | `audioTracks` | `'all'` | `FFAudioDecoder` track decode mode: `'all'` decodes every audio track in parallel (zero-gap hot switching); `'first'` decodes only the selected track and opens the target track lazily on `switchTrack` — lower CPU/power on multi-track sources, with a brief splice instead of a seamless switch |
 | `frameEventMs` | `0` | Minimum interval in ms between `FFVideoDecoder` `'frame'` events (`0` = every frame). The first frame is always emitted; larger values throttle the NAPI bridge traffic for apps that only need periodic PTS updates (A/V sync, progress) |
 | `startTimeMs` | `0` | VOD start position in ms: the decoder seeks to the keyframe at/before the target and drops pre-target frames (video: decode but no render/emit, audio: no resample/emit), so playback starts precisely at the requested position. `0` = from head. Ignored when the source is not seekable (live streams fall back to normal startup) |
-| `sharedDemux` | `false` | Shared demuxer: every decoder (video / audio / subtitle) opened for the same source with matching demux options (`userAgent`/`headers`/`allowedExtensions`/`liveStartIndex`/`analyzeMs`/`program`/`httpPersistent`/`reconnect`/`variantIndex`/`maxBandwidth`/`targetLatencyMs`/`autoReconnect`/`reconnectMaxRetries`) shares ONE network connection through a process-wide demux session, instead of one connection per decoder. A single demux thread routes packets to per-decoder bounded queues; queue high-water backpressure keeps the self-pacing semantics of private connections (a paused decoder stalls the shared read exactly like it used to stall its own). Concurrent first openers race; the loser attaches to the winner (startup stays parallel, steady state is one connection). Attachers compensate a different `startTimeMs` with their own pre-target drop. `probe()` reuses a live session's context for metadata reads without opening a new connection |
+| `sharedDemux` | `false` | Shared demuxer: every decoder (video / audio / subtitle) opened for the same source with matching demux options (`userAgent`/`headers`/`allowedExtensions`/`liveStartIndex`/`analyzeMs`/`program`/`httpPersistent`/`reconnect`/`variantIndex`/`maxBandwidth`/`abr`/`targetLatencyMs`/`autoReconnect`/`reconnectMaxRetries`) shares ONE network connection through a process-wide demux session, instead of one connection per decoder. A single demux thread routes packets to per-decoder bounded queues; queue high-water backpressure keeps the self-pacing semantics of private connections (a paused decoder stalls the shared read exactly like it used to stall its own). Concurrent first openers race; the loser attaches to the winner (startup stays parallel, steady state is one connection). Attachers compensate a different `startTimeMs` with their own pre-target drop. `probe()` reuses a live session's context for metadata reads without opening a new connection |
 | `rtspTransport` | FFmpeg default | RTSP transport for rtsp:// sources: `'tcp'` (interleaved in the control connection) or `'udp'` |
 | `bufferSize` | `0` | Low-level socket buffer size in bytes (FFmpeg `buffer_size`); raise it for high-bitrate RTSP/multicast feeds |
 | `rwTimeoutMs` | `0` | I/O read/write timeout in ms (FFmpeg `rw_timeout`); guards against a stalled socket on non-HLS protocols. `0` = no timeout |
@@ -258,10 +259,25 @@ subscription:
   recovered from a 401/403/404/429 by re-resolving the source and
   reopening; stream indexes stay valid. Followed by
   `discontinuity('reconnect')`.
+- `'error'` (`(msg: string, err: FFError)`): runtime failure. The first
+  argument is the raw message (pre-1.15 shape, unchanged); the second is a
+  structured `{ code, message }` payload added in 1.15.0, where `code` is a
+  best-effort category derived from the message:
+  `'surface' | 'hw' | 'seek' | 'network' | 'open' | 'demux' | 'decode' |
+  'internal'` (root-cause substrings win over wrappers, e.g. the HTTP 403
+  inside "shared demux open failed: ..." classifies as `network`). Treat
+  unknown codes as `'internal'`. `open()` rejections stay plain strings.
+- `off(event?)` (all three decoders, 1.15.0): remove one event listener
+  (each event holds a single slot), or — called with no argument — every
+  listener of the decoder (`removeAllListeners` semantics).
 - `getBufferStats()` (video/audio): `{ bufferedAheadMs, readBytes,
-  measuredBitrateBps, liveLatencyMs, overflowCount, reconnectCount }` —
-  queue depth, consumed bytes, EWMA bitrate (5s windows) and the
-  overflow/reconnect counters.
+  measuredBitrateBps, liveLatencyMs, overflowCount, reconnectCount,
+  variantIndex, variantBandwidthBps, variantSwitchCount }` —
+  queue depth, consumed bytes, EWMA bitrate (5s windows), the
+  overflow/reconnect counters and (1.16) the ABR variant state: the active
+  master-playlist variant (0-based doc index, -1 when none selected /
+  private connection), its `BANDWIDTH` (0 when unknown) and the number of
+  variant switches the session has applied.
 - `getStats()` (video/audio): `{ decodedFrames, droppedFrames,
   overflowCount, reconnectCount, discontinuityCount }`.
 
@@ -275,11 +291,12 @@ bandwidth via `probe()`.
 open(src: string, streamIndex?: number, options?: FFNetOptions): Promise<FFAudioOpenInfo>
 on(event: 'pcm', cb: (packet: FFAudioPacket) => void): void   // F32LE interleaved
 on(event: 'end', cb: () => void): void
-on(event: 'error', cb: (msg: string) => void): void
+on(event: 'error', cb: (msg: string, err: FFError) => void): void
 on(event: 'switched', cb: (info: FFAudioOpenInfo) => void): void
 on(event: 'overflow', cb: (ev: FFOverflowEvent) => void): void
 on(event: 'discontinuity', cb: (ev: FFDiscontinuityEvent) => void): void
 on(event: 'reconnected', cb: () => void): void
+off(event?: 'pcm' | 'end' | 'error' | 'switched' | 'overflow' | 'discontinuity' | 'reconnected'): void
 start(paced?: boolean): void      // default true = realtime pacing
 switchTrack(streamIndex: number): void  // instant hot switch, mid-playback
 flushBacklog(): void              // live A/V resync: drop queue backlog
@@ -310,11 +327,12 @@ bits, numerically identical to OHOS `audio.AudioChannelLayout` values; `0x3`
 open(src: string, streamIndex?: number, options?: FFNetOptions): Promise<FFVideoOpenInfo>
 on(event: 'frame', cb: (ev: FFVideoFrameEvent) => void): void
 on(event: 'end', cb: () => void): void
-on(event: 'error', cb: (msg: string) => void): void
+on(event: 'error', cb: (msg: string, err: FFError) => void): void
 on(event: 'info', cb: (ev: FFVideoInfoEvent) => void): void  // { backend: 'hw' | 'sw' }
 on(event: 'overflow', cb: (ev: FFOverflowEvent) => void): void
 on(event: 'discontinuity', cb: (ev: FFDiscontinuityEvent) => void): void
 on(event: 'reconnected', cb: () => void): void
+off(event?: 'frame' | 'end' | 'error' | 'info' | 'overflow' | 'discontinuity' | 'reconnected'): void
 start(surfaceId: string): void    // renders into XComponent surface
 flushToKeyframe(): void            // live A/V resync: drop backlog to newest keyframe
 setSpeed(speed: number): void      // user speed [0.5, 2.0]: pacing /speed, content pts unchanged
@@ -439,12 +457,14 @@ open(src: string, streamIndex?: number, options?: FFNetOptions): Promise<FFSubti
 on(event: 'subtitle', cb: (ev: FFSubtitleEvent) => void): void
 on(event: 'pes', cb: (payload: ArrayBuffer, pts: number) => void): void  // raw PES pump
 on(event: 'end', cb: () => void): void
-on(event: 'error', cb: (msg: string) => void): void
+on(event: 'error', cb: (msg: string, err: FFError) => void): void
 on(event: 'overflow', cb: (ev: FFOverflowEvent) => void): void
 on(event: 'discontinuity', cb: (ev: FFDiscontinuityEvent) => void): void
+off(event?: 'subtitle' | 'pes' | 'end' | 'error' | 'overflow' | 'discontinuity'): void
 setRawPump(enable: boolean): void  // before start(): forward PES as-is
 setSpeed(speed: number): void      // user speed [0.5, 2.0]: paced mode pacing /speed
-start(paced?: boolean): void      // default true = presentation-time pacing
+setDelayMs(delayMs: number): void  // text-cue sync offset ±60s: shifts the display instant only
+start(paced?: boolean): void       // default true = presentation-time pacing
 detach(): void                    // leak-path cleanup, no thread joins
 pause(): void; resume(): void
 stop(): void; close(): void

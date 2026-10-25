@@ -118,6 +118,18 @@ export interface FFNetOptions {
    *  every variant exceeds the cap). 0 (default) = no cap. Ignored when
    *  variantIndex is set. */
   maxBandwidth?: number;
+  /** Adaptive bitrate on live HLS master playlists (1.16): when the demux
+   *  starves (throughput under 15% of realtime for ~8s) the session
+   *  downgrades one variant rung via an in-pipeline rebuild; sustained
+   *  health (>= 90% of realtime) probes one rung back up with an
+   *  exponentially growing dwell (30s → 300s) after failed probes. Without
+   *  an explicit variantIndex the open starts at the highest-bandwidth rung
+   *  (maxBandwidth caps the ladder). Subscribers see 'reconnected' +
+   *  discontinuity('reconnect'); getBufferStats() exposes the active
+   *  variant. Requires live + a master playlist with >= 2 known-bandwidth
+   *  variants; an explicit variantIndex pins the variant and disables
+   *  switching. Default false. */
+  abr?: boolean;
   /** Live target latency (F1): derive the HLS live start index from the
    *  playlist's TARGETDURATION so playback enters ~this far behind the live
    *  edge; a runtime catch-up drops backlog that exceeds the target by more
@@ -282,14 +294,40 @@ export interface FFOverflowEvent {
   dropped: number;
 }
 
-/** Stream discontinuity: 'resync' = explicit backlog resync
+/** Machine-readable runtime error category, derived from the error message
+ *  by an ordered keyword match (first hit wins, root-cause substrings take
+ *  precedence over wrappers like "shared demux open failed: ..."):
+ *  'surface' — native window / BufferQueue failures (wedge, geometry, request buffer)
+ *  'hw'      — OH_AVCodec hardware decoder failures / missing capability
+ *  'seek'    — seek failures
+ *  'network' — HTTP/TLS/socket errors embedded in the message
+ *  'open'    — container/codec open and stream-selection failures
+ *  'demux'   — demux/read failures
+ *  'decode'  — decode/filter/resample failures
+ *  'internal'— anything else */
+export type FFErrorCode = 'surface' | 'hw' | 'seek' | 'network' | 'open' | 'demux' | 'decode' | 'internal';
+
+/** Structured error payload passed as the second 'error' event argument.
+ *  The first argument stays the raw message string (pre-1.15 callers only
+ *  reading it keep working); `code` is a best-effort classification, not a
+ *  contract — treat unknown codes as 'internal'. */
+export interface FFError {
+  code: FFErrorCode;
+  message: string;
+}
+
+/** Stream discontinuity reason: 'resync' = explicit backlog resync
  *  (flushToKeyframe / flushBacklog), 'reconnect' = the shared demux session
  *  rebuilt its connection in place (see the 'reconnected' event),
  *  'seek' = in-pipeline seek re-anchor (effective landing target in ms —
  *  may precede the requested target when the pre-target keyframe gap is
- *  too large to decode through, see the kernel fast-landing path). */
+ *  too large to decode through, see the kernel fast-landing path),
+ *  'hw2sw' = hardware→software decode fallback re-anchor. */
+export type FFDiscontinuityReason = 'resync' | 'reconnect' | 'seek' | 'hw2sw';
+
+/** Stream discontinuity event (see FFDiscontinuityReason). */
 export interface FFDiscontinuityEvent {
-  reason: string;
+  reason: FFDiscontinuityReason;
   /** reason === 'seek' only: effective re-anchor target (ms, stream pts domain) */
   seekMs?: number;
 }
@@ -309,6 +347,15 @@ export interface FFBufferStats {
   overflowCount: number;
   /** In-place session rebuilds after token/window/rate-limit errors (A3) */
   reconnectCount: number;
+  /** Active HLS master-playlist variant, 0-based doc index (1.16 ABR);
+   *  -1 when no variant was selected or on a private connection */
+  variantIndex: number;
+  /** BANDWIDTH of the active variant in bits per second (1.16 ABR);
+   *  0 when unknown / not selected */
+  variantBandwidthBps: number;
+  /** Variant switches applied by the session ABR (downgrades + upgrades,
+   *  1.16); 0 when ABR is off */
+  variantSwitchCount: number;
 }
 
 /** Decode-side playback statistics of a decoder. */

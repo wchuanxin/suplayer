@@ -2,6 +2,124 @@
 
 English | [中文](CHANGELOG_zh.md)
 
+## 1.16.0
+
+### HLS adaptive bitrate (`abr`): starve-driven downgrades + health-probe upgrades
+
+- New `FFNetOptions.abr` option (default `false`): adaptive variant
+  switching for live HLS master-playlist sources, implemented inside the
+  shared demux session so every subscriber (video / audio / subtitle)
+  switches together over the same connection.
+- Detection reuses the live throughput watchdog: the video stream's
+  media-time progress is measured per 10s window. Sustained starvation
+  (progress under 15% of realtime for ~8s) arms a one-rung downgrade —
+  deliberately ahead of the 15s starve abort, so a lower rung gets the
+  chance to rescue the session first. With no lower rung left the stock
+  abort path still applies.
+- Upgrades are health probes: after sustained health (>= 90% of realtime)
+  the session probes one rung up at most once per dwell window (30s
+  initial). A starve-driven downgrade doubles the dwell (up to 300s) so a
+  rung that cannot sustain itself is not re-probed aggressively; 60s of
+  sustained health resets the penalty.
+- Switch mechanics: an in-place session rebuild on the demux thread (same
+  path as A3 token recovery) — master playlist re-fetch (fresh CDN token),
+  stream-layout validation, `NotifyReconnect` + `DropBacklogToKeyframe`
+  on every subscriber queue. Apps observe the familiar `'reconnected'`
+  event + `discontinuity('reconnect')`; no new event types. A failed
+  switch rolls back to the previous variant before giving up.
+- Defaults: without an explicit `variantIndex` the open starts at the
+  highest-bandwidth rung (`maxBandwidth` caps the ladder); an explicit
+  `variantIndex` pins the variant and disables switching (stats still
+  work). Armed only for `live` sources with a master playlist carrying
+  >= 2 known-bandwidth variants.
+- `getBufferStats()` (audio + video) adds `variantIndex` (0-based doc
+  index of the active variant, -1 when none selected / private
+  connection), `variantBandwidthBps` (BANDWIDTH of the active variant, 0
+  when unknown) and `variantSwitchCount` (variant switches applied so
+  far).
+
+### `FFSubtitleDecoder.setDelayMs`: embedded text subtitle sync offset
+
+- New `setDelayMs(delayMs)` on `FFSubtitleDecoder`: shifts the display
+  instant of embedded text cues by `delayMs` ms (positive = later,
+  negative = earlier, clamped to ±60000). The paced wall target — and
+  with it the synthesized text-cue end clear — moves; the emitted event
+  timeline (`ptsMs` / `durationMs`) stays on the content clock.
+- Text-cue lookahead hand-off fix: a packet pre-read while probing the
+  next cue's start is held and processed on the next loop pass instead
+  of being re-read at the cue boundary.
+
+## 1.15.0
+
+### `off()` event unsubscription + structured errors (`FFError`)
+
+- New `off()` method on all three decoders (`FFAudioDecoder` /
+  `FFVideoDecoder` / `FFSubtitleDecoder`), mirroring the `on()` surface:
+  - `off(event)` removes the current listener of one event (each event
+    holds a single slot, so this is effectively `removeListener`).
+  - `off()` with no argument removes every listener of the decoder
+    (`removeAllListeners` semantics) — useful before dropping a decoder
+    reference or re-binding a full handler set.
+  - Supported events per decoder match `on()` exactly; an unknown event
+    name throws (same behavior as `on()`).
+- `'error'` listeners now receive a second, structured argument:
+  `(msg: string, err: FFError)` where `FFError = { code: FFErrorCode,
+  message: string }`. `code` is a best-effort machine-readable category
+  derived from the message by an ordered keyword match:
+  `'surface' | 'hw' | 'seek' | 'network' | 'open' | 'demux' | 'decode' |
+  'internal'` — root-cause substrings win over wrappers (e.g. the HTTP 403
+  inside "shared demux open failed: ..." classifies as `network`).
+  Purely additive: pre-1.15 callbacks reading only the first string
+  argument keep working unchanged. `open()` promise rejections remain
+  plain string errors.
+- Type-level: `FFDiscontinuityEvent.reason` tightened from `string` to the
+  `FFDiscontinuityReason` union (`'resync' | 'reconnect' | 'seek' |
+  'hw2sw'`); new exported types `FFErrorCode`, `FFError`,
+  `FFDiscontinuityReason`.
+
+## 1.14.1
+
+### Rate-limited mid-GOP join decode log spam
+
+- A mid-GOP join (live raw-transport streams, shared-demux attachers) made
+  the software H.264 decoder emit its per-slice errors — "non-existing PPS 0
+  referenced", "decode_slice_header error", "no frame!" — for every discarded
+  slice before the first in-band SPS/PPS+IDR arrived, flooding hilog with
+  hundreds of lines in tens of milliseconds.
+- The kernel log bridge (`FfLogCallback`) now recognizes these known
+  join-noise message prefixes: the first occurrence passes through unchanged,
+  afterwards at most one WARN line per 5 s is emitted carrying the suppressed
+  count (`(mid-GOP join noise, suppressed x N)`). All other log paths (real
+  decode/probe errors) are unchanged.
+
+## 1.14.0
+
+### GOP-adaptive stream analysis for live raw-transport sources
+
+- Long-GOP first-frame fix: a live raw-transport join (raw TS / FLV /
+  direct live URLs, not HLS playlists) lands mid-GOP. When the caller's
+  `analyzeMs` window is shorter than the stream GOP (IPTV commonly 4-6s),
+  `avformat_find_stream_info` closed the window before the next in-band
+  IDR and the open carried video `width/height = 0` — the consumer's
+  surface configure then failed and the pipeline degraded into the
+  hardware→software→wedge chain with no self-recovery.
+- The shared demux session (`DemuxSession::Init` / `Rebuild`) now raises
+  the analysis budget once for live non-HLS sources with an explicit
+  `analyzeMs` (and no `startTimeMs` seek): `max_analyze_duration` to
+  10s and `probesize` to 12MB. Adaptivity comes from
+  `avformat_find_stream_info`'s built-in early exit — it returns as soon
+  as every stream has codec parameters (MPEG-TS video: first SPS/IDR) —
+  so the raised cap costs short-GOP streams nothing and only lets
+  long-GOP streams keep reading until the IDR arrives.
+- Why not repeated `find_stream_info` calls: `codec_info_duration`
+  persists on the stream and the replayed internal packet buffer
+  re-accrues already-analyzed media time against the raised budget, so a
+  second call consumes the new window on old data almost without reading
+  further from the network.
+- HLS (`.m3u8`) sources keep the caller's tighter `analyzeMs` untouched
+  (segments start on a keyframe; zapping stays fast). Non-live sources
+  and precise-start opens (`startTimeMs`) are unchanged.
+
 ## 1.12.0
 
 ### User-level playback speed — `setSpeed` on all three decoders

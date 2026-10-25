@@ -98,6 +98,24 @@ public:
     AVFormatContext* fmt() { return fmt_; }
     AVProgram* program() { return program_; }
 
+    // ---- ABR (1.16) published stats (atomics; safe from any thread) ------
+    // Doc-order index of the variant currently open in the shared session
+    // (-1 = none selected / not resolved).
+    int32_t AbrVariantIndex() const
+    {
+        return abrVariantIndex_.load(std::memory_order_relaxed);
+    }
+    // BANDWIDTH of that variant in bits per second (0 = unknown).
+    int64_t AbrVariantBandwidthBps() const
+    {
+        return abrVariantBandwidth_.load(std::memory_order_relaxed);
+    }
+    // Variant switches applied by the session ABR so far (down + up).
+    int32_t AbrSwitchCount() const
+    {
+        return abrSwitchCount_.load(std::memory_order_relaxed);
+    }
+
     // 方案⑤ fast-landing: the video stream the shared seek positions on
     // (first routed video stream — program member when a program is locked).
     // Demux-thread only. nullptr when the source has no video stream.
@@ -124,6 +142,16 @@ private:
     // F1: periodically drop subscriber backlogs that exceed the target
     // latency + tolerance (runtime catch-up toward the live edge).
     void MaybeCatchUp();
+    // ABR (1.16): re-derive the variant ladder + published stats from a
+    // fresh master-playlist resolution (Init / Rebuild). Demux-thread only.
+    void RefreshAbrLadder(const SourceResolution& res);
+    // ABR (1.16): per-starve-window ladder evaluation (arms down/up
+    // switches). Demux-thread only, called from TrackStarveWatchdog.
+    void AbrEvaluateWindow(double ratio);
+    // ABR (1.16): apply an armed variant switch in place (rebuild with the
+    // target rung, notify subscribers). Demux-thread only. Returns false
+    // when the session died (switch AND rollback rebuilds both failed).
+    bool ApplyAbrSwitch(int dir);
     void Shutdown();
     void AddClaim();
     bool HasSubscribersOrClaims();
@@ -182,6 +210,23 @@ private:
     // 方案⑤ armed shared seek target (INT64_MIN = none); exchanged by the
     // demux thread at the top of each loop pass (last-write-wins).
     std::atomic<int64_t> pendingSharedSeekMs_{ INT64_MIN };
+    // ---- ABR (1.16) ----------------------------------------------------
+    // Armed only for live HLS master playlists with a usable variant ladder
+    // (>= 2 known-bandwidth variants at/below maxBandwidth) and no explicit
+    // variantIndex pin. Ladder state is demux-thread only; the three
+    // published stats above are atomics read by NAPI threads.
+    bool abrActive_ = false;
+    std::vector<int> abrLadder_;     // doc-order variant indexes, [0] = highest bw
+    std::vector<int64_t> abrLadderBw_; // parallel BANDWIDTHs (bits per second)
+    int abrLadderPos_ = -1;          // current rung; -1 = off-ladder
+    int pendingAbrSwitch_ = 0;       // -1 downgrade, +1 upgrade probe (demux thread)
+    int64_t abrStarveSinceMs_ = 0;   // 0 = no starve streak (demux thread)
+    int64_t abrHealthySinceMs_ = 0;  // 0 = no health streak (demux thread)
+    int64_t abrDwellMs_ = 0;         // up-probe dwell (penalty) window
+    int64_t abrNextUpProbeMs_ = 0;   // steady ms before which no up-probe
+    std::atomic<int32_t> abrVariantIndex_{ -1 };
+    std::atomic<int64_t> abrVariantBandwidth_{ 0 };
+    std::atomic<int32_t> abrSwitchCount_{ 0 };
     std::thread demuxThread_;
 
     // Bounded-join teardown: Shutdown waits for the demux thread at most

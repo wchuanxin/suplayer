@@ -92,7 +92,12 @@ SourceResolution ResolveSource(const std::string& src, const NetOptions& opts,
     SourceResolution res;
     res.url = src;
 
-    const bool wantVariant = opts.variantIndex != INT32_MIN || opts.maxBandwidth > 0;
+    // ABR (1.16): a live abr open without an explicit variantIndex defaults
+    // to the highest-bandwidth variant (maxBandwidth still caps it) and must
+    // fetch the master so the caller gets the whole variant ladder.
+    const bool abrDefault = opts.abr && opts.live && opts.variantIndex == INT32_MIN;
+    const bool wantVariant =
+        opts.variantIndex != INT32_MIN || opts.maxBandwidth > 0 || abrDefault;
     // F1 only when the caller did not pin an explicit live_start_index.
     const bool wantLatency =
         opts.targetLatencyMs > 0 && opts.liveStartIndex == INT32_MIN && opts.live;
@@ -122,11 +127,20 @@ SourceResolution ResolveSource(const std::string& src, const NetOptions& opts,
     }
 
     if (doc.isMaster) {
+        if (opts.abr) {
+            // ABR (1.16): hand the caller the full ladder (doc order).
+            res.variants = doc.variants;
+        }
         if (wantVariant) {
-            const int sel = SelectVariant(doc.variants, opts.variantIndex, opts.maxBandwidth);
+            // ABR default selection: highest known bandwidth; maxBandwidth
+            // (when set) still applies as the cap.
+            const int64_t bwCap = abrDefault && opts.maxBandwidth <= 0
+                ? INT64_MAX : opts.maxBandwidth;
+            const int sel = SelectVariant(doc.variants, opts.variantIndex, bwCap);
             if (sel >= 0) {
                 res.url = doc.variants[static_cast<size_t>(sel)].uri;
                 res.variantSelected = true;
+                res.selectedVariant = sel;
                 OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFDemux",
                     "playlist resolve: variant #%{public}d bw=%{public}lld (%{public}dx%{public}d) of %{public}zu",
                     sel, static_cast<long long>(doc.variants[static_cast<size_t>(sel)].bandwidth),

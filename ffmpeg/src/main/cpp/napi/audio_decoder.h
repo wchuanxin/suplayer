@@ -8,6 +8,7 @@ namespace ffmpeg {
 napi_value FFAudioDecoderConstructor(napi_env env, napi_callback_info info);
 napi_value FFAudioDecoderOpen(napi_env env, napi_callback_info info);
 napi_value FFAudioDecoderOn(napi_env env, napi_callback_info info);
+napi_value FFAudioDecoderOff(napi_env env, napi_callback_info info);
 napi_value FFAudioDecoderStart(napi_env env, napi_callback_info info);
 napi_value FFAudioDecoderSwitchTrack(napi_env env, napi_callback_info info);
 napi_value FFAudioDecoderPause(napi_env env, napi_callback_info info);

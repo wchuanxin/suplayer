@@ -61,6 +61,30 @@ public:
     // harmless when no Pop is waiting.
     void Wake();
 
+    // Subscriber-thread side: whether the end marker arrived or the queue
+    // was detached (both make every subsequent Pop fail fast). A deadline-
+    // Pop caller uses this to tell its own timeout (false) from a real
+    // end (true).
+    bool IsEnded()
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return eof_ || detached_;
+    }
+
+    // Subscriber-thread side: whether this queue was detached (teardown).
+    // Pop() keeps serving an already-routed backlog after Detach() (the
+    // natural EOF drain semantics); a video decode loop polls this to tell
+    // the teardown case from a real end-of-stream and must then stop
+    // touching the shared render surface immediately — on a hot source
+    // switch the next pipeline attaches a new producer to the same
+    // surfaceId, and the buffer-queue transition frees the in-flight
+    // OH_NativeBuffer mid-render (SIGSEGV in OH_NativeBuffer_Unmap).
+    bool IsDetached()
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return detached_;
+    }
+
     // Control-thread side (A/V resync): drop the entire backlog and resume
     // at the NEWEST keyframe still queued (video), or at the next routed
     // packet when no keyframe is queued / skipToKey is off (audio). Used to

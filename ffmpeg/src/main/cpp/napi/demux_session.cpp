@@ -7,7 +7,9 @@ extern "C" {
 
 #include <hilog/log.h>
 
+#include <algorithm>
 #include <chrono>
+#include <utility>
 
 namespace ffmpeg {
 namespace {
@@ -33,6 +35,20 @@ constexpr double LIVE_STARVE_RATIO = 0.15;   // < 15% of realtime = starving
 constexpr double LIVE_STARVE_HEALTHY = 0.5;  // >= 50% of realtime = healthy
 constexpr int64_t LIVE_STARVE_MS = 15000;    // sustained starve before abort
 
+// ABR (1.16): variant switching cadence. Downgrades arm once the starve
+// streak outlives ABR_STARVE_SWITCH_MS (two consecutive watchdog windows)
+// — ahead of LIVE_STARVE_MS so a lower rung gets the chance to rescue the
+// session before the abort kills it. Upgrades are health probes: they need
+// a sustained >= ABR_UP_HEALTHY streak and fire at most once per dwell
+// window; a starve-driven downgrade doubles the dwell (penalizing a failed
+// probe) up to ABR_UP_DWELL_MAX_MS. ABR_UP_STABLE_MS of sustained health
+// resets the penalty.
+constexpr int64_t ABR_STARVE_SWITCH_MS = 8000;
+constexpr double ABR_UP_HEALTHY = 0.9;      // window counts as upgrade-healthy
+constexpr int64_t ABR_UP_STABLE_MS = 60000; // sustained health resets the dwell
+constexpr int64_t ABR_UP_DWELL_MS = 30000;  // initial up-probe dwell
+constexpr int64_t ABR_UP_DWELL_MAX_MS = 300000; // dwell cap after failed probes
+
 // Fast-landing threshold for shared seeks (鏂规鈶?: the seek positions the
 // demuxer at the keyframe <= target. When that keyframe is further back than
 // this, decoding the whole pre-target intra-GOP span would stall the landing
@@ -42,6 +58,44 @@ constexpr int64_t LIVE_STARVE_MS = 15000;    // sustained starve before abort
 // 'seek' discontinuity event. Smaller gaps keep exact landing: waiting out
 // the decode costs less than the position error of landing early.
 constexpr int64_t FAST_SEEK_GAP_MS = 12000;
+
+// GOP-adaptive stream analysis for live raw-transport sources (raw TS / FLV
+// / direct live URLs, not HLS playlists). avformat_find_stream_info() exits
+// as soon as every stream carries codec parameters — for MPEG-TS video that
+// is the first in-band SPS/IDR — so max_analyze_duration is an upper bound,
+// not a wait: short-GOP streams pay nothing extra under a larger cap.
+// A live raw-transport join lands mid-GOP; when the app's analyzeMs is
+// shorter than the stream GOP (IPTV measures 4-6s) the window closes before
+// the next IDR and the open carries video width/height = 0 — the app's
+// surface configure then fails and the pipeline degrades into the
+// hw→sw→wedge chain. Repeated find_stream_info() calls cannot extend the
+// window: codec_info_duration persists on the stream and the replayed
+// packet_buffer re-accrues the already-analyzed media time against the
+// raised budget (the second call re-processes the buffered packets and hits
+// the new cap almost without reading new data). Instead raise the cap once,
+// before the single call, and let the built-in early exit provide the
+// adaptivity. probesize is raised in step so a high-bitrate source does not
+// hit the 5MB default byte cap before the media-time cap (10s @ 6Mbps
+// already exceeds it).
+constexpr int64_t LIVE_RAW_ANALYZE_CAP_MS = 10000;
+constexpr int64_t LIVE_RAW_PROBESIZE = 12 * 1024 * 1024;
+
+bool RaiseLiveAnalyzeWindow(AVFormatContext* fmt, const NetOptions& opts, bool isHlsPlaylist)
+{
+    // Gates: live raw-transport only — HLS segments start on a keyframe so
+    // the app's tighter analyzeMs is enough there (and keeps zapping fast);
+    // an explicit analyzeMs > 0 signals the caller tuned the window;
+    // startTimeMs would discard the analysis window on the post-open seek.
+    if (fmt == nullptr || !opts.live || opts.analyzeMs <= 0 || isHlsPlaylist || opts.startTimeMs > 0) {
+        return false;
+    }
+    if (static_cast<int64_t>(opts.analyzeMs) >= LIVE_RAW_ANALYZE_CAP_MS) {
+        return false;
+    }
+    fmt->max_analyze_duration = LIVE_RAW_ANALYZE_CAP_MS * 1000;
+    fmt->probesize = LIVE_RAW_PROBESIZE;
+    return true;
+}
 
 std::mutex& RegistryMutex()
 {
@@ -83,6 +137,7 @@ std::string DemuxSession::BuildKey(const std::string& src, const NetOptions& opt
     key += "|rc=" + std::to_string(opts.reconnect ? 1 : 0);
     key += "|vi=" + std::to_string(opts.variantIndex);
     key += "|bw=" + std::to_string(opts.maxBandwidth);
+    key += "|abr=" + std::to_string(opts.abr ? 1 : 0);
     key += "|lat=" + std::to_string(opts.targetLatencyMs);
     key += "|arc=" + std::to_string(opts.autoReconnect);
     key += "|rcm=" + std::to_string(opts.reconnectMaxRetries);
@@ -195,6 +250,22 @@ bool DemuxSession::Init(const std::string& src, const NetOptions& opts, std::str
     // A2/F1: resolve variant selection + latency-derived live start index.
     // Infallible: falls back to the original URL on any failure.
     const SourceResolution res = ResolveSource(src, opts, &DemuxSession::InterruptCb, this);
+    // ABR (1.16): capture the variant ladder from the resolved master
+    // playlist. Switching is armed only for live sources without an explicit
+    // variantIndex pin; the published stats work whenever a variant was
+    // selected (pinned included).
+    if (opts.abr) {
+        RefreshAbrLadder(res);
+        abrActive_ = opts.live && opts.variantIndex == INT32_MIN && abrLadderPos_ >= 0;
+        if (abrActive_) {
+            abrDwellMs_ = ABR_UP_DWELL_MS;
+            abrNextUpProbeMs_ = NowSteadyMs() + abrDwellMs_;
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFDemux",
+                "abr armed: %{public}zu rungs, starting at doc#%{public}d bw=%{public}lld",
+                abrLadder_.size(), AbrVariantIndex(),
+                static_cast<long long>(AbrVariantBandwidthBps()));
+        }
+    }
     NetOptions effOpts = opts;
     if (res.liveStartIndex != INT32_MIN) {
         effOpts.liveStartIndex = res.liveStartIndex;
@@ -207,6 +278,12 @@ bool DemuxSession::Init(const std::string& src, const NetOptions& opts, std::str
     }
     AVDictionary* dict = nullptr;
     ApplyOpenOptions(fmt_, &dict, effOpts);
+    if (RaiseLiveAnalyzeWindow(fmt_, effOpts, res.isHlsPlaylist)) {
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFDemux",
+            "live raw-transport source: analysis window raised to %{public}lldms "
+            "(avformat_find_stream_info exits adaptively at the first IDR)",
+            static_cast<long long>(LIVE_RAW_ANALYZE_CAP_MS));
+    }
     std::string ioErr;
     if (!AttachCustomIO(fmt_, res.url, ioErr)) {
         if (!ioErr.empty()) {
@@ -330,6 +407,20 @@ void DemuxSession::DemuxLoop()
     AVPacket* pkt = av_packet_alloc();
     int reconnectAttempts = 0;
     while (!stopping_.load(std::memory_order_relaxed)) {
+        // ABR (1.16): apply an armed variant switch (starve-driven downgrade
+        // or health-probe upgrade) before anything else — a pending shared
+        // seek below then lands inside the NEW variant.
+        if (pendingAbrSwitch_ != 0) {
+            const int abrDir = pendingAbrSwitch_;
+            pendingAbrSwitch_ = 0;
+            if (!ApplyAbrSwitch(abrDir)) {
+                auto eofSubs = SnapshotSubscribers();
+                for (auto& q : eofSubs) {
+                    q->PushEof();
+                }
+                break;
+            }
+        }
         // 鏂规鈶?shared-session seek: apply at the loop top (this thread is
         // the sole fmt_ owner). Last-write-wins; subscribers re-anchor via
         // NotifySeek and complete their pending seek acks on the epoch
@@ -481,6 +572,8 @@ bool DemuxSession::Rebuild(std::string& err)
     starveWindowVideoPkts_ = 0;
     starveLastVideoPts_ = AV_NOPTS_VALUE;
     starveLowSinceMs_ = 0;
+    abrStarveSinceMs_ = 0;
+    abrHealthySinceMs_ = 0;
     // Re-resolve from the ORIGINAL source: a token-protected CDN mints a
     // fresh signed variant URL on every master-playlist fetch (A3).
     const SourceResolution res = ResolveSource(src_, opts_, &DemuxSession::InterruptCb, this);
@@ -496,6 +589,14 @@ bool DemuxSession::Rebuild(std::string& err)
     }
     AVDictionary* dict = nullptr;
     ApplyOpenOptions(fmt_, &dict, effOpts);
+    if (RaiseLiveAnalyzeWindow(fmt_, effOpts, res.isHlsPlaylist)) {
+        // Mid-stream reconnect lands mid-GOP just like a fresh open: same
+        // adaptive window so the rebuilt session does not come back with
+        // 0x0 video parameters.
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFDemux",
+            "rebuild: live raw-transport analysis window raised to %{public}lldms",
+            static_cast<long long>(LIVE_RAW_ANALYZE_CAP_MS));
+    }
     std::string ioErr;
     if (!AttachCustomIO(fmt_, res.url, ioErr)) {
         if (!ioErr.empty()) {
@@ -542,6 +643,18 @@ bool DemuxSession::Rebuild(std::string& err)
         avformat_close_input(&fmt_);
         ReleaseStreamIO(ioPb);
         return false;
+    }
+    // ABR (1.16): refresh the ladder from the freshly fetched master so doc
+    // indexes stay valid when the CDN rotates its variant list between
+    // fetches. The variant that just opened dropping off the ladder ends
+    // switching (playback itself continues).
+    if (abrActive_) {
+        RefreshAbrLadder(res);
+        if (abrLadderPos_ < 0) {
+            abrActive_ = false;
+            OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFDemux",
+                "abr: current variant left the ladder, switching disabled");
+        }
     }
     return true;
 }
@@ -691,6 +804,12 @@ void DemuxSession::TrackStarveWatchdog(const AVPacket* pkt)
     OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFDemux",
         "live progress ratio %{public}.2f over last %{public}lldms", ratio,
         static_cast<long long>(span));
+    // ABR (1.16): per-window ladder evaluation (arm down/up switches) ahead
+    // of the abort bookkeeping, so a downgrade can rescue the session before
+    // LIVE_STARVE_MS kills it.
+    if (abrActive_) {
+        AbrEvaluateWindow(ratio);
+    }
     if (ratio >= LIVE_STARVE_HEALTHY) {
         starveLowSinceMs_ = 0;
         return;
@@ -709,6 +828,143 @@ void DemuxSession::TrackStarveWatchdog(const AVPacket* pkt)
             ratio, static_cast<long long>(now - starveLowSinceMs_));
         starveAbort_.store(true, std::memory_order_relaxed);
     }
+}
+
+void DemuxSession::RefreshAbrLadder(const SourceResolution& res)
+{
+    // Demux-thread only.
+    abrLadder_.clear();
+    abrLadderBw_.clear();
+    abrLadderPos_ = -1;
+    if (res.selectedVariant < 0 ||
+        res.selectedVariant >= static_cast<int>(res.variants.size())) {
+        return;
+    }
+    abrVariantIndex_.store(res.selectedVariant, std::memory_order_relaxed);
+    abrVariantBandwidth_.store(
+        res.variants[static_cast<size_t>(res.selectedVariant)].bandwidth,
+        std::memory_order_relaxed);
+    // Ladder: known-bandwidth variants at/below maxBandwidth, sorted by
+    // descending bandwidth; needs at least two rungs to be switchable.
+    const int64_t cap = opts_.maxBandwidth > 0 ? opts_.maxBandwidth : INT64_MAX;
+    std::vector<std::pair<int64_t, int>> rungs; // (bandwidth, doc index)
+    for (size_t i = 0; i < res.variants.size(); ++i) {
+        const int64_t bw = res.variants[i].bandwidth;
+        if (bw > 0 && bw <= cap) {
+            rungs.emplace_back(bw, static_cast<int>(i));
+        }
+    }
+    if (rungs.size() < 2) {
+        return;
+    }
+    std::sort(rungs.begin(), rungs.end(),
+        [](const std::pair<int64_t, int>& a, const std::pair<int64_t, int>& b) {
+            return a.first > b.first;
+        });
+    for (const auto& rung : rungs) {
+        abrLadderBw_.push_back(rung.first);
+        abrLadder_.push_back(rung.second);
+        if (rung.second == res.selectedVariant) {
+            abrLadderPos_ = static_cast<int>(abrLadder_.size()) - 1;
+        }
+    }
+}
+
+void DemuxSession::AbrEvaluateWindow(double ratio)
+{
+    // Demux-thread only; one call per completed LIVE_STARVE_WINDOW_MS window.
+    const int64_t now = NowSteadyMs();
+    if (ratio <= LIVE_STARVE_RATIO) {
+        // Starved window: once the streak covers ABR_STARVE_SWITCH_MS (two
+        // consecutive windows), arm a one-rung downgrade. Without a lower
+        // rung the stock starve-abort path stays in charge.
+        abrHealthySinceMs_ = 0;
+        if (abrStarveSinceMs_ == 0) {
+            abrStarveSinceMs_ = now;
+            return;
+        }
+        if (now - abrStarveSinceMs_ >= ABR_STARVE_SWITCH_MS && abrLadderPos_ >= 0 &&
+            abrLadderPos_ < static_cast<int>(abrLadder_.size()) - 1) {
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFDemux",
+                "abr: starve streak %{public}lldms (ratio %{public}.2f), arming downgrade from rung %{public}d",
+                static_cast<long long>(now - abrStarveSinceMs_), ratio, abrLadderPos_);
+            pendingAbrSwitch_ = -1; // overrides a pending upgrade probe
+        }
+        return;
+    }
+    abrStarveSinceMs_ = 0;
+    if (ratio < ABR_UP_HEALTHY) {
+        return; // transitional band: neither starved nor clearly healthy
+    }
+    if (abrHealthySinceMs_ == 0) {
+        abrHealthySinceMs_ = now;
+        return;
+    }
+    if (now - abrHealthySinceMs_ >= ABR_UP_STABLE_MS) {
+        // Sustained health: lift any failed-probe penalty.
+        abrDwellMs_ = ABR_UP_DWELL_MS;
+    }
+    if (pendingAbrSwitch_ == 0 && abrLadderPos_ > 0 && now >= abrNextUpProbeMs_) {
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFDemux",
+            "abr: healthy streak %{public}lldms (ratio %{public}.2f), arming upgrade probe from rung %{public}d",
+            static_cast<long long>(now - abrHealthySinceMs_), ratio, abrLadderPos_);
+        pendingAbrSwitch_ = 1;
+        abrHealthySinceMs_ = 0; // restart the health streak on the new rung
+    }
+}
+
+bool DemuxSession::ApplyAbrSwitch(int dir)
+{
+    // Demux-thread only (sole fmt_ owner). Returns false when the session
+    // died (switch rebuild AND rollback rebuild both failed).
+    if (!abrActive_ || stopping_.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    const int newPos = abrLadderPos_ + dir;
+    if (newPos < 0 || newPos >= static_cast<int>(abrLadder_.size())) {
+        return true; // no rung in that direction: keep the current variant
+    }
+    const int32_t prevVariant = opts_.variantIndex;
+    const int prevPos = abrLadderPos_;
+    const int docIndex = abrLadder_[static_cast<size_t>(newPos)];
+    const int64_t bw = abrLadderBw_[static_cast<size_t>(newPos)];
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFDemux",
+        "abr: %{public}s to doc#%{public}d (bw=%{public}lld, rung %{public}d -> %{public}d)",
+        dir < 0 ? "downgrading" : "upgrading", docIndex, static_cast<long long>(bw),
+        prevPos, newPos);
+    opts_.variantIndex = docIndex;
+    std::string err;
+    if (Rebuild(err)) {
+        if (dir < 0) {
+            // Failed-probe penalty: push the next upgrade attempt further out.
+            abrDwellMs_ = abrDwellMs_ * 2 > ABR_UP_DWELL_MAX_MS
+                ? ABR_UP_DWELL_MAX_MS : abrDwellMs_ * 2;
+        }
+        abrNextUpProbeMs_ = NowSteadyMs() + abrDwellMs_;
+        abrSwitchCount_.fetch_add(1, std::memory_order_relaxed);
+        // Subscribers: same recovery semantics as a token rebuild — count
+        // the reconnect, drop the old-timeline backlog at the next keyframe.
+        auto subs = SnapshotSubscribers();
+        for (auto& q : subs) {
+            q->NotifyReconnect();
+            q->DropBacklogToKeyframe();
+        }
+        return true;
+    }
+    // The failed Rebuild closed fmt_: roll back to the previous variant or
+    // the session dies with it.
+    OH_LOG_Print(LOG_APP, LOG_WARN, 0xFF00, "FFDemux",
+        "abr: switch to doc#%{public}d failed (%{public}s), rolling back to doc#%{public}d",
+        docIndex, err.c_str(), prevVariant);
+    opts_.variantIndex = prevVariant;
+    abrLadderPos_ = prevPos;
+    if (Rebuild(err)) {
+        return true;
+    }
+    OH_LOG_Print(LOG_APP, LOG_ERROR, 0xFF00, "FFDemux",
+        "abr: rollback to doc#%{public}d failed (%{public}s), ending session",
+        prevVariant, err.c_str());
+    return false;
 }
 
 std::shared_ptr<PacketQueue> DemuxSession::Subscribe(const std::vector<int>& streamIndexes)

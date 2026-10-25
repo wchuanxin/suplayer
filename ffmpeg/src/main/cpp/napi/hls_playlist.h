@@ -24,6 +24,13 @@ struct SourceResolution {
     // the playlist (wantVariant/wantLatency); a fetch failure leaves it
     // false so callers keep the stock probe-based open.
     bool isHlsPlaylist = false;
+    // ABR (1.16): the full variant list of the fetched master playlist, in
+    // document order; empty when nothing was fetched or the source is not a
+    // master playlist. Populated only when opts.abr is set.
+    std::vector<HlsVariant> variants;
+    // ABR (1.16): doc-order index of the variant `url` was picked from
+    // (-1 = no variant selected / original URL kept).
+    int32_t selectedVariant = -1;
 };
 
 // FFmpeg 7.1's hls_probe rejects playlist URLs whose path lacks .m3u8/.m3u

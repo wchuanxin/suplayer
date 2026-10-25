@@ -3,6 +3,7 @@
 #include "demux_session.h"
 #include "hls_playlist.h"
 #include "stream_io.h"
+#include "error_classify.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -131,6 +132,19 @@ public:
     napi_ref* ReconnectedSlot()
     {
         return &reconnectedRef_;
+    }
+    // off()/off(event): delete + null every callback reference. JS-thread
+    // only (same thread as TsfnDispatcher reads), so no extra locking.
+    void ClearAllCallbacks(napi_env env)
+    {
+        napi_ref* slots[] = { PcmSlot(), EndSlot(), ErrorSlot(), SwitchedSlot(), OverflowSlot(),
+            DiscontinuitySlot(), ReconnectedSlot() };
+        for (napi_ref* slot : slots) {
+            if (*slot != nullptr) {
+                napi_delete_reference(env, *slot);
+                *slot = nullptr;
+            }
+        }
     }
     napi_ref GetPcmCallback() const
     {
@@ -720,6 +734,19 @@ public:
     uint64_t GetDiscontinuityCount() const
     {
         return discontinuityCount_.load(std::memory_order_relaxed);
+    }
+    // ---- ABR (1.16) session stats -------------------------------------
+    int32_t GetAbrVariantIndex() const
+    {
+        return session_ != nullptr ? session_->AbrVariantIndex() : -1;
+    }
+    int64_t GetAbrVariantBandwidthBps() const
+    {
+        return session_ != nullptr ? session_->AbrVariantBandwidthBps() : 0;
+    }
+    int32_t GetAbrSwitchCount() const
+    {
+        return session_ != nullptr ? session_->AbrSwitchCount() : 0;
     }
 
     void Start(bool paced)
@@ -1638,9 +1665,7 @@ void TsfnDispatcher(napi_env env, napi_value jsCallback, void* context, void* da
             napi_value cb = nullptr;
             napi_get_reference_value(env, core->GetErrorCallback(), &cb);
             if (cb != nullptr) {
-                napi_value msgVal = nullptr;
-                napi_create_string_utf8(env, msg->err.c_str(), NAPI_AUTO_LENGTH, &msgVal);
-                napi_call_function(env, undefined, cb, 1, &msgVal, &undefined);
+                CallErrorCallback(env, undefined, cb, msg->err);
             }
         }
     } else if (msg->type == MSG_SWITCHED) {
@@ -1724,34 +1749,7 @@ void CoreFinalize(napi_env env, void* data, void* hint)
     // queue object is being destroyed).
     core->DetachDemux();
     core->ReleaseTsfn();
-    napi_ref pcm = core->GetPcmCallback();
-    napi_ref end = core->GetEndCallback();
-    napi_ref err = core->GetErrorCallback();
-    napi_ref sw = core->GetSwitchedCallback();
-    napi_ref overflow = core->GetOverflowCallback();
-    napi_ref discont = core->GetDiscontinuityCallback();
-    napi_ref reconnected = core->GetReconnectedCallback();
-    if (pcm != nullptr) {
-        napi_delete_reference(env, pcm);
-    }
-    if (end != nullptr) {
-        napi_delete_reference(env, end);
-    }
-    if (err != nullptr) {
-        napi_delete_reference(env, err);
-    }
-    if (sw != nullptr) {
-        napi_delete_reference(env, sw);
-    }
-    if (overflow != nullptr) {
-        napi_delete_reference(env, overflow);
-    }
-    if (discont != nullptr) {
-        napi_delete_reference(env, discont);
-    }
-    if (reconnected != nullptr) {
-        napi_delete_reference(env, reconnected);
-    }
+    core->ClearAllCallbacks(env);
     delete core;
 }
 
@@ -1802,7 +1800,7 @@ napi_value FFAudioDecoderOpen(napi_env env, napi_callback_info info)
     if (argc >= 3 && !ParseNetOptions(env, args[2], ctx->netOpts)) {
         delete ctx;
         napi_throw_type_error(env, nullptr,
-            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect?, variantIndex?, maxBandwidth?, targetLatencyMs?, autoReconnect?, reconnectMaxRetries?, dvrSeek?, rtspTransport?, bufferSize?, rwTimeoutMs? }");
+            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect?, variantIndex?, maxBandwidth?, abr?, targetLatencyMs?, autoReconnect?, reconnectMaxRetries?, dvrSeek?, rtspTransport?, bufferSize?, rwTimeoutMs? }");
         return nullptr;
     }
 
@@ -1856,6 +1854,63 @@ napi_value FFAudioDecoderOn(napi_env env, napi_callback_info info)
         napi_delete_reference(env, *slot);
     }
     napi_create_reference(env, args[1], 1, slot);
+    return nullptr;
+}
+
+napi_value FFAudioDecoderOff(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    AudioDecoderCore* core = GetCore(env, info);
+    if (core == nullptr) {
+        napi_throw_error(env, nullptr, "FFAudioDecoder is not constructed");
+        return nullptr;
+    }
+    // off() with no event: remove all listeners (removeAllListeners).
+    if (argc == 0 || args[0] == nullptr) {
+        core->ClearAllCallbacks(env);
+        return nullptr;
+    }
+    napi_valuetype type = napi_undefined;
+    napi_typeof(env, args[0], &type);
+    if (type == napi_undefined || type == napi_null) {
+        core->ClearAllCallbacks(env);
+        return nullptr;
+    }
+    size_t len = 0;
+    if (napi_get_value_string_utf8(env, args[0], nullptr, 0, &len) != napi_ok) {
+        napi_throw_type_error(env, nullptr, "off(event?: string) expects an event name or no argument");
+        return nullptr;
+    }
+    std::vector<char> ev(len + 1, '\0');
+    napi_get_value_string_utf8(env, args[0], ev.data(), ev.size(), &len);
+    std::string event(ev.data(), len);
+
+    napi_ref* slot = nullptr;
+    if (event == "pcm") {
+        slot = core->PcmSlot();
+    } else if (event == "end") {
+        slot = core->EndSlot();
+    } else if (event == "error") {
+        slot = core->ErrorSlot();
+    } else if (event == "switched") {
+        slot = core->SwitchedSlot();
+    } else if (event == "overflow") {
+        slot = core->OverflowSlot();
+    } else if (event == "discontinuity") {
+        slot = core->DiscontinuitySlot();
+    } else if (event == "reconnected") {
+        slot = core->ReconnectedSlot();
+    } else {
+        napi_throw_type_error(env, nullptr,
+            "unsupported event, expect 'pcm' | 'end' | 'error' | 'switched' | 'overflow' | 'discontinuity' | 'reconnected'");
+        return nullptr;
+    }
+    if (*slot != nullptr) {
+        napi_delete_reference(env, *slot);
+        *slot = nullptr;
+    }
     return nullptr;
 }
 
@@ -2046,6 +2101,14 @@ napi_value FFAudioDecoderGetBufferStats(napi_env env, napi_callback_info info)
     // A3: in-place session rebuilds (token self-healing), from the queue.
     napi_create_int64(env, static_cast<int64_t>(core->GetReconnectEvents()), &v);
     napi_set_named_property(env, result, "reconnectCount", v);
+    // ABR (1.16): active HLS variant (doc index) + bandwidth; -1/0 on a
+    // private connection or when no master-playlist variant was selected.
+    napi_create_int32(env, core->GetAbrVariantIndex(), &v);
+    napi_set_named_property(env, result, "variantIndex", v);
+    napi_create_int64(env, core->GetAbrVariantBandwidthBps(), &v);
+    napi_set_named_property(env, result, "variantBandwidthBps", v);
+    napi_create_int32(env, core->GetAbrSwitchCount(), &v);
+    napi_set_named_property(env, result, "variantSwitchCount", v);
     return result;
 }
 

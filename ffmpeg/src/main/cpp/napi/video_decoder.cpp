@@ -4,6 +4,7 @@
 #include "demux_session.h"
 #include "hls_playlist.h"
 #include "stream_io.h"
+#include "error_classify.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -291,6 +292,19 @@ public:
     {
         return &reconnectedRef_;
     }
+    // off()/off(event): delete + null every callback reference. JS-thread
+    // only (same thread as TsfnDispatcher reads), so no extra locking.
+    void ClearAllCallbacks(napi_env env)
+    {
+        napi_ref* slots[] = { FrameSlot(), EndSlot(), ErrorSlot(), InfoSlot(), OverflowSlot(),
+            DiscontinuitySlot(), ReconnectedSlot() };
+        for (napi_ref* slot : slots) {
+            if (*slot != nullptr) {
+                napi_delete_reference(env, *slot);
+                *slot = nullptr;
+            }
+        }
+    }
     napi_ref GetOverflowCallback() const
     {
         return overflowRef_;
@@ -564,6 +578,19 @@ public:
     uint64_t GetDiscontinuityCount() const
     {
         return discontinuityCount_.load(std::memory_order_relaxed);
+    }
+    // ---- ABR (1.16) session stats -------------------------------------
+    int32_t GetAbrVariantIndex() const
+    {
+        return session_ != nullptr ? session_->AbrVariantIndex() : -1;
+    }
+    int64_t GetAbrVariantBandwidthBps() const
+    {
+        return session_ != nullptr ? session_->AbrVariantBandwidthBps() : 0;
+    }
+    int32_t GetAbrSwitchCount() const
+    {
+        return session_ != nullptr ? session_->AbrSwitchCount() : 0;
     }
 
     // ---- Runtime VOD seek (private + shared 鏂规鈶? ----------------------
@@ -1793,7 +1820,18 @@ private:
         }
         while (!stop_) {
             PollQueueEvents();
-            // 鏂规鈶?shared-session seek: the demux thread moved the shared
+            // Hot-switch teardown race (see the sw Run loop): a detached queue
+            // means this decoder is being torn down. Stop feeding the routed
+            // backlog to the codec — the next pipeline is already attaching a
+            // new producer to the same surfaceId. Feed EOS (same as the
+            // natural EOF path below) so the codec drains and stops.
+            if (queue_ != nullptr && queue_->IsDetached()) {
+                OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFVideo",
+                    "queue detached (hw), stop feeding codec");
+                hw_->FeedPacket(nullptr, 0, 0, true);
+                break;
+            }
+            // 方案⑤ shared-session seek: the demux thread moved the shared
             // connection and dropped our backlog; re-anchor the hardware
             // path to the notified target and complete the pending ack.
             {
@@ -1960,7 +1998,22 @@ private:
 
         while (!stop_) {
             PollQueueEvents();
-            // 鏂规鈶?shared-session seek: the demux thread moved the shared
+            // Hot-switch teardown race: after the leak-path detach (JS thread
+            // never joins), Pop keeps serving the routed backlog, so this
+            // worker used to keep rendering into the shared surface for
+            // seconds while the next pipeline already attached a new producer
+            // to the same surfaceId — the buffer-queue transition freed the
+            // in-flight OH_NativeBuffer mid-render and crashed inside
+            // OH_NativeBuffer_Unmap (fault thread = this worker). A detached
+            // queue means this decoder is being torn down: exit now, no more
+            // surface touches.
+            if (queue_ != nullptr && queue_->IsDetached()) {
+                OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFVideo",
+                    "queue detached (sw), exit without surface drain");
+                EmitEnd();
+                break;
+            }
+            // 鏂规鈥?shared-session seek: the demux thread moved the shared
             // connection and dropped our backlog; re-anchor the software
             // path (decoder flush, pacing, pre-target drop filter) to the
             // notified target and complete the pending ack.
@@ -2418,9 +2471,7 @@ void TsfnDispatcher(napi_env env, napi_value jsCallback, void* context, void* da
             napi_value cb = nullptr;
             napi_get_reference_value(env, core->GetErrorCallback(), &cb);
             if (cb != nullptr) {
-                napi_value msgVal = nullptr;
-                napi_create_string_utf8(env, msg->err.c_str(), NAPI_AUTO_LENGTH, &msgVal);
-                napi_call_function(env, undefined, cb, 1, &msgVal, &undefined);
+                CallErrorCallback(env, undefined, cb, msg->err);
             }
         }
     }
@@ -2438,34 +2489,7 @@ void CoreFinalize(napi_env env, void* data, void* hint)
     // queue object is being destroyed).
     core->DetachDemux();
     core->ReleaseTsfn();
-    napi_ref frame = core->GetFrameCallback();
-    napi_ref end = core->GetEndCallback();
-    napi_ref err = core->GetErrorCallback();
-    napi_ref info = core->GetInfoCallback();
-    napi_ref overflow = core->GetOverflowCallback();
-    napi_ref discont = core->GetDiscontinuityCallback();
-    napi_ref reconnected = core->GetReconnectedCallback();
-    if (frame != nullptr) {
-        napi_delete_reference(env, frame);
-    }
-    if (end != nullptr) {
-        napi_delete_reference(env, end);
-    }
-    if (err != nullptr) {
-        napi_delete_reference(env, err);
-    }
-    if (info != nullptr) {
-        napi_delete_reference(env, info);
-    }
-    if (overflow != nullptr) {
-        napi_delete_reference(env, overflow);
-    }
-    if (discont != nullptr) {
-        napi_delete_reference(env, discont);
-    }
-    if (reconnected != nullptr) {
-        napi_delete_reference(env, reconnected);
-    }
+    core->ClearAllCallbacks(env);
     delete core;
 }
 
@@ -2516,7 +2540,7 @@ napi_value FFVideoDecoderOpen(napi_env env, napi_callback_info info)
     if (argc >= 3 && !ParseNetOptions(env, args[2], ctx->netOpts)) {
         delete ctx;
         napi_throw_type_error(env, nullptr,
-            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect?, variantIndex?, maxBandwidth?, targetLatencyMs?, autoReconnect?, reconnectMaxRetries?, dvrSeek?, rtspTransport?, bufferSize?, rwTimeoutMs? }");
+            "options must be { userAgent?, headers?, allowedExtensions?, liveStartIndex?, analyzeMs?, hw?, program?, httpPersistent?, reconnect?, variantIndex?, maxBandwidth?, abr?, targetLatencyMs?, autoReconnect?, reconnectMaxRetries?, dvrSeek?, rtspTransport?, bufferSize?, rwTimeoutMs? }");
         return nullptr;
     }
 
@@ -2570,6 +2594,63 @@ napi_value FFVideoDecoderOn(napi_env env, napi_callback_info info)
         napi_delete_reference(env, *slot);
     }
     napi_create_reference(env, args[1], 1, slot);
+    return nullptr;
+}
+
+napi_value FFVideoDecoderOff(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    VideoDecoderCore* core = GetCore(env, info);
+    if (core == nullptr) {
+        napi_throw_error(env, nullptr, "FFVideoDecoder is not constructed");
+        return nullptr;
+    }
+    // off() with no event: remove all listeners (removeAllListeners).
+    if (argc == 0 || args[0] == nullptr) {
+        core->ClearAllCallbacks(env);
+        return nullptr;
+    }
+    napi_valuetype type = napi_undefined;
+    napi_typeof(env, args[0], &type);
+    if (type == napi_undefined || type == napi_null) {
+        core->ClearAllCallbacks(env);
+        return nullptr;
+    }
+    size_t len = 0;
+    if (napi_get_value_string_utf8(env, args[0], nullptr, 0, &len) != napi_ok) {
+        napi_throw_type_error(env, nullptr, "off(event?: string) expects an event name or no argument");
+        return nullptr;
+    }
+    std::vector<char> ev(len + 1, '\0');
+    napi_get_value_string_utf8(env, args[0], ev.data(), ev.size(), &len);
+    std::string event(ev.data(), len);
+
+    napi_ref* slot = nullptr;
+    if (event == "frame") {
+        slot = core->FrameSlot();
+    } else if (event == "end") {
+        slot = core->EndSlot();
+    } else if (event == "error") {
+        slot = core->ErrorSlot();
+    } else if (event == "info") {
+        slot = core->InfoSlot();
+    } else if (event == "overflow") {
+        slot = core->OverflowSlot();
+    } else if (event == "discontinuity") {
+        slot = core->DiscontinuitySlot();
+    } else if (event == "reconnected") {
+        slot = core->ReconnectedSlot();
+    } else {
+        napi_throw_type_error(env, nullptr,
+            "unsupported event, expect 'frame' | 'end' | 'error' | 'info' | 'overflow' | 'discontinuity' | 'reconnected'");
+        return nullptr;
+    }
+    if (*slot != nullptr) {
+        napi_delete_reference(env, *slot);
+        *slot = nullptr;
+    }
     return nullptr;
 }
 
@@ -2725,6 +2806,14 @@ napi_value FFVideoDecoderGetBufferStats(napi_env env, napi_callback_info info)
     // A3: in-place session rebuilds (token self-healing), from the queue.
     napi_create_int64(env, static_cast<int64_t>(core->GetReconnectEvents()), &v);
     napi_set_named_property(env, result, "reconnectCount", v);
+    // ABR (1.16): active HLS variant (doc index) + bandwidth; -1/0 on a
+    // private connection or when no master-playlist variant was selected.
+    napi_create_int32(env, core->GetAbrVariantIndex(), &v);
+    napi_set_named_property(env, result, "variantIndex", v);
+    napi_create_int64(env, core->GetAbrVariantBandwidthBps(), &v);
+    napi_set_named_property(env, result, "variantBandwidthBps", v);
+    napi_create_int32(env, core->GetAbrSwitchCount(), &v);
+    napi_set_named_property(env, result, "variantSwitchCount", v);
     return result;
 }
 

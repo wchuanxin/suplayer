@@ -2,6 +2,103 @@
 
 [English](CHANGELOG.md) | 中文
 
+## 1.16.0
+
+### HLS 自适应码率（`abr`）：饥饿降档 + 健康探测升档
+
+- 新增 `FFNetOptions.abr` 选项（默认 `false`）：直播 HLS 主播放列表源的
+  自适应变体切换，实现在共享解复用会话内部 —— 视频 / 音频 / 字幕全体
+  订阅者随同一连接一同切换。
+- 检测复用直播吞吐看门狗：按 10s 窗口测量视频流的媒体时间推进。持续
+  饥饿（推进低于实时的 15% 且持续约 8s）触发降一档 —— 刻意早于 15s 的
+  饥饿中止，让更低一档先有机会救回会话；已无更低档时仍走原有中止
+  路径。
+- 升档为健康探测：持续健康（>= 实时的 90%）后按驻留窗口（初始 30s）
+  至多探测升一档；饥饿驱动的降档使驻留翻倍（上限 300s），无法自持的
+  档位不会被反复探测；持续健康 60s 重置惩罚。
+- 切换机制：解复用线程上的会话内重建（与 A3 token 自愈同路径）—— 重新
+  拉取主播放列表（新鲜 CDN token）、流布局校验、对每个订阅者队列
+  `NotifyReconnect` + `DropBacklogToKeyframe`。应用侧观察到熟悉的
+  `'reconnected'` 事件 + `discontinuity('reconnect')`，不新增事件类型。
+  切换失败先回滚到原变体，回滚也失败才终止会话。
+- 默认行为：无显式 `variantIndex` 时 open 从最高带宽档起步
+  （`maxBandwidth` 作为梯子上限）；显式 `variantIndex` 视为钉选并禁用
+  切换（统计仍可用）。仅在 `live` 且主播放列表含 >= 2 个已知带宽变体时
+  生效。
+- `getBufferStats()`（音频 + 视频）新增 `variantIndex`（当前变体在主
+  播放列表中的 0 基文档索引，未选择/私有连接为 -1）、
+  `variantBandwidthBps`（当前变体 BANDWIDTH，未知为 0）与
+  `variantSwitchCount`（迄今发生的变体切换次数）。
+
+### `FFSubtitleDecoder.setDelayMs`：内嵌文本字幕同步偏移
+
+- `FFSubtitleDecoder` 新增 `setDelayMs(delayMs)`：按 `delayMs` 毫秒
+  （正 = 延后，负 = 提前，钳制 ±60000）平移内嵌文本字幕的显示时刻。
+  移动的是步调墙钟目标 —— 连带合成的字幕清除时刻 —— 上报的事件时间线
+  （`ptsMs` / `durationMs`）仍留在内容时钟上。
+- 文本字幕前瞻交接修复：探测下一条字幕起始时预读的包改为留存到下一轮
+  循环处理，不再在字幕边界重复读取。
+
+## 1.15.0
+
+### `off()` 事件解绑 + 结构化错误（`FFError`）
+
+- 三路解码器（`FFAudioDecoder` / `FFVideoDecoder` / `FFSubtitleDecoder`）
+  新增 `off()` 方法，与 `on()` 事件面一一对应：
+  - `off(event)` 移除指定事件的当前监听器（每事件单槽位，等效
+    `removeListener`）。
+  - `off()` 不带参数移除该解码器的全部监听器（`removeAllListeners`
+    语义）——丢弃解码器引用前、或整体重绑处理器时使用。
+  - 各解码器支持的事件与 `on()` 完全一致；未知事件名抛错（与
+    `on()` 行为相同）。
+- `'error'` 监听器新增第二个结构化参数：`(msg: string, err: FFError)`，
+  其中 `FFError = { code: FFErrorCode, message: string }`。`code` 是按
+  有序关键词匹配从消息中推导的最佳努力机器可读分类：
+  `'surface' | 'hw' | 'seek' | 'network' | 'open' | 'demux' | 'decode' |
+  'internal'`——根因子串优先于包装层（例如 "shared demux open
+  failed: ..." 内层的 HTTP 403 归类为 `network`）。纯增量变更：1.15
+  之前只读第一个 string 参数的回调完全不受影响。`open()` 的 promise
+  rejection 仍为纯字符串错误。
+- 类型层：`FFDiscontinuityEvent.reason` 由 `string` 收紧为
+  `FFDiscontinuityReason` 字面量联合（`'resync' | 'reconnect' | 'seek' |
+  'hw2sw'`）；新增导出类型 `FFErrorCode`、`FFError`、
+  `FFDiscontinuityReason`。
+
+## 1.14.1
+
+### GOP 中段接入解码日志刷屏限流
+
+- GOP 中段接入（直播裸传输流、共享解复用会话附加方）令 h264 软解在带内
+  SPS/PPS+IDR 到达前对每个被丢弃的 slice 刷解码错误 —— "non-existing PPS 0
+  referenced"、"decode_slice_header error"、"no frame!" —— 实测数十毫秒内
+  数百条冲垮 hilog。
+- 内核日志桥（`FfLogCallback`）现按前缀识别这类已知接入噪音：首条原样放行，
+  其后每 5s 至多输出 1 条 WARN 并附累计抑制计数
+  （`(mid-GOP join noise, suppressed x N)`）。其余日志路径（真实解码/探测
+  错误）不变。
+
+## 1.14.0
+
+### 直播裸传输流源的 GOP 自适应流分析
+
+- 长 GOP 首帧修复：直播裸传输流接入（裸 TS / FLV / 直连直播地址，非
+  HLS 播放列表）必然落在 GOP 中段。当调用方的 `analyzeMs` 分析窗口短于
+  流 GOP（IPTV 常见 4-6s）时，`avformat_find_stream_info` 在下一个带内
+  IDR 到达前就关闭了窗口，open 携带视频 `width/height = 0` —— 消费方的
+  surface configure 随之失败，管线退化为硬解→软解→surface wedge 链条
+  且无法自恢复。
+- 共享解复用会话（`DemuxSession::Init` / `Rebuild`）现对设置了显式
+  `analyzeMs`（且无 `startTimeMs` 精确定位）的直播非 HLS 源一次性提高
+  分析预算：`max_analyze_duration` 提到 10s、`probesize` 提到 12MB。
+  自适应性来自 `avformat_find_stream_info` 的内建早退 —— 所有流拿到
+  编码参数（MPEG-TS 视频：首个 SPS/IDR）即返回 —— 因此提高上限对
+  短 GOP 流零额外开销，仅让长 GOP 流继续读到 IDR 为止。
+- 为何不用重复调 `find_stream_info` 扩展：`codec_info_duration` 持久
+  累计在流上，重入时内部包缓冲回放会把已分析的媒体时长重复记入新预算，
+  第二次调用几乎不读新数据就把提高后的窗口耗尽。
+- HLS（`.m3u8`）源保持调用方较紧的 `analyzeMs` 不变（分片起始于关键帧，
+  换台速度不受影响）。非直播源与精确定位 open（`startTimeMs`）不受影响。
+
 ## 1.12.0
 
 ### 用户级倍速播放 — 三路解码器的 `setSpeed`

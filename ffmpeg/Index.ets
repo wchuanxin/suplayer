@@ -27,6 +27,9 @@ export {
   FFNetOptions,
   FFOverflowEvent,
   FFDiscontinuityEvent,
+  FFDiscontinuityReason,
+  FFErrorCode,
+  FFError,
   FFBufferStats,
   FFPlaybackStats
 } from './src/main/ets/FFMedia';

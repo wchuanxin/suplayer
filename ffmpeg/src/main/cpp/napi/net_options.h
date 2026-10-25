@@ -49,6 +49,13 @@ struct NetOptions {
                                         // into EXT-X-STREAM-INF order); INT32_MIN = not set
     int64_t maxBandwidth = 0;           // A2: pick the highest-bandwidth variant <= this (bits
                                         // per second); 0 = no bandwidth-based selection
+    bool abr = false;                   // Adaptive bitrate on live HLS master playlists:
+                                        // starve-driven variant downgrades + health-probe
+                                        // upgrades via in-pipeline session rebuilds. Without
+                                        // an explicit variantIndex the open starts at the
+                                        // highest-bandwidth rung (maxBandwidth caps the
+                                        // ladder); an explicit variantIndex pins the variant
+                                        // and disables switching.
     int64_t targetLatencyMs = 0;        // F1: target live latency; derives live_start_index from
                                         // the playlist segment duration and arms runtime
                                         // catch-up (drop backlog when buffered latency exceeds
@@ -269,8 +276,9 @@ inline bool ParseNetOptions(napi_env env, napi_value val, NetOptions& out)
         !readBool("httpPersistent", out.httpPersistent) || !readBool("reconnect", out.reconnect) ||
         !readAudioTracks("audioTracks", out.audioAllTracks) || !readInt("frameEventMs", out.frameEventMs) ||
         !readInt64("startTimeMs", out.startTimeMs) || !readBool("sharedDemux", out.sharedDemux) ||
-        !readBool("live", out.live) || !readInt("variantIndex", out.variantIndex) ||
-        !readInt64("maxBandwidth", out.maxBandwidth) || !readInt64("targetLatencyMs", out.targetLatencyMs) ||
+        !readBool("live", out.live) ||         !readInt("variantIndex", out.variantIndex) ||
+        !readInt64("maxBandwidth", out.maxBandwidth) || !readBool("abr", out.abr) ||
+        !readInt64("targetLatencyMs", out.targetLatencyMs) ||
         !readTri("autoReconnect", out.autoReconnect) ||
         !readInt("reconnectMaxRetries", out.reconnectMaxRetries) || !readBool("dvrSeek", out.dvrSeek) ||
         !readString("rtspTransport", out.rtspTransport) || !readInt("bufferSize", out.bufferSize) ||

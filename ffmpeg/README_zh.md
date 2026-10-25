@@ -200,8 +200,9 @@ display matrix 的顺时针角度，0/90/180/270）。
 | `program` | 未设置 | MPEG-TS 节目号锁定。设定后仅解复用该节目的流；自动选轨被限制在节目内，显式 `streamIndex` 也会对照其校验。未知节目号使 `open` 失败 |
 | `httpPersistent` | `true` | 在 HLS 播放列表刷新与分片下载之间复用一条 HTTP/TCP 连接（`http_persistent=1`），而非每次请求都重连 —— 降低直播边缘延迟与 TLS 握手开销 |
 | `reconnect` | `true` | 网络请求失败自动重试：`reconnect=1`、`reconnect_streamed=1`、`reconnect_on_network_error=1`、`reconnect_on_http_error=4xx,5xx`、`reconnect_delay_max=5` —— 可扛住 CDN 边缘未命中（新宣告分片的瞬时 404/410）与短暂断网 |
-| `variantIndex` | 未设置 | HLS 主播放列表变体选择：选取该 0 基索引处的变体。优先于 `maxBandwidth` |
-| `maxBandwidth` | `0` | HLS 变体带宽上限：选取 `BANDWIDTH <= maxBandwidth` 的最高带宽变体（全部超限时取最低）。`0` = 不限。主播放列表在打开前抓取一次，选中的变体 URL 替换源；任何抓取/解析失败回退到原始 URL |
+| `variantIndex` | 未设置 | HLS 主播放列表变体选择：选取该 0 基索引处的变体。优先于 `maxBandwidth`。设置 `abr` 时为钉选（统计仍可用，切换禁用） |
+| `maxBandwidth` | `0` | HLS 变体带宽上限：选取 `BANDWIDTH <= maxBandwidth` 的最高带宽变体（全部超限时取最低）。`0` = 不限。主播放列表在打开前抓取一次，选中的变体 URL 替换源；任何抓取/解析失败回退到原始 URL。设置 `abr` 时同时作为切换梯子的上限 |
+| `abr` | `false` | 直播 HLS 主播放列表自适应码率：共享会话按 10s 窗口测量视频流的媒体时间推进；持续饥饿（低于实时的 15% 且持续约 8s）触发原地重建降一档变体（先于 15s 饥饿中止），持续健康（≥ 实时的 90%）按指数增长的驻留窗口（30s → 失败探测后至 300s；持续健康 60s 重置）探测升回一档。未显式设置 `variantIndex` 时 open 从最高带宽档起步。订阅者收到 `'reconnected'` + `discontinuity('reconnect')`；`getBufferStats()` 暴露当前变体（`variantIndex` / `variantBandwidthBps` / `variantSwitchCount`）。仅在 `live` 且主播放列表含 ≥ 2 个已知带宽变体时生效 |
 | `targetLatencyMs` | `0` | 直播目标延迟：未显式设置 `liveStartIndex` 时，由媒体播放列表的 `TARGETDURATION` 推导 `liveStartIndex`（`-ceil(target/segDur)`，钳制 1..30）并持续收敛 —— 共享会话每 ~5s 丢弃超过 `target + max(2s, target/2)` 的订阅者积压。`0` = 关闭 |
 | `autoReconnect` | 自动 | 401/403/404/429 读错误（令牌过期、滑动窗口未命中、限流）后的原地会话重建：共享会话重新解析源（新鲜 CDN 令牌）并重开、校验流布局；订阅者收到 `'reconnected'` + `discontinuity('reconnect')`。`true` = 始终开启，`false` = 始终关闭，未设置 = 自动（直播开、点播关） |
 | `reconnectMaxRetries` | `3` | 会话放弃（EOF）前的重建尝试次数；指数退避 1s..8s（HTTP 429 为 2s..16s） |
@@ -209,7 +210,7 @@ display matrix 的顺时针角度，0/90/180/270）。
 | `audioTracks` | `'all'` | `FFAudioDecoder` 音轨解码模式：`'all'` 并行解码全部音轨（零间隙热切换）；`'first'` 只解码选中轨道，`switchTrack` 时再惰性打开目标轨道 —— 多轨源上 CPU/功耗更低，切换处有短暂拼接而非无缝 |
 | `frameEventMs` | `0` | `FFVideoDecoder` `'frame'` 事件之间的最小间隔（ms）（`0` = 每帧）。首帧必定上报；更大的值可削减 NAPI 桥流量，适合只需要周期性 PTS 更新（音画同步、进度）的应用 |
 | `startTimeMs` | `0` | 点播起始位置（ms）：解码器 seek 到目标处或之前的关键帧并丢弃目标前帧（视频：解码但不渲染/上报；音频：不重采样/上报），起播精确落在请求位置。`0` = 从头。源不可 seek 时忽略（直播回退为正常起播） |
-| `sharedDemux` | `false` | 共享解复用器：对同一源以匹配的解复用选项（`userAgent`/`headers`/`allowedExtensions`/`liveStartIndex`/`analyzeMs`/`program`/`httpPersistent`/`reconnect`/`variantIndex`/`maxBandwidth`/`targetLatencyMs`/`autoReconnect`/`reconnectMaxRetries`）打开的每个解码器（视频/音频/字幕）通过进程级解复用会话共享**一条**网络连接，而非每个解码器一条。单个解复用线程把包路由到各解码器的有界队列；队列高水位反压保留了私有连接的自节流语义（暂停的解码器会像从前停摆自己的读取那样停摆共享读取）。并发的首次打开者相互竞争，落败者挂接到胜者（启动保持并行，稳态一条连接）。挂接者用各自的目标前丢弃来补偿不同的 `startTimeMs`。`probe()` 复用活跃会话的上下文读取元数据，不新开连接 |
+| `sharedDemux` | `false` | 共享解复用器：对同一源以匹配的解复用选项（`userAgent`/`headers`/`allowedExtensions`/`liveStartIndex`/`analyzeMs`/`program`/`httpPersistent`/`reconnect`/`variantIndex`/`maxBandwidth`/`abr`/`targetLatencyMs`/`autoReconnect`/`reconnectMaxRetries`）打开的每个解码器（视频/音频/字幕）通过进程级解复用会话共享**一条**网络连接，而非每个解码器一条。单个解复用线程把包路由到各解码器的有界队列；队列高水位反压保留了私有连接的自节流语义（暂停的解码器会像从前停摆自己的读取那样停摆共享读取）。并发的首次打开者相互竞争，落败者挂接到胜者（启动保持并行，稳态一条连接）。挂接者用各自的目标前丢弃来补偿不同的 `startTimeMs`。`probe()` 复用活跃会话的上下文读取元数据，不新开连接 |
 | `rtspTransport` | FFmpeg 默认 | rtsp:// 源的 RTSP 传输：`'tcp'`（在控制连接内交织）或 `'udp'` |
 | `bufferSize` | `0` | 底层 socket 缓冲区大小（字节）（FFmpeg `buffer_size`）；高码率 RTSP/组播流可调大 |
 | `rwTimeoutMs` | `0` | I/O 读写超时（ms）（FFmpeg `rw_timeout`）；防护非 HLS 协议上停摆的 socket。`0` = 无超时 |
@@ -234,9 +235,22 @@ display matrix 的顺时针角度，0/90/180/270）。
 - `'reconnected'`（仅视频/音频，无负载）：共享会话从 401/403/404/429 中
   恢复 —— 重新解析源并重开，流索引保持有效。随后跟随
   `discontinuity('reconnect')`。
+- `'error'`（`(msg: string, err: FFError)`）：运行时失败。第一个参数是
+  原始消息串（1.15 之前的形态，不变）；第二个参数是 1.15.0 新增的结构化
+  `{ code, message }` 负载，`code` 为从消息推导的最佳努力机器可读分类：
+  `'surface' | 'hw' | 'seek' | 'network' | 'open' | 'demux' | 'decode' |
+  'internal'`（根因子串优先于包装层，例如 "shared demux open
+  failed: ..." 内层的 HTTP 403 归类为 `network`）。未知取值请按
+  `'internal'` 处理。`open()` 的 rejection 仍为纯字符串。
+- `off(event?)`（三个解码器，1.15.0）：移除单个事件的监听器（每事件
+  单槽位）；不带参数调用则移除该解码器的全部监听器
+  （`removeAllListeners` 语义）。
 - `getBufferStats()`（视频/音频）：`{ bufferedAheadMs, readBytes,
-  measuredBitrateBps, liveLatencyMs, overflowCount, reconnectCount }` —
-  队列深度、已消费字节、EWMA 码率（5s 窗口）与溢出/重连计数器。
+  measuredBitrateBps, liveLatencyMs, overflowCount, reconnectCount,
+  variantIndex, variantBandwidthBps, variantSwitchCount }` —
+  队列深度、已消费字节、EWMA 码率（5s 窗口）、溢出/重连计数器，以及
+  （1.16）ABR 变体状态：当前主播放列表变体（0 基文档索引，未选择/私有
+  连接为 -1）、其 `BANDWIDTH`（未知为 0）与会话迄今应用的变体切换次数。
 - `getStats()`（视频/音频）：`{ decodedFrames, droppedFrames,
   overflowCount, reconnectCount, discontinuityCount }`。
 
@@ -249,11 +263,12 @@ MPEG-TS 节目为 `0`），应用可据此通过 `probe()` 按真实带宽排序
 open(src: string, streamIndex?: number, options?: FFNetOptions): Promise<FFAudioOpenInfo>
 on(event: 'pcm', cb: (packet: FFAudioPacket) => void): void   // F32LE 交织
 on(event: 'end', cb: () => void): void
-on(event: 'error', cb: (msg: string) => void): void
+on(event: 'error', cb: (msg: string, err: FFError) => void): void
 on(event: 'switched', cb: (info: FFAudioOpenInfo) => void): void
 on(event: 'overflow', cb: (ev: FFOverflowEvent) => void): void
 on(event: 'discontinuity', cb: (ev: FFDiscontinuityEvent) => void): void
 on(event: 'reconnected', cb: () => void): void
+off(event?: 'pcm' | 'end' | 'error' | 'switched' | 'overflow' | 'discontinuity' | 'reconnected'): void
 start(paced?: boolean): void      // 默认 true = 实时步调
 switchTrack(streamIndex: number): void  // 播放中瞬时热切换
 flushBacklog(): void              // 直播音画重同步：丢弃队列积压
@@ -283,11 +298,12 @@ stop(): void; close(): void
 open(src: string, streamIndex?: number, options?: FFNetOptions): Promise<FFVideoOpenInfo>
 on(event: 'frame', cb: (ev: FFVideoFrameEvent) => void): void
 on(event: 'end', cb: () => void): void
-on(event: 'error', cb: (msg: string) => void): void
+on(event: 'error', cb: (msg: string, err: FFError) => void): void
 on(event: 'info', cb: (ev: FFVideoInfoEvent) => void): void  // { backend: 'hw' | 'sw' }
 on(event: 'overflow', cb: (ev: FFOverflowEvent) => void): void
 on(event: 'discontinuity', cb: (ev: FFDiscontinuityEvent) => void): void
 on(event: 'reconnected', cb: () => void): void
+off(event?: 'frame' | 'end' | 'error' | 'info' | 'overflow' | 'discontinuity' | 'reconnected'): void
 start(surfaceId: string): void    // 渲染到 XComponent surface
 flushToKeyframe(): void            // 直播音画重同步：积压丢到最新关键帧
 setSpeed(speed: number): void      // 用户倍速 [0.5, 2.0]：步调 /speed，内容 pts 不变
@@ -391,12 +407,14 @@ open(src: string, streamIndex?: number, options?: FFNetOptions): Promise<FFSubti
 on(event: 'subtitle', cb: (ev: FFSubtitleEvent) => void): void
 on(event: 'pes', cb: (payload: ArrayBuffer, pts: number) => void): void  // 裸 PES 泵
 on(event: 'end', cb: () => void): void
-on(event: 'error', cb: (msg: string) => void): void
+on(event: 'error', cb: (msg: string, err: FFError) => void): void
 on(event: 'overflow', cb: (ev: FFOverflowEvent) => void): void
 on(event: 'discontinuity', cb: (ev: FFDiscontinuityEvent) => void): void
+off(event?: 'subtitle' | 'pes' | 'end' | 'error' | 'overflow' | 'discontinuity'): void
 setRawPump(enable: boolean): void  // start() 之前：按原样转发 PES
 setSpeed(speed: number): void      // 用户倍速 [0.5, 2.0]：步调模式步调 /speed
-start(paced?: boolean): void      // 默认 true = 按呈现时间步调
+setDelayMs(delayMs: number): void  // 文本字幕同步偏移 ±60s：仅平移显示时刻
+start(paced?: boolean): void       // 默认 true = 按呈现时间步调
 detach(): void                    // 防泄漏清理，不做线程 join
 pause(): void; resume(): void
 stop(): void; close(): void
