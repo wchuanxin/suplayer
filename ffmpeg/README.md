@@ -67,7 +67,7 @@ Or declare the dependency in `oh-package.json5`:
 ```json5
 // oh-package.json5
 "dependencies": {
-  "@suplayer/ffmpeg": "^1.16.0"
+  "@suplayer/ffmpeg": "^1.17.0"
 }
 ```
 
