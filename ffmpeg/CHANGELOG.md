@@ -2,6 +2,16 @@
 
 English | [中文](CHANGELOG_zh.md)
 
+## 1.17.1
+
+### Docs: Chinese quick-start guide in README (visible on OHPM)
+
+- The OHPM package page renders only the `README.md` packed into the HAR
+  (`README_zh.md` is not packed), so Chinese readers saw English-only docs
+  there. `README.md` now opens with a concise Chinese quick-start guide
+  (capabilities summary, install, links to the full Chinese README and
+  changelog on Gitee).
+
 ## 1.17.0
 
 ### Multi-core software video decoding (`swThreads`)

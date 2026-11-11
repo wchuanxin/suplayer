@@ -2,6 +2,30 @@
 
 English | [中文](README_zh.md)
 
+> **中文快速指引**
+>
+> FFmpeg 媒体内核（HAR，预编译 `arm64-v8a`/`x86_64` 原生库），兼容 API 24+
+>（HarmonyOS 6.1.1 及以上）。能力：媒体探测（含 PSI 节目表 PAT/PMT/SDT）、
+> 视频帧提取、音频解码（F32LE PCM，多音轨并行热切换）、视频软解（NV12 直写
+> XComponent Surface，`swThreads` 多核加速）与 H.264/HEVC 硬解（开启失败与
+> 中途故障自动回退软解）、AVS2/AVS3（央视 4K 超高清 TS）、多节目 TS、DVB 字幕、
+> 运行时 seek/倍速/截帧、JS 自定义 I/O（streamio）、fd:// 源、转码
+>（OpenH264 + AAC）、直播（HTTPS/HLS/RTSP，内置 OpenSSL）。
+>
+> 安装：
+>
+> ```bash
+> ohpm install @suplayer/ffmpeg
+> ```
+>
+> 或在 `oh-package.json5` 声明 `"@suplayer/ffmpeg": "^1.17.1"`，然后
+> `ohpm install --all`。
+>
+> **完整中文文档**：
+> [README_zh.md（Gitee）](https://gitee.com/wchuanxin/suplayer/blob/master/ffmpeg/README_zh.md)
+> · [中文更新日志](https://gitee.com/wchuanxin/suplayer/blob/master/ffmpeg/CHANGELOG_zh.md)
+> —— OHPM 包页面仅展示本 README，仓库内含中英双语文档。
+
 FFmpeg-powered media kernel for HarmonyOS (compatible with API 24+,
 HarmonyOS 6.1.1 and later). Ships as a HAR with prebuilt native libraries for
 `arm64-v8a` and `x86_64`.
@@ -67,7 +91,7 @@ Or declare the dependency in `oh-package.json5`:
 ```json5
 // oh-package.json5
 "dependencies": {
-  "@suplayer/ffmpeg": "^1.17.0"
+  "@suplayer/ffmpeg": "^1.17.1"
 }
 ```
 

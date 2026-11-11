@@ -2,6 +2,14 @@
 
 [English](CHANGELOG.md) | 中文
 
+## 1.17.1
+
+### 文档：README 增加中文快速指引（OHPM 页面可见）
+
+- OHPM 包页面仅渲染打入 HAR 的 `README.md`（`README_zh.md` 不入包），中文
+  读者此前在 OHPM 只能看到英文文档。现 `README.md` 顶部加入中文快速指引
+  （能力简介、安装方式、Gitee 完整中文文档与更新日志链接）。
+
 ## 1.17.0
 
 ### 多核软件视频解码（`swThreads`）
