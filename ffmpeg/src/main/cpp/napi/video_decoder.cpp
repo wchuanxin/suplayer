@@ -471,11 +471,26 @@ public:
         }
         dec_ = avcodec_alloc_context3(codec);
         avcodec_parameters_to_context(dec_, stream->codecpar);
+        // Multi-core software decode: swThreads > 1 (or 0 = auto) arms frame
+        // + slice threading on the software context. Frame threading adds
+        // N-1 frames of output latency, so live callers stay conservative
+        // (2); heavy VOD software decode (4K/HDR hw fallback) can afford
+        // more. Default 1 keeps the historical single-threaded behavior.
+        // No effect while the hardware pipeline is active.
+        if (netOpts.swThreads != 1) {
+            dec_->thread_count = netOpts.swThreads;
+            dec_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+        }
         int openRet = avcodec_open2(dec_, codec, nullptr);
         if (openRet < 0) {
             lastError_ = "avcodec_open2 failed: " + ErrToStr(openRet);
             CloseCodec();
             return false;
+        }
+        if (netOpts.swThreads != 1) {
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FFVideo",
+                "sw decode threads=%{public}d type=%{public}d",
+                dec_->thread_count, dec_->thread_type);
         }
         width_ = dec_->width;
         height_ = dec_->height;

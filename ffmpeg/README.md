@@ -231,6 +231,7 @@ Optional network/live options accepted by `probe` and both decoders' `open`:
 | `rtspTransport` | FFmpeg default | RTSP transport for rtsp:// sources: `'tcp'` (interleaved in the control connection) or `'udp'` |
 | `bufferSize` | `0` | Low-level socket buffer size in bytes (FFmpeg `buffer_size`); raise it for high-bitrate RTSP/multicast feeds |
 | `rwTimeoutMs` | `0` | I/O read/write timeout in ms (FFmpeg `rw_timeout`); guards against a stalled socket on non-HLS protocols. `0` = no timeout |
+| `swThreads` | `1` | Software video decode thread count: `1` = single-threaded (lowest latency), `0` = auto (FFmpeg picks the CPU count), `N` = `N` decode threads (frame + slice threading). Frame threading adds `N-1` frames of output latency — keep live streams conservative (`2`); heavy VOD software decode (4K/HDR hardware fallback) can afford more. No effect while hardware decode is active |
 
 For live streams `durationMs` is `0` and the `'end'` event never fires; use
 `stop()` to end playback. `stop()` also aborts in-flight network reads

@@ -214,6 +214,7 @@ display matrix 的顺时针角度，0/90/180/270）。
 | `rtspTransport` | FFmpeg 默认 | rtsp:// 源的 RTSP 传输：`'tcp'`（在控制连接内交织）或 `'udp'` |
 | `bufferSize` | `0` | 底层 socket 缓冲区大小（字节）（FFmpeg `buffer_size`）；高码率 RTSP/组播流可调大 |
 | `rwTimeoutMs` | `0` | I/O 读写超时（ms）（FFmpeg `rw_timeout`）；防护非 HLS 协议上停摆的 socket。`0` = 无超时 |
+| `swThreads` | `1` | 软件视频解码线程数：`1` = 单线程（最低延迟）；`0` = 自动（FFmpeg 按 CPU 数取）；`N` = `N` 个解码线程（帧级 + 切片级线程）。帧线程带来 `N-1` 帧输出延迟 —— 直播保持保守（`2`）；重型点播软解（4K/HDR 硬解回退）可给更多。硬解生效期间无效果 |
 
 直播流的 `durationMs` 为 `0` 且 `'end'` 事件不会触发；用 `stop()` 结束
 播放。`stop()` 也会立即中止进行中的网络读取。

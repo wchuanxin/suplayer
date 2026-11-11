@@ -77,6 +77,12 @@ struct NetOptions {
                                         // blocking longer than this aborts with ETIMEDOUT.
                                         // 0 = no timeout (FFmpeg default). Applied to all
                                         // protocol-based sources.
+    int32_t swThreads = 1;              // Software video decode thread count: 1 = single
+                                        // threaded (lowest latency, historical default),
+                                        // 0 = auto (FFmpeg picks the CPU count), N = N decode
+                                        // threads (frame + slice threading). Frame threading
+                                        // adds N-1 frames of output latency. No effect while
+                                        // hardware decode is active.
 };
 
 // Parse optional JS options object into NetOptions.
@@ -282,7 +288,7 @@ inline bool ParseNetOptions(napi_env env, napi_value val, NetOptions& out)
         !readTri("autoReconnect", out.autoReconnect) ||
         !readInt("reconnectMaxRetries", out.reconnectMaxRetries) || !readBool("dvrSeek", out.dvrSeek) ||
         !readString("rtspTransport", out.rtspTransport) || !readInt("bufferSize", out.bufferSize) ||
-        !readInt64("rwTimeoutMs", out.rwTimeoutMs)) {
+        !readInt64("rwTimeoutMs", out.rwTimeoutMs) || !readInt("swThreads", out.swThreads)) {
         return false;
     }
     return true;

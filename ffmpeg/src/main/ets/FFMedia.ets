@@ -185,6 +185,12 @@ export interface FFNetOptions {
   /** I/O read/write timeout in ms (FFmpeg 'rw_timeout'; 0 = no timeout).
    *  Guards against a stalled socket on non-HLS protocols. */
   rwTimeoutMs?: number;
+  /** Software video decode thread count: 1 (default) = single-threaded
+   *  (lowest latency), 0 = let FFmpeg pick the CPU count, N = N decode
+   *  threads (frame + slice threading). Frame threading adds N-1 frames of
+   *  output latency — keep live streams conservative (2). No effect while
+   *  hardware decode is active. */
+  swThreads?: number;
 }
 
 export interface FFAudioOpenInfo {

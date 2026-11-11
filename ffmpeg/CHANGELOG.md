@@ -2,6 +2,22 @@
 
 English | [中文](CHANGELOG_zh.md)
 
+## 1.17.0
+
+### Multi-core software video decoding (`swThreads`)
+
+- New `FFNetOptions.swThreads` option (default `1`): software video decode
+  thread count. `1` keeps the historical single-threaded behavior (lowest
+  latency); `0` lets FFmpeg pick the CPU count; `N` arms `N` decode threads
+  with frame + slice threading (`thread_type = FF_THREAD_FRAME |
+  FF_THREAD_SLICE`).
+- Applied at the software codec open — the only software open site; the
+  mid-stream hardware → software fallback reuses the same context and
+  inherits the configured threads. Hardware decode is unaffected.
+- Frame threading adds `N-1` frames of output latency: live callers should
+  stay conservative (`2` ≈ +20ms at 50fps); heavy VOD software decode
+  (4K/HDR hardware fallback) can afford `4`+.
+
 ## 1.16.0
 
 ### HLS adaptive bitrate (`abr`): starve-driven downgrades + health-probe upgrades
